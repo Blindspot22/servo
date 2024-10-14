@@ -98,6 +98,7 @@ impl Gamepad {
         button_bounds: (f64, f64),
         supported_haptic_effects: GamepadSupportedHapticEffects,
         xr: bool,
+        can_gc: CanGc,
     ) -> DomRoot<Gamepad> {
         Self::new_with_proto(
             global,
@@ -108,6 +109,7 @@ impl Gamepad {
             button_bounds,
             supported_haptic_effects,
             xr,
+            can_gc,
         )
     }
 
@@ -126,6 +128,7 @@ impl Gamepad {
         button_bounds: (f64, f64),
         supported_haptic_effects: GamepadSupportedHapticEffects,
         xr: bool,
+        can_gc: CanGc,
     ) -> DomRoot<Gamepad> {
         let button_list = GamepadButtonList::init_buttons(global);
         let vibration_actuator =
@@ -148,7 +151,7 @@ impl Gamepad {
             )),
             global,
             None,
-            CanGc::note(),
+            can_gc,
         );
         gamepad.init_axes();
         gamepad
@@ -243,7 +246,7 @@ impl Gamepad {
     }
 
     pub fn notify_event(&self, event_type: GamepadEventType) {
-        let event = GamepadEvent::new_with_type(&self.global(), event_type, self);
+        let event = GamepadEvent::new_with_type(&self.global(), event_type, self, CanGc::note());
         event
             .upcast::<Event>()
             .fire(self.global().as_window().upcast::<EventTarget>());

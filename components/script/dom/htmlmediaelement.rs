@@ -17,7 +17,7 @@ use headers::{ContentLength, ContentRange, HeaderMapExt};
 use html5ever::{local_name, namespace_url, ns, LocalName, Prefix};
 use http::header::{self, HeaderMap, HeaderValue};
 use http::StatusCode;
-use ipc_channel::ipc;
+use ipc_channel::ipc::{self, IpcSharedMemory};
 use ipc_channel::router::ROUTER;
 use js::jsapi::JSAutoRealm;
 use media::{glplayer_channel, GLPlayerMsg, GLPlayerMsgForward, WindowGLContext};
@@ -35,10 +35,10 @@ use servo_media::player::{PlaybackState, Player, PlayerError, PlayerEvent, SeekL
 use servo_media::{ClientContextId, ServoMedia, SupportsMediaType};
 use servo_url::ServoUrl;
 use webrender_api::{
-    ExternalImageData, ExternalImageId, ExternalImageType, ImageBufferKind, ImageData,
-    ImageDescriptor, ImageDescriptorFlags, ImageFormat, ImageKey,
+    ExternalImageData, ExternalImageId, ExternalImageType, ImageBufferKind, ImageDescriptor,
+    ImageDescriptorFlags, ImageFormat, ImageKey,
 };
-use webrender_traits::{ImageUpdate, WebRenderScriptApi};
+use webrender_traits::{CrossProcessCompositorApi, ImageUpdate, SerializableImageData};
 
 use crate::document_loader::{LoadBlocker, LoadType};
 use crate::dom::attr::Attr;
@@ -157,7 +157,7 @@ impl FrameHolder {
 
 pub struct MediaFrameRenderer {
     player_id: Option<u64>,
-    api: WebRenderScriptApi,
+    compositor_api: CrossProcessCompositorApi,
     current_frame: Option<(ImageKey, i32, i32)>,
     old_frame: Option<ImageKey>,
     very_old_frame: Option<ImageKey>,
@@ -166,10 +166,10 @@ pub struct MediaFrameRenderer {
 }
 
 impl MediaFrameRenderer {
-    fn new(render_api_sender: WebRenderScriptApi) -> Self {
+    fn new(compositor_api: CrossProcessCompositorApi) -> Self {
         Self {
             player_id: None,
-            api: render_api_sender,
+            compositor_api,
             current_frame: None,
             old_frame: None,
             very_old_frame: None,
@@ -214,7 +214,7 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                     updates.push(ImageUpdate::UpdateImage(
                         *image_key,
                         descriptor,
-                        ImageData::Raw(frame.get_data()),
+                        SerializableImageData::Raw(IpcSharedMemory::from_bytes(&frame.get_data())),
                     ));
                 }
 
@@ -229,7 +229,7 @@ impl VideoFrameRenderer for MediaFrameRenderer {
             Some((ref mut image_key, ref mut width, ref mut height)) => {
                 self.old_frame = Some(*image_key);
 
-                let Some(new_image_key) = self.api.generate_image_key() else {
+                let Some(new_image_key) = self.compositor_api.generate_image_key() else {
                     return;
                 };
 
@@ -245,13 +245,13 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                         ImageBufferKind::Texture2D
                     };
 
-                    ImageData::External(ExternalImageData {
+                    SerializableImageData::External(ExternalImageData {
                         id: ExternalImageId(self.player_id.unwrap()),
                         channel_index: 0,
                         image_type: ExternalImageType::TextureHandle(texture_target),
                     })
                 } else {
-                    ImageData::Raw(frame.get_data())
+                    SerializableImageData::Raw(IpcSharedMemory::from_bytes(&frame.get_data()))
                 };
 
                 self.current_frame_holder
@@ -261,7 +261,7 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                 updates.push(ImageUpdate::AddImage(new_image_key, descriptor, image_data));
             },
             None => {
-                let Some(image_key) = self.api.generate_image_key() else {
+                let Some(image_key) = self.compositor_api.generate_image_key() else {
                     return;
                 };
                 self.current_frame = Some((image_key, frame.get_width(), frame.get_height()));
@@ -273,13 +273,13 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                         ImageBufferKind::Texture2D
                     };
 
-                    ImageData::External(ExternalImageData {
+                    SerializableImageData::External(ExternalImageData {
                         id: ExternalImageId(self.player_id.unwrap()),
                         channel_index: 0,
                         image_type: ExternalImageType::TextureHandle(texture_target),
                     })
                 } else {
-                    ImageData::Raw(frame.get_data())
+                    SerializableImageData::Raw(IpcSharedMemory::from_bytes(&frame.get_data()))
                 };
 
                 self.current_frame_holder = Some(FrameHolder::new(frame));
@@ -287,7 +287,7 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                 updates.push(ImageUpdate::AddImage(image_key, descriptor, image_data));
             },
         }
-        self.api.update_images(updates);
+        self.compositor_api.update_images(updates);
     }
 }
 
@@ -446,7 +446,7 @@ impl HTMLMediaElement {
             in_flight_play_promises_queue: Default::default(),
             player: Default::default(),
             video_renderer: Arc::new(Mutex::new(MediaFrameRenderer::new(
-                document.window().get_webrender_api_sender(),
+                document.window().compositor_api().clone(),
             ))),
             audio_renderer: Default::default(),
             show_poster: Cell::new(true),
@@ -717,7 +717,7 @@ impl HTMLMediaElement {
         // changed, which is why we need to pass the base URL in the task
         // right here.
         let doc = document_from_node(self);
-        let task = MediaElementMicrotask::ResourceSelectionTask {
+        let task = MediaElementMicrotask::ResourceSelection {
             elem: DomRoot::from_ref(self),
             generation_id: self.generation_id.get(),
             base_url: doc.base_url(),
@@ -1075,14 +1075,12 @@ impl HTMLMediaElement {
         self.error.get().is_some()
     }
 
-    // https://html.spec.whatwg.org/multipage/#potentially-playing
+    /// <https://html.spec.whatwg.org/multipage/#potentially-playing>
     fn is_potentially_playing(&self) -> bool {
         !self.paused.get() &&
-        // FIXME: We need https://github.com/servo/servo/pull/22348
-        //              to know whether playback has ended or not
-        // !self.Ended() &&
-        self.error.get().is_none() &&
-        !self.is_blocked_media_element()
+            !self.Ended() &&
+            self.error.get().is_none() &&
+            !self.is_blocked_media_element()
     }
 
     // https://html.spec.whatwg.org/multipage/#blocked-media-element
@@ -1865,7 +1863,7 @@ impl HTMLMediaElement {
                 // https://html.spec.whatwg.org/multipage/#dom-media-seek
 
                 // Step 13.
-                let task = MediaElementMicrotask::SeekedTask {
+                let task = MediaElementMicrotask::Seeked {
                     elem: DomRoot::from_ref(self),
                     generation_id: self.generation_id.get(),
                 };
@@ -2512,7 +2510,7 @@ impl VirtualMethods for HTMLMediaElement {
         self.remove_controls();
 
         if context.tree_connected {
-            let task = MediaElementMicrotask::PauseIfNotInDocumentTask {
+            let task = MediaElementMicrotask::PauseIfNotInDocument {
                 elem: DomRoot::from_ref(self),
             };
             ScriptThread::await_stable_state(Microtask::MediaElement(task));
@@ -2539,16 +2537,16 @@ impl LayoutHTMLMediaElementHelpers for LayoutDom<'_, HTMLMediaElement> {
 
 #[derive(JSTraceable, MallocSizeOf)]
 pub enum MediaElementMicrotask {
-    ResourceSelectionTask {
+    ResourceSelection {
         elem: DomRoot<HTMLMediaElement>,
         generation_id: u32,
         #[no_trace]
         base_url: ServoUrl,
     },
-    PauseIfNotInDocumentTask {
+    PauseIfNotInDocument {
         elem: DomRoot<HTMLMediaElement>,
     },
-    SeekedTask {
+    Seeked {
         elem: DomRoot<HTMLMediaElement>,
         generation_id: u32,
     },
@@ -2557,7 +2555,7 @@ pub enum MediaElementMicrotask {
 impl MicrotaskRunnable for MediaElementMicrotask {
     fn handler(&self, can_gc: CanGc) {
         match self {
-            &MediaElementMicrotask::ResourceSelectionTask {
+            &MediaElementMicrotask::ResourceSelection {
                 ref elem,
                 generation_id,
                 ref base_url,
@@ -2566,12 +2564,12 @@ impl MicrotaskRunnable for MediaElementMicrotask {
                     elem.resource_selection_algorithm_sync(base_url.clone(), can_gc);
                 }
             },
-            MediaElementMicrotask::PauseIfNotInDocumentTask { elem } => {
+            MediaElementMicrotask::PauseIfNotInDocument { elem } => {
                 if !elem.upcast::<Node>().is_connected() {
                     elem.internal_pause_steps();
                 }
             },
-            &MediaElementMicrotask::SeekedTask {
+            &MediaElementMicrotask::Seeked {
                 ref elem,
                 generation_id,
             } => {
@@ -2584,9 +2582,9 @@ impl MicrotaskRunnable for MediaElementMicrotask {
 
     fn enter_realm(&self) -> JSAutoRealm {
         match self {
-            &MediaElementMicrotask::ResourceSelectionTask { ref elem, .. } |
-            &MediaElementMicrotask::PauseIfNotInDocumentTask { ref elem } |
-            &MediaElementMicrotask::SeekedTask { ref elem, .. } => enter_realm(&**elem),
+            &MediaElementMicrotask::ResourceSelection { ref elem, .. } |
+            &MediaElementMicrotask::PauseIfNotInDocument { ref elem } |
+            &MediaElementMicrotask::Seeked { ref elem, .. } => enter_realm(&**elem),
         }
     }
 }

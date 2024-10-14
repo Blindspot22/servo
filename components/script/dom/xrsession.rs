@@ -68,6 +68,7 @@ use crate::dom::xrspace::XRSpace;
 use crate::realms::InRealm;
 use crate::script_runtime::JSContext;
 use crate::task_source::TaskSource;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct XRSession {
@@ -240,7 +241,7 @@ impl XRSession {
                 let this = this.clone();
                 let _ = task_source.queue_with_canceller(
                     task!(xr_event_callback: move || {
-                        this.root().event_callback(message.to().unwrap());
+                        this.root().event_callback(message.to().unwrap(), CanGc::note());
                     }),
                     &canceller,
                 );
@@ -275,13 +276,13 @@ impl XRSession {
         let _ = task_source.queue_with_canceller(
             task!(session_initial_inputs: move || {
                 let this = this.root();
-                this.input_sources.add_input_sources(&this, &initial_inputs);
+                this.input_sources.add_input_sources(&this, &initial_inputs, CanGc::note());
             }),
             &canceller,
         );
     }
 
-    fn event_callback(&self, event: XREvent) {
+    fn event_callback(&self, event: XREvent, can_gc: CanGc) {
         match event {
             XREvent::SessionEnd => {
                 // https://immersive-web.github.io/webxr/#shut-down-the-session
@@ -366,13 +367,14 @@ impl XRSession {
                 self.dirty_layers();
             },
             XREvent::AddInput(info) => {
-                self.input_sources.add_input_sources(self, &[info]);
+                self.input_sources.add_input_sources(self, &[info], can_gc);
             },
             XREvent::RemoveInput(id) => {
                 self.input_sources.remove_input_source(self, id);
             },
             XREvent::UpdateInput(id, source) => {
-                self.input_sources.add_remove_input_source(self, id, source);
+                self.input_sources
+                    .add_remove_input_source(self, id, source, can_gc);
             },
             XREvent::InputChanged(id, frame) => {
                 self.input_frames.borrow_mut().insert(id, frame);
@@ -674,16 +676,8 @@ impl XRSessionMethods for XRSession {
 
         // https://immersive-web.github.io/layers/#updaterenderstatechanges
         // Step 1.
-        if init.baseLayer.is_some() {
-            if self.has_layers_feature() {
-                return Err(Error::NotSupported);
-            }
-            // https://github.com/immersive-web/layers/issues/189
-            if init.layers.is_some() {
-                return Err(Error::Type(String::from(
-                    "Cannot set WebXR layers and baseLayer",
-                )));
-            }
+        if init.baseLayer.is_some() && (self.has_layers_feature() || init.layers.is_some()) {
+            return Err(Error::NotSupported);
         }
 
         if let Some(Some(ref layers)) = init.layers {

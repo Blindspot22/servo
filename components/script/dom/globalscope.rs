@@ -120,8 +120,7 @@ use crate::microtask::{Microtask, MicrotaskQueue, UserMicrotask};
 use crate::realms::{enter_realm, AlreadyInRealm, InRealm};
 use crate::script_module::{DynamicModuleList, ModuleScript, ModuleTree, ScriptFetchOptions};
 use crate::script_runtime::{
-    CanGc, CommonScriptMsg, ContextForRequestInterrupt, JSContext as SafeJSContext, ScriptChan,
-    ScriptPort,
+    CanGc, CommonScriptMsg, JSContext as SafeJSContext, ScriptChan, ScriptPort, ThreadSafeJSContext,
 };
 use crate::script_thread::{MainThreadScriptChan, ScriptThread};
 use crate::security_manager::CSPViolationReporter;
@@ -151,7 +150,8 @@ pub struct AutoCloseWorker {
     #[no_trace]
     control_sender: Sender<DedicatedWorkerControlMsg>,
     /// The context to request an interrupt on the worker thread.
-    context: ContextForRequestInterrupt,
+    #[no_trace]
+    context: ThreadSafeJSContext,
 }
 
 impl Drop for AutoCloseWorker {
@@ -168,7 +168,7 @@ impl Drop for AutoCloseWorker {
             warn!("Couldn't send an exit message to a dedicated worker.");
         }
 
-        self.context.request_interrupt();
+        self.context.request_interrupt_callback();
 
         // TODO: step 2 and 3.
         // Step 4 is unnecessary since we don't use actual ports for dedicated workers.
@@ -374,6 +374,8 @@ struct TimerListener {
     context: Trusted<GlobalScope>,
 }
 
+type FileListenerCallback = Box<dyn Fn(Rc<Promise>, Fallible<Vec<u8>>) + Send>;
+
 /// A wrapper for the handling of file data received by the ipc router
 struct FileListener {
     /// State should progress as either of:
@@ -384,19 +386,14 @@ struct FileListener {
     task_canceller: TaskCanceller,
 }
 
-enum FileListenerCallback {
-    Promise(Box<dyn Fn(Rc<Promise>, Result<Vec<u8>, Error>) + Send>),
-    Stream,
-}
-
 enum FileListenerTarget {
-    Promise(TrustedPromise),
+    Promise(TrustedPromise, FileListenerCallback),
     Stream(Trusted<ReadableStream>),
 }
 
 enum FileListenerState {
-    Empty(FileListenerCallback, FileListenerTarget),
-    Receiving(Vec<u8>, FileListenerCallback, FileListenerTarget),
+    Empty(FileListenerTarget),
+    Receiving(Vec<u8>, FileListenerTarget),
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
@@ -532,7 +529,7 @@ impl TimerListener {
                     },
                 };
                 // Step 7, substeps run in a task.
-                global.fire_timer(id);
+                global.fire_timer(id, CanGc::note());
             }),
             &self.canceller,
         );
@@ -616,7 +613,7 @@ impl MessageListener {
 }
 
 /// Callback used to enqueue file chunks to streams as part of FileListener.
-fn stream_handle_incoming(stream: &ReadableStream, bytes: Result<Vec<u8>, Error>) {
+fn stream_handle_incoming(stream: &ReadableStream, bytes: Fallible<Vec<u8>>) {
     match bytes {
         Ok(b) => {
             stream.enqueue_native(b);
@@ -636,7 +633,7 @@ impl FileListener {
     fn handle(&mut self, msg: FileManagerResult<ReadFileProgress>) {
         match msg {
             Ok(ReadFileProgress::Meta(blob_buf)) => match self.state.take() {
-                Some(FileListenerState::Empty(callback, target)) => {
+                Some(FileListenerState::Empty(target)) => {
                     let bytes = if let FileListenerTarget::Stream(ref trusted_stream) = target {
                         let trusted = trusted_stream.clone();
 
@@ -653,14 +650,14 @@ impl FileListener {
                         blob_buf.bytes
                     };
 
-                    self.state = Some(FileListenerState::Receiving(bytes, callback, target));
+                    self.state = Some(FileListenerState::Receiving(bytes, target));
                 },
                 _ => panic!(
                     "Unexpected FileListenerState when receiving ReadFileProgress::Meta msg."
                 ),
             },
             Ok(ReadFileProgress::Partial(mut bytes_in)) => match self.state.take() {
-                Some(FileListenerState::Receiving(mut bytes, callback, target)) => {
+                Some(FileListenerState::Receiving(mut bytes, target)) => {
                     if let FileListenerTarget::Stream(ref trusted_stream) = target {
                         let trusted = trusted_stream.clone();
 
@@ -676,19 +673,15 @@ impl FileListener {
                         bytes.append(&mut bytes_in);
                     };
 
-                    self.state = Some(FileListenerState::Receiving(bytes, callback, target));
+                    self.state = Some(FileListenerState::Receiving(bytes, target));
                 },
                 _ => panic!(
                     "Unexpected FileListenerState when receiving ReadFileProgress::Partial msg."
                 ),
             },
             Ok(ReadFileProgress::EOF) => match self.state.take() {
-                Some(FileListenerState::Receiving(bytes, callback, target)) => match target {
-                    FileListenerTarget::Promise(trusted_promise) => {
-                        let callback = match callback {
-                            FileListenerCallback::Promise(callback) => callback,
-                            _ => panic!("Expected promise callback."),
-                        };
+                Some(FileListenerState::Receiving(bytes, target)) => match target {
+                    FileListenerTarget::Promise(trusted_promise, callback) => {
                         let task = task!(resolve_promise: move || {
                             let promise = trusted_promise.root();
                             let _ac = enter_realm(&*promise.global());
@@ -717,16 +710,12 @@ impl FileListener {
                 },
             },
             Err(_) => match self.state.take() {
-                Some(FileListenerState::Receiving(_, callback, target)) |
-                Some(FileListenerState::Empty(callback, target)) => {
+                Some(FileListenerState::Receiving(_, target)) |
+                Some(FileListenerState::Empty(target)) => {
                     let error = Err(Error::Network);
 
                     match target {
-                        FileListenerTarget::Promise(trusted_promise) => {
-                            let callback = match callback {
-                                FileListenerCallback::Promise(callback) => callback,
-                                _ => panic!("Expected promise callback."),
-                            };
+                        FileListenerTarget::Promise(trusted_promise, callback) => {
                             let _ = self.task_source.queue_with_canceller(
                                 task!(reject_promise: move || {
                                     let promise = trusted_promise.root();
@@ -2021,10 +2010,9 @@ impl GlobalScope {
         let task_source = self.file_reading_task_source();
 
         let mut file_listener = FileListener {
-            state: Some(FileListenerState::Empty(
-                FileListenerCallback::Stream,
-                FileListenerTarget::Stream(trusted_stream),
-            )),
+            state: Some(FileListenerState::Empty(FileListenerTarget::Stream(
+                trusted_stream,
+            ))),
             task_source,
             task_canceller,
         };
@@ -2042,12 +2030,7 @@ impl GlobalScope {
         stream
     }
 
-    pub fn read_file_async(
-        &self,
-        id: Uuid,
-        promise: Rc<Promise>,
-        callback: Box<dyn Fn(Rc<Promise>, Result<Vec<u8>, Error>) + Send>,
-    ) {
+    pub fn read_file_async(&self, id: Uuid, promise: Rc<Promise>, callback: FileListenerCallback) {
         let recv = self.send_msg(id);
 
         let trusted_promise = TrustedPromise::new(promise);
@@ -2055,10 +2038,10 @@ impl GlobalScope {
         let task_source = self.file_reading_task_source();
 
         let mut file_listener = FileListener {
-            state: Some(FileListenerState::Empty(
-                FileListenerCallback::Promise(callback),
-                FileListenerTarget::Promise(trusted_promise),
-            )),
+            state: Some(FileListenerState::Empty(FileListenerTarget::Promise(
+                trusted_promise,
+                callback,
+            ))),
             task_source,
             task_canceller,
         };
@@ -2115,7 +2098,7 @@ impl GlobalScope {
         closing: Arc<AtomicBool>,
         join_handle: JoinHandle<()>,
         control_sender: Sender<DedicatedWorkerControlMsg>,
-        context: ContextForRequestInterrupt,
+        context: ThreadSafeJSContext,
     ) {
         self.list_auto_close_worker
             .borrow_mut()
@@ -2893,8 +2876,8 @@ impl GlobalScope {
         }
     }
 
-    pub fn fire_timer(&self, handle: TimerEventId) {
-        self.timers.fire_timer(handle, self);
+    pub fn fire_timer(&self, handle: TimerEventId, can_gc: CanGc) {
+        self.timers.fire_timer(handle, self, can_gc);
     }
 
     pub fn resume(&self) {
@@ -2926,7 +2909,7 @@ impl GlobalScope {
     /// Returns a boolean indicating whether the event-loop
     /// where this global is running on can continue running JS.
     pub fn can_continue_running(&self) -> bool {
-        if self.downcast::<Window>().is_some() {
+        if self.is::<Window>() {
             return ScriptThread::can_continue_running();
         }
         if let Some(worker) = self.downcast::<WorkerGlobalScope>() {
@@ -3190,20 +3173,25 @@ impl GlobalScope {
         }
     }
 
-    pub fn handle_uncaptured_gpu_error(&self, device: WebGPUDevice, error: webgpu::Error) {
+    pub fn handle_uncaptured_gpu_error(
+        &self,
+        device: WebGPUDevice,
+        error: webgpu::Error,
+        can_gc: CanGc,
+    ) {
         if let Some(gpu_device) = self
             .gpu_devices
             .borrow()
             .get(&device)
             .and_then(|device| device.root())
         {
-            gpu_device.fire_uncaptured_error(error);
+            gpu_device.fire_uncaptured_error(error, can_gc);
         } else {
             warn!("Recived error for lost GPUDevice!")
         }
     }
 
-    pub fn handle_gamepad_event(&self, gamepad_event: GamepadEvent) {
+    pub fn handle_gamepad_event(&self, gamepad_event: GamepadEvent, can_gc: CanGc) {
         match gamepad_event {
             GamepadEvent::Connected(index, name, bounds, supported_haptic_effects) => {
                 self.handle_gamepad_connect(
@@ -3212,6 +3200,7 @@ impl GlobalScope {
                     bounds.axis_bounds,
                     bounds.button_bounds,
                     supported_haptic_effects,
+                    can_gc,
                 );
             },
             GamepadEvent::Disconnected(index) => {
@@ -3234,6 +3223,7 @@ impl GlobalScope {
         axis_bounds: (f64, f64),
         button_bounds: (f64, f64),
         supported_haptic_effects: GamepadSupportedHapticEffects,
+        can_gc: CanGc,
     ) {
         // TODO: 2. If document is not null and is not allowed to use the "gamepad" permission,
         //          then abort these steps.
@@ -3254,7 +3244,8 @@ impl GlobalScope {
                             axis_bounds,
                             button_bounds,
                             supported_haptic_effects,
-                            false
+                            false,
+                            can_gc,
                         );
                         navigator.set_gamepad(selected_index as usize, &gamepad);
                     }

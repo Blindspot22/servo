@@ -693,7 +693,7 @@ impl Document {
         self.activity.get() != DocumentActivity::Inactive
     }
 
-    pub fn set_activity(&self, activity: DocumentActivity) {
+    pub fn set_activity(&self, activity: DocumentActivity, can_gc: CanGc) {
         // This function should only be called on documents with a browsing context
         assert!(self.has_browsing_context);
         if activity == self.activity.get() {
@@ -751,6 +751,7 @@ impl Document {
                         false, // bubbles
                         false, // cancelable
                         true, // persisted
+                        can_gc,
                     );
                     let event = event.upcast::<Event>();
                     event.set_trusted(true);
@@ -765,7 +766,7 @@ impl Document {
         &self.origin
     }
 
-    // https://dom.spec.whatwg.org/#concept-document-url
+    /// <https://dom.spec.whatwg.org/#concept-document-url>
     pub fn url(&self) -> ServoUrl {
         self.url.borrow().clone()
     }
@@ -774,7 +775,7 @@ impl Document {
         *self.url.borrow_mut() = url;
     }
 
-    // https://html.spec.whatwg.org/multipage/#fallback-base-url
+    /// <https://html.spec.whatwg.org/multipage/#fallback-base-url>
     pub fn fallback_base_url(&self) -> ServoUrl {
         let document_url = self.url();
         if let Some(browsing_context) = self.browsing_context() {
@@ -799,7 +800,7 @@ impl Document {
         document_url
     }
 
-    // https://html.spec.whatwg.org/multipage/#document-base-url
+    /// <https://html.spec.whatwg.org/multipage/#document-base-url>
     pub fn base_url(&self) -> ServoUrl {
         match self.base_element() {
             // Step 1.
@@ -2256,7 +2257,7 @@ impl Document {
     }
 
     // https://html.spec.whatwg.org/multipage/#unload-a-document
-    pub fn unload(&self, recursive_flag: bool) {
+    pub fn unload(&self, recursive_flag: bool, can_gc: CanGc) {
         // TODO: Step 1, increase the event loop's termination nesting level by 1.
         // Step 2
         self.incr_ignore_opens_during_unload_counter();
@@ -2272,6 +2273,7 @@ impl Document {
                 false,                  // bubbles
                 false,                  // cancelable
                 self.salvageable.get(), // persisted
+                can_gc,
             );
             let event = event.upcast::<Event>();
             event.set_trusted(true);
@@ -2286,6 +2288,7 @@ impl Document {
                 atom!("unload"),
                 EventBubbles::Bubbles,
                 EventCancelable::Cancelable,
+                can_gc,
             );
             event.set_trusted(true);
             let event_target = self.window.upcast::<EventTarget>();
@@ -2304,7 +2307,7 @@ impl Document {
             for iframe in self.iter_iframes() {
                 // TODO: handle the case of cross origin iframes.
                 let document = document_from_node(&*iframe);
-                document.unload(true);
+                document.unload(true, can_gc);
                 if !document.salvageable() {
                     self.salvageable.set(false);
                 }
@@ -2328,7 +2331,7 @@ impl Document {
     }
 
     // https://html.spec.whatwg.org/multipage/#the-end
-    pub fn maybe_queue_document_completion(&self) {
+    pub fn maybe_queue_document_completion(&self, can_gc: CanGc) {
         // https://html.spec.whatwg.org/multipage/#delaying-load-events-mode
         let is_in_delaying_load_events_mode = match self.window.undiscarded_window_proxy() {
             Some(window_proxy) => window_proxy.is_delaying_load_events_mode(),
@@ -2378,6 +2381,7 @@ impl Document {
                         atom!("load"),
                         EventBubbles::DoesNotBubble,
                         EventCancelable::NotCancelable,
+                        can_gc,
                     );
                     event.set_trusted(true);
 
@@ -2420,6 +2424,7 @@ impl Document {
                             false, // bubbles
                             false, // cancelable
                             false, // persisted
+                            can_gc,
                         );
                         let event = event.upcast::<Event>();
                         event.set_trusted(true);
@@ -2658,7 +2663,7 @@ impl Document {
         for iframe in self.iter_iframes() {
             if let Some(document) = iframe.GetContentDocument() {
                 // TODO: abort the active documents of every child browsing context.
-                document.abort(CanGc::note());
+                document.abort(can_gc);
                 // TODO: salvageable flag.
             }
         }
@@ -2977,7 +2982,10 @@ impl Document {
     }
 
     /// <https://drafts.csswg.org/resize-observer/#broadcast-active-resize-observations>
-    pub(crate) fn broadcast_active_resize_observations(&self) -> ResizeObservationDepth {
+    pub(crate) fn broadcast_active_resize_observations(
+        &self,
+        can_gc: CanGc,
+    ) -> ResizeObservationDepth {
         let mut shallowest = ResizeObservationDepth::max();
         // Breaking potential re-borrow cycle on `resize_observers`:
         // broadcasting resize observations calls into a JS callback,
@@ -2988,7 +2996,7 @@ impl Document {
             .iter()
             .map(|obs| DomRoot::from_ref(&**obs))
         {
-            observer.broadcast_active_resize_observations(&mut shallowest);
+            observer.broadcast_active_resize_observations(&mut shallowest, can_gc);
         }
         shallowest
     }
@@ -3013,6 +3021,30 @@ impl Document {
 
     pub(crate) fn status_code(&self) -> Option<u16> {
         self.status_code
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#encoding-parsing-a-url>
+    pub fn encoding_parse_a_url(&self, url: &str) -> Result<ServoUrl, url::ParseError> {
+        // NOTE: This algorithm is defined for both Document and environment settings objects.
+        // This implementation is only for documents.
+
+        // Step 1. Let encoding be UTF-8.
+        // Step 2. If environment is a Document object, then set encoding to environment's character encoding.
+        let encoding = self.encoding.get();
+
+        // Step 3. Otherwise, if environment's relevant global object is a Window object, set encoding to environment's
+        // relevant global object's associated Document's character encoding.
+
+        // Step 4. Let baseURL be environment's base URL, if environment is a Document object;
+        // otherwise environment's API base URL.
+        let base_url = self.base_url();
+
+        // Step 5. Return the result of applying the URL parser to url, with baseURL and encoding.
+        url::Url::options()
+            .base_url(Some(base_url.as_url()))
+            .encoding_override(Some(&|s| encoding.encode(s).0))
+            .parse(url)
+            .map(ServoUrl::from)
     }
 }
 
@@ -4576,7 +4608,7 @@ impl DocumentMethods for Document {
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createevent
-    fn CreateEvent(&self, mut interface: DOMString) -> Fallible<DomRoot<Event>> {
+    fn CreateEvent(&self, mut interface: DOMString, can_gc: CanGc) -> Fallible<DomRoot<Event>> {
         interface.make_ascii_lowercase();
         match &*interface {
             "beforeunloadevent" => Ok(DomRoot::upcast(BeforeUnloadEvent::new_uninitialized(
@@ -4587,13 +4619,17 @@ impl DocumentMethods for Document {
             )),
             "customevent" => Ok(DomRoot::upcast(CustomEvent::new_uninitialized(
                 self.window.upcast(),
+                can_gc,
             ))),
             // FIXME(#25136): devicemotionevent, deviceorientationevent
             // FIXME(#7529): dragevent
             "events" | "event" | "htmlevents" | "svgevents" => {
-                Ok(Event::new_uninitialized(self.window.upcast()))
+                Ok(Event::new_uninitialized(self.window.upcast(), can_gc))
             },
-            "focusevent" => Ok(DomRoot::upcast(FocusEvent::new_uninitialized(&self.window))),
+            "focusevent" => Ok(DomRoot::upcast(FocusEvent::new_uninitialized(
+                &self.window,
+                can_gc,
+            ))),
             "hashchangeevent" => Ok(DomRoot::upcast(HashChangeEvent::new_uninitialized(
                 &self.window,
             ))),
@@ -4634,8 +4670,8 @@ impl DocumentMethods for Document {
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createrange
-    fn CreateRange(&self) -> DomRoot<Range> {
-        Range::new_with_doc(self, None, CanGc::note())
+    fn CreateRange(&self, can_gc: CanGc) -> DomRoot<Range> {
+        Range::new_with_doc(self, None, can_gc)
     }
 
     // https://dom.spec.whatwg.org/#dom-document-createnodeiteratorroot-whattoshow-filter
@@ -5182,6 +5218,7 @@ impl DocumentMethods for Document {
         &self,
         _unused1: Option<DOMString>,
         _unused2: Option<DOMString>,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<Document>> {
         // Step 1
         if !self.is_html_document() {
@@ -5232,7 +5269,7 @@ impl DocumentMethods for Document {
         if self.has_browsing_context() {
             // spec says "stop document loading",
             // which is a process that does more than just abort
-            self.abort(CanGc::note());
+            self.abort(can_gc);
         }
 
         // Step 9
@@ -5299,6 +5336,7 @@ impl DocumentMethods for Document {
         url: USVString,
         target: DOMString,
         features: DOMString,
+        _can_gc: CanGc,
     ) -> Fallible<Option<DomRoot<WindowProxy>>> {
         self.browsing_context()
             .ok_or(Error::InvalidAccess)?
@@ -5335,7 +5373,7 @@ impl DocumentMethods for Document {
                     return Ok(());
                 }
                 // Step 5.
-                self.Open(None, None)?;
+                self.Open(None, None, can_gc)?;
                 self.get_current_parser().unwrap()
             },
         };

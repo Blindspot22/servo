@@ -1023,19 +1023,9 @@ impl<'a> FlexItem<'a> {
             flex_context.config.flex_axis,
         );
 
-        let pbm = box_.style().padding_border_margin(containing_block);
-        let content_box_size = box_
+        let (content_box_size, min_size, max_size, pbm) = box_
             .style()
-            .content_box_size_deprecated(containing_block, &pbm)
-            .map(|v| v.map(Au::from));
-        let max_size = box_
-            .style()
-            .content_max_box_size_deprecated(containing_block, &pbm)
-            .map(|v| v.map(Au::from));
-        let min_size = box_
-            .style()
-            .content_min_box_size_deprecated(containing_block, &pbm)
-            .map(|v| v.map(Au::from));
+            .content_box_sizes_and_padding_border_margin_deprecated(&containing_block.into());
 
         let margin_auto_is_zero = flex_context.sides_to_flex_relative(pbm.margin.auto_is(Au::zero));
         let padding = flex_context.sides_to_flex_relative(pbm.padding);
@@ -2522,7 +2512,9 @@ impl FlexItemBox {
                     .auto_is(|| {
                         let containing_block_inline_size_minus_pbm =
                             flex_context.containing_block.inline_size -
-                                padding_border_margin.padding_border_sums.inline;
+                                padding_border_margin.padding_border_sums.inline -
+                                padding_border_margin.margin.inline_start.auto_is(Au::zero) -
+                                padding_border_margin.margin.inline_end.auto_is(Au::zero);
 
                         if item_with_auto_cross_size_stretches_to_container_size {
                             containing_block_inline_size_minus_pbm

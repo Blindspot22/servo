@@ -95,7 +95,7 @@ use style::thread_state::{self, ThreadState};
 use url::Position;
 use webgpu::{WebGPUDevice, WebGPUMsg};
 use webrender_api::DocumentId;
-use webrender_traits::WebRenderScriptApi;
+use webrender_traits::CrossProcessCompositorApi;
 
 use crate::document_loader::DocumentLoader;
 use crate::dom::bindings::cell::DomRefCell;
@@ -145,8 +145,8 @@ use crate::microtask::{Microtask, MicrotaskQueue};
 use crate::realms::enter_realm;
 use crate::script_module::ScriptFetchOptions;
 use crate::script_runtime::{
-    get_reports, new_rt_and_cx, CanGc, CommonScriptMsg, ContextForRequestInterrupt, JSContext,
-    Runtime, ScriptChan, ScriptPort, ScriptThreadEventCategory,
+    get_reports, new_rt_and_cx, CanGc, CommonScriptMsg, JSContext, Runtime, ScriptChan, ScriptPort,
+    ScriptThreadEventCategory, ThreadSafeJSContext,
 };
 use crate::task_manager::TaskManager;
 use crate::task_queue::{QueuedTask, QueuedTaskConversion, TaskQueue};
@@ -669,9 +669,9 @@ pub struct ScriptThread {
     #[no_trace]
     webrender_document: DocumentId,
 
-    /// Webrender API sender.
+    /// Cross-process access to the compositor's API.
     #[no_trace]
-    webrender_api_sender: WebRenderScriptApi,
+    compositor_api: CrossProcessCompositorApi,
 
     /// Periodically print out on which events script threads spend their processing time.
     profile_script_events: bool,
@@ -734,13 +734,13 @@ pub struct ScriptThread {
 
 struct BHMExitSignal {
     closing: Arc<AtomicBool>,
-    js_context: ContextForRequestInterrupt,
+    js_context: ThreadSafeJSContext,
 }
 
 impl BackgroundHangMonitorExitSignal for BHMExitSignal {
     fn signal_to_exit(&self) {
         self.closing.store(true, Ordering::SeqCst);
-        self.js_context.request_interrupt();
+        self.js_context.request_interrupt_callback();
     }
 }
 
@@ -1314,7 +1314,7 @@ impl ScriptThread {
         let closing = Arc::new(AtomicBool::new(false));
         let background_hang_monitor_exit_signal = BHMExitSignal {
             closing: closing.clone(),
-            js_context: ContextForRequestInterrupt::new(cx),
+            js_context: runtime.thread_safe_js_context(),
         };
 
         let background_hang_monitor = state.background_hang_monitor_register.register_component(
@@ -1399,7 +1399,7 @@ impl ScriptThread {
             custom_element_reaction_stack: CustomElementReactionStack::new(),
 
             webrender_document: state.webrender_document,
-            webrender_api_sender: state.webrender_api_sender,
+            compositor_api: state.compositor_api,
 
             profile_script_events: opts.debug.profile_script_events,
             print_pwm: opts.print_pwm,
@@ -1538,7 +1538,7 @@ impl ScriptThread {
     }
 
     /// Process compositor events as part of a "update the rendering task".
-    fn process_pending_compositor_events(&self, pipeline_id: PipelineId) {
+    fn process_pending_compositor_events(&self, pipeline_id: PipelineId, can_gc: CanGc) {
         let Some(document) = self.documents.borrow().find_document(pipeline_id) else {
             warn!("Processing pending compositor events for closed pipeline {pipeline_id}.");
             return;
@@ -1630,7 +1630,7 @@ impl ScriptThread {
 
                 CompositorEvent::GamepadEvent(gamepad_event) => {
                     let global = window.upcast::<GlobalScope>();
-                    global.handle_gamepad_event(gamepad_event);
+                    global.handle_gamepad_event(gamepad_event, can_gc);
                 },
             }
         }
@@ -1638,7 +1638,7 @@ impl ScriptThread {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#update-the-rendering>
-    fn update_the_rendering(&self) {
+    fn update_the_rendering(&self, can_gc: CanGc) {
         self.update_the_rendering_task_queued_for_pipeline
             .borrow_mut()
             .clear();
@@ -1687,7 +1687,7 @@ impl ScriptThread {
 
             // TODO: Should this be broken and to match the specification more closely? For instance see
             // https://html.spec.whatwg.org/multipage/#flush-autofocus-candidates.
-            self.process_pending_compositor_events(pipeline_id);
+            self.process_pending_compositor_events(pipeline_id, can_gc);
 
             // TODO(#31665): Implement the "run the scroll steps" from
             // https://drafts.csswg.org/cssom-view/#document-run-the-scroll-steps.
@@ -1707,7 +1707,7 @@ impl ScriptThread {
             }
 
             // Update animations and send events.
-            self.update_animations_and_send_events();
+            self.update_animations_and_send_events(can_gc);
 
             // TODO(#31866): Implement "run the fullscreen steps" from
             // https://fullscreen.spec.whatwg.org/multipage/#run-the-fullscreen-steps.
@@ -1723,7 +1723,7 @@ impl ScriptThread {
             let mut depth = Default::default();
             while document.gather_active_resize_observations_at_depth(&depth) {
                 // Note: this will reflow the doc.
-                depth = document.broadcast_active_resize_observations();
+                depth = document.broadcast_active_resize_observations(can_gc);
             }
 
             if document.has_skipped_resize_observations() {
@@ -1781,7 +1781,7 @@ impl ScriptThread {
                 SCRIPT_THREAD_ROOT.with(|root| {
                     if let Some(script_thread) = root.get() {
                         let script_thread = unsafe {&*script_thread};
-                        script_thread.update_the_rendering();
+                        script_thread.update_the_rendering(CanGc::note());
                     }
                 })
             }),
@@ -2005,7 +2005,9 @@ impl ScriptThread {
                     FromScript(inner_msg) => self.handle_msg_from_script(inner_msg),
                     FromDevtools(inner_msg) => self.handle_msg_from_devtools(inner_msg),
                     FromImageCache(inner_msg) => self.handle_msg_from_image_cache(inner_msg),
-                    FromWebGPUServer(inner_msg) => self.handle_msg_from_webgpu_server(inner_msg),
+                    FromWebGPUServer(inner_msg) => {
+                        self.handle_msg_from_webgpu_server(inner_msg, can_gc)
+                    },
                 }
 
                 None
@@ -2025,7 +2027,7 @@ impl ScriptThread {
             let mut docs = self.docs_with_no_blocking_loads.borrow_mut();
             for document in docs.iter() {
                 let _realm = enter_realm(&**document);
-                document.maybe_queue_document_completion();
+                document.maybe_queue_document_completion(can_gc);
 
                 // Document load is a rendering opportunity.
                 ScriptThread::note_rendering_opportunity(document.window().pipeline_id());
@@ -2069,7 +2071,7 @@ impl ScriptThread {
 
     // Perform step 7.10 from https://html.spec.whatwg.org/multipage/#event-loop-processing-model.
     // Described at: https://drafts.csswg.org/web-animations-1/#update-animations-and-send-events
-    fn update_animations_and_send_events(&self) {
+    fn update_animations_and_send_events(&self, can_gc: CanGc) {
         for (_, document) in self.documents.borrow().iter() {
             document.update_animation_timeline();
             document.maybe_mark_animating_nodes_as_dirty();
@@ -2077,7 +2079,9 @@ impl ScriptThread {
 
         for (_, document) in self.documents.borrow().iter() {
             let _realm = enter_realm(&*document);
-            document.animations().send_pending_events(document.window());
+            document
+                .animations()
+                .send_pending_events(document.window(), can_gc);
         }
     }
 
@@ -2309,7 +2313,7 @@ impl ScriptThread {
                 can_gc,
             ),
             ConstellationControlMsg::UnloadDocument(pipeline_id) => {
-                self.handle_unload_document(pipeline_id)
+                self.handle_unload_document(pipeline_id, can_gc)
             },
             ConstellationControlMsg::ResizeInactive(id, new_size) => {
                 self.handle_resize_inactive_msg(id, new_size)
@@ -2318,7 +2322,7 @@ impl ScriptThread {
                 self.handle_get_title_msg(pipeline_id)
             },
             ConstellationControlMsg::SetDocumentActivity(pipeline_id, activity) => {
-                self.handle_set_document_activity_msg(pipeline_id, activity)
+                self.handle_set_document_activity_msg(pipeline_id, activity, can_gc)
             },
             ConstellationControlMsg::SetThrottled(pipeline_id, throttled) => {
                 self.handle_set_throttled_msg(pipeline_id, throttled)
@@ -2473,7 +2477,7 @@ impl ScriptThread {
         window.layout_mut().set_epoch_paint_time(epoch, time);
     }
 
-    fn handle_msg_from_webgpu_server(&self, msg: WebGPUMsg) {
+    fn handle_msg_from_webgpu_server(&self, msg: WebGPUMsg, can_gc: CanGc) {
         match msg {
             WebGPUMsg::FreeAdapter(id) => self.gpu_id_hub.free_adapter_id(id),
             WebGPUMsg::FreeDevice {
@@ -2518,7 +2522,7 @@ impl ScriptThread {
             } => {
                 let global = self.documents.borrow().find_global(pipeline_id).unwrap();
                 let _ac = enter_realm(&*global);
-                global.handle_uncaptured_gpu_error(device, error);
+                global.handle_uncaptured_gpu_error(device, error, can_gc);
             },
             _ => {},
         }
@@ -2986,7 +2990,12 @@ impl ScriptThread {
     }
 
     /// Handles activity change message
-    fn handle_set_document_activity_msg(&self, id: PipelineId, activity: DocumentActivity) {
+    fn handle_set_document_activity_msg(
+        &self,
+        id: PipelineId,
+        activity: DocumentActivity,
+        can_gc: CanGc,
+    ) {
         debug!(
             "Setting activity of {} to be {:?} in {:?}.",
             id,
@@ -2995,7 +3004,7 @@ impl ScriptThread {
         );
         let document = self.documents.borrow().find_document(id);
         if let Some(document) = document {
-            document.set_activity(activity);
+            document.set_activity(activity, can_gc);
             return;
         }
         let mut loads = self.incomplete_loads.borrow_mut();
@@ -3071,10 +3080,10 @@ impl ScriptThread {
         }
     }
 
-    fn handle_unload_document(&self, pipeline_id: PipelineId) {
+    fn handle_unload_document(&self, pipeline_id: PipelineId, can_gc: CanGc) {
         let document = self.documents.borrow().find_document(pipeline_id);
         if let Some(document) = document {
-            document.unload(false);
+            document.unload(false, can_gc);
         }
     }
 
@@ -3661,7 +3670,7 @@ impl ScriptThread {
             system_font_service: self.system_font_service.clone(),
             resource_threads: self.resource_threads.clone(),
             time_profiler_chan: self.time_profiler_chan.clone(),
-            webrender_api_sender: self.webrender_api_sender.clone(),
+            compositor_api: self.compositor_api.clone(),
             paint_time_metrics,
             window_size: incomplete.window_size,
         };
@@ -3692,7 +3701,7 @@ impl ScriptThread {
             self.webxr_registry.clone(),
             self.microtask_queue.clone(),
             self.webrender_document,
-            self.webrender_api_sender.clone(),
+            self.compositor_api.clone(),
             self.relayout_event,
             self.prepare_for_screenshot,
             self.unminify_js,

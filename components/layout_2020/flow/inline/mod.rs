@@ -117,16 +117,17 @@ use crate::context::LayoutContext;
 use crate::flow::float::{FloatBox, SequentialLayoutState};
 use crate::flow::{CollapsibleWithParentStartMargin, FlowLayout};
 use crate::formatting_contexts::{
-    Baselines, IndependentFormattingContext, NonReplacedFormattingContextContents,
+    Baselines, IndependentFormattingContext, IndependentLayoutResult,
+    NonReplacedFormattingContextContents,
 };
 use crate::fragment_tree::{
     BoxFragment, CollapsedBlockMargins, CollapsedMargin, Fragment, FragmentFlags,
     PositioningFragment,
 };
-use crate::geom::{LogicalRect, LogicalVec2, PhysicalPoint, PhysicalRect, ToLogical};
+use crate::geom::{LogicalRect, LogicalVec2, ToLogical};
 use crate::positioned::{AbsolutelyPositionedBox, PositioningContext};
 use crate::sizing::ContentSizes;
-use crate::style_ext::{Clamp, ComputedValuesExt, PaddingBorderMargin};
+use crate::style_ext::{ComputedValuesExt, PaddingBorderMargin};
 use crate::{ContainingBlock, IndefiniteContainingBlock};
 
 // From gfxFontConstants.h in Firefox.
@@ -1907,139 +1908,27 @@ impl IndependentFormattingContext {
         offset_in_text: usize,
         bidi_level: Level,
     ) {
-        let style = self.style();
-        let container_writing_mode = layout.containing_block.style.writing_mode;
-        let pbm = style.padding_border_margin(layout.containing_block);
-        let margin = pbm.margin.auto_is(Au::zero);
-        let pbm_sums = pbm.padding + pbm.border + margin;
-
         // We need to know the inline size of the atomic before deciding whether to do the line break.
-        let (fragments, content_rect, baselines, mut child_positioning_context) = match self {
-            IndependentFormattingContext::Replaced(replaced) => {
-                let size = replaced
-                    .contents
-                    .used_size_as_if_inline_element(layout.containing_block, &replaced.style, &pbm)
-                    .to_physical_size(container_writing_mode);
-                let fragments = replaced.contents.make_fragments(
-                    &replaced.style,
-                    layout.containing_block,
-                    size,
-                );
-
-                let content_rect = PhysicalRect::new(PhysicalPoint::zero(), size);
-                (fragments, content_rect, None, None)
-            },
-            IndependentFormattingContext::NonReplaced(non_replaced) => {
-                let box_size = non_replaced
-                    .style
-                    .content_box_size_deprecated(layout.containing_block, &pbm)
-                    .map(|v| v.map(Au::from));
-                let max_box_size = non_replaced
-                    .style
-                    .content_max_box_size_deprecated(layout.containing_block, &pbm)
-                    .map(|v| v.map(Au::from));
-                let min_box_size = non_replaced
-                    .style
-                    .content_min_box_size_deprecated(layout.containing_block, &pbm)
-                    .map(|v| v.map(Au::from))
-                    .auto_is(Au::zero);
-                let block_size = box_size
-                    .block
-                    .map(|v| v.clamp_between_extremums(min_box_size.block, max_box_size.block));
-
-                // https://drafts.csswg.org/css2/visudet.html#inlineblock-width
-                let tentative_inline_size = box_size.inline.auto_is(|| {
-                    let style = non_replaced.style.clone();
-                    let containing_block_for_children =
-                        IndefiniteContainingBlock::new_for_style_and_block_size(&style, block_size);
-                    let available_size =
-                        layout.containing_block.inline_size - pbm_sums.inline_sum();
-                    non_replaced
-                        .inline_content_sizes(layout.layout_context, &containing_block_for_children)
-                        .shrink_to_fit(available_size)
-                });
-
-                // https://drafts.csswg.org/css2/visudet.html#min-max-widths
-                // In this case “applying the rules above again” with a non-auto inline-size
-                // always results in that size.
-                let inline_size = tentative_inline_size
-                    .clamp_between_extremums(min_box_size.inline, max_box_size.inline);
-
-                let containing_block_for_children = ContainingBlock {
-                    inline_size,
-                    block_size,
-                    style: &non_replaced.style,
-                };
-                assert_eq!(
-                    layout.containing_block.style.writing_mode.is_horizontal(),
-                    containing_block_for_children
-                        .style
-                        .writing_mode
-                        .is_horizontal(),
-                    "Mixed horizontal and vertical writing modes are not supported yet"
-                );
-
-                let mut positioning_context =
-                    PositioningContext::new_for_style(&non_replaced.style)
-                        .unwrap_or_else(|| PositioningContext::new_for_subtree(true));
-                let independent_layout = non_replaced.layout(
-                    layout.layout_context,
-                    &mut positioning_context,
-                    &containing_block_for_children,
-                    layout.containing_block,
-                );
-                let (inline_size, block_size) =
-                    match independent_layout.content_inline_size_for_table {
-                        Some(inline) => (inline, independent_layout.content_block_size),
-                        None => {
-                            // https://drafts.csswg.org/css2/visudet.html#block-root-margin
-                            let block_size = block_size.auto_is(|| {
-                                // https://drafts.csswg.org/css2/visudet.html#min-max-heights
-                                // In this case “applying the rules above again” with a non-auto block-size
-                                // always results in that size.
-                                independent_layout
-                                    .content_block_size
-                                    .clamp_between_extremums(min_box_size.block, max_box_size.block)
-                            });
-                            (inline_size, block_size)
-                        },
-                    };
-
-                let content_rect = PhysicalRect::new(
-                    PhysicalPoint::zero(),
-                    LogicalVec2 {
-                        block: block_size,
-                        inline: inline_size,
-                    }
-                    .to_physical_size(container_writing_mode),
-                );
-
-                (
-                    independent_layout.fragments,
-                    content_rect,
-                    Some(independent_layout.baselines),
-                    Some(positioning_context),
-                )
-            },
-        };
+        let mut child_positioning_context = PositioningContext::new_for_style(self.style())
+            .unwrap_or_else(|| PositioningContext::new_for_subtree(true));
+        let IndependentLayoutResult {
+            mut fragment,
+            baselines,
+            pbm_sums,
+        } = self.layout_float_or_atomic_inline(
+            layout.layout_context,
+            &mut child_positioning_context,
+            layout.containing_block,
+        );
 
         // Offset the content rectangle by the physical offset of the padding, border, and margin.
+        let container_writing_mode = layout.containing_block.style.writing_mode;
         let pbm_physical_offset = pbm_sums
             .start_offset()
             .to_physical_size(container_writing_mode);
-        let content_rect = content_rect.translate(pbm_physical_offset.to_vector());
-
-        let fragment = BoxFragment::new(
-            self.base_fragment_info(),
-            self.style().clone(),
-            fragments,
-            content_rect,
-            pbm.padding.to_physical(container_writing_mode),
-            pbm.border.to_physical(container_writing_mode),
-            margin.to_physical(container_writing_mode),
-            None, /* clearance */
-            CollapsedBlockMargins::zero(),
-        );
+        fragment.content_rect = fragment
+            .content_rect
+            .translate(pbm_physical_offset.to_vector());
 
         // Apply baselines if necessary.
         let mut fragment = match baselines {
@@ -2049,14 +1938,18 @@ impl IndependentFormattingContext {
 
         // Lay out absolutely positioned children if this new atomic establishes a containing block
         // for absolutes.
-        if let Some(positioning_context) = child_positioning_context.as_mut() {
+        let positioning_context = if matches!(self, IndependentFormattingContext::Replaced(_)) {
+            None
+        } else {
             if fragment
                 .style
                 .establishes_containing_block_for_absolute_descendants(fragment.base.flags)
             {
-                positioning_context.layout_collected_children(layout.layout_context, &mut fragment);
+                child_positioning_context
+                    .layout_collected_children(layout.layout_context, &mut fragment);
             }
-        }
+            Some(child_positioning_context)
+        };
 
         if layout.text_wrap_mode == TextWrapMode::Wrap &&
             !layout
@@ -2088,7 +1981,7 @@ impl IndependentFormattingContext {
             AtomicLineItem {
                 fragment,
                 size,
-                positioning_context: child_positioning_context,
+                positioning_context,
                 baseline_offset_in_parent,
                 baseline_offset_in_item: baseline_offset,
                 bidi_level,

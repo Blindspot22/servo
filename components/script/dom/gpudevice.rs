@@ -63,6 +63,7 @@ use crate::dom::gputexture::GPUTexture;
 use crate::dom::gpuuncapturederrorevent::GPUUncapturedErrorEvent;
 use crate::dom::promise::Promise;
 use crate::realms::InRealm;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct GPUDevice {
@@ -83,6 +84,29 @@ pub struct GPUDevice {
     #[ignore_malloc_size_of = "promises are hard"]
     lost_promise: DomRefCell<Rc<Promise>>,
     valid: Cell<bool>,
+}
+
+pub enum PipelineLayout {
+    Implicit(PipelineLayoutId, Vec<BindGroupLayoutId>),
+    Explicit(PipelineLayoutId),
+}
+
+impl PipelineLayout {
+    pub fn explicit(&self) -> Option<PipelineLayoutId> {
+        match self {
+            PipelineLayout::Explicit(layout_id) => Some(*layout_id),
+            _ => None,
+        }
+    }
+
+    pub fn implicit(self) -> Option<(PipelineLayoutId, Vec<BindGroupLayoutId>)> {
+        match self {
+            PipelineLayout::Implicit(layout_id, bind_group_layout_ids) => {
+                Some((layout_id, bind_group_layout_ids))
+            },
+            _ => None,
+        }
+    }
 }
 
 impl GPUDevice {
@@ -170,8 +194,8 @@ impl GPUDevice {
         }
     }
 
-    pub fn fire_uncaptured_error(&self, error: webgpu::Error) {
-        let error = GPUError::from_error(&self.global(), error);
+    pub fn fire_uncaptured_error(&self, error: webgpu::Error, can_gc: CanGc) {
+        let error = GPUError::from_error(&self.global(), error, can_gc);
         let ev = GPUUncapturedErrorEvent::new(
             &self.global(),
             DOMString::from("uncapturederror"),
@@ -212,39 +236,30 @@ impl GPUDevice {
     pub fn get_pipeline_layout_data(
         &self,
         layout: &GPUPipelineLayoutOrGPUAutoLayoutMode,
-    ) -> (
-        Option<PipelineLayoutId>,
-        Option<(PipelineLayoutId, Vec<BindGroupLayoutId>)>,
-        Vec<webgpu::WebGPUBindGroupLayout>,
-    ) {
+    ) -> PipelineLayout {
         if let GPUPipelineLayoutOrGPUAutoLayoutMode::GPUPipelineLayout(ref layout) = layout {
-            (Some(layout.id().0), None, layout.bind_group_layouts())
+            PipelineLayout::Explicit(layout.id().0)
         } else {
             let layout_id = self.global().wgpu_id_hub().create_pipeline_layout_id();
             let max_bind_grps = self.limits.MaxBindGroups();
-            let mut bgls = Vec::with_capacity(max_bind_grps as usize);
             let mut bgl_ids = Vec::with_capacity(max_bind_grps as usize);
             for _ in 0..max_bind_grps {
                 let bgl = self.global().wgpu_id_hub().create_bind_group_layout_id();
-                bgls.push(webgpu::WebGPUBindGroupLayout(bgl));
                 bgl_ids.push(bgl);
             }
-            (None, Some((layout_id, bgl_ids)), bgls)
+            PipelineLayout::Implicit(layout_id, bgl_ids)
         }
     }
 
     pub fn parse_render_pipeline<'a>(
         &self,
         descriptor: &GPURenderPipelineDescriptor,
-    ) -> Fallible<(
-        Option<(PipelineLayoutId, Vec<BindGroupLayoutId>)>,
-        RenderPipelineDescriptor<'a>,
-    )> {
-        let (layout, implicit_ids, _) = self.get_pipeline_layout_data(&descriptor.parent.layout);
+    ) -> Fallible<(PipelineLayout, RenderPipelineDescriptor<'a>)> {
+        let pipeline_layout = self.get_pipeline_layout_data(&descriptor.parent.layout);
 
         let desc = wgpu_pipe::RenderPipelineDescriptor {
             label: (&descriptor.parent.parent).into(),
-            layout,
+            layout: pipeline_layout.explicit(),
             cache: None,
             vertex: wgpu_pipe::VertexState {
                 stage: (&descriptor.vertex.parent).into(),
@@ -348,7 +363,7 @@ impl GPUDevice {
             },
             multiview: None,
         };
-        Ok((implicit_ids, desc))
+        Ok((pipeline_layout, desc))
     }
 
     /// <https://gpuweb.github.io/gpuweb/#lose-the-device>
@@ -476,8 +491,8 @@ impl GPUDeviceMethods for GPUDevice {
         &self,
         descriptor: &GPURenderPipelineDescriptor,
     ) -> Fallible<DomRoot<GPURenderPipeline>> {
-        let (implicit_ids, desc) = self.parse_render_pipeline(descriptor)?;
-        let render_pipeline = GPURenderPipeline::create(self, implicit_ids, desc, None)?;
+        let (pipeline_layout, desc) = self.parse_render_pipeline(descriptor)?;
+        let render_pipeline = GPURenderPipeline::create(self, pipeline_layout, desc, None)?;
         Ok(GPURenderPipeline::new(
             &self.global(),
             render_pipeline,
@@ -560,13 +575,13 @@ impl GPUDeviceMethods for GPUDevice {
 }
 
 impl AsyncWGPUListener for GPUDevice {
-    fn handle_response(&self, response: WebGPUResponse, promise: &Rc<Promise>) {
+    fn handle_response(&self, response: WebGPUResponse, promise: &Rc<Promise>, can_gc: CanGc) {
         match response {
             WebGPUResponse::PoppedErrorScope(result) => match result {
                 Ok(None) | Err(PopError::Lost) => promise.resolve_native(&None::<Option<GPUError>>),
                 Err(PopError::Empty) => promise.reject_error(Error::Operation),
                 Ok(Some(error)) => {
-                    let error = GPUError::from_error(&self.global(), error);
+                    let error = GPUError::from_error(&self.global(), error, can_gc);
                     promise.resolve_native(&error);
                 },
             },

@@ -145,6 +145,7 @@ pub fn Fetch(
     input: RequestInfo,
     init: RootedTraceableBox<RequestInit>,
     comp: InRealm,
+    can_gc: CanGc,
 ) -> Rc<Promise> {
     let core_resource_thread = global.core_resource_thread();
 
@@ -153,12 +154,12 @@ pub fn Fetch(
 
     // Step 7. Let responseObject be null.
     // NOTE: We do initialize the object earlier earlier so we can use it to track errors
-    let response = Response::new(global);
+    let response = Response::new(global, can_gc);
     response.Headers().set_guard(Guard::Immutable);
 
     // Step 2. Let requestObject be the result of invoking the initial value of Request as constructor
     //         with input and init as arguments. If this throws an exception, reject p with it and return p.
-    let request = match Request::Constructor(global, None, CanGc::note(), input, init) {
+    let request = match Request::Constructor(global, None, can_gc, input, init) {
         Err(e) => {
             response.error_stream(e.clone());
             promise.reject_error(e);
@@ -181,7 +182,7 @@ pub fn Fetch(
 
     // Step 6. If globalObject is a ServiceWorkerGlobalScope object, then set request’s
     //         service-workers mode to "none".
-    if global.downcast::<ServiceWorkerGlobalScope>().is_some() {
+    if global.is::<ServiceWorkerGlobalScope>() {
         request_init.service_workers_mode = ServiceWorkersMode::None;
     }
 
