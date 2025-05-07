@@ -4,15 +4,15 @@
 
 use cssparser::match_ignore_ascii_case;
 use dom_struct::dom_struct;
-use html5ever::{local_name, namespace_url, ns, LocalName, Prefix};
+use html5ever::{LocalName, Prefix, local_name, ns};
 use js::rust::HandleObject;
-use servo_atoms::Atom;
 use style::attr::AttrValue;
 use style::color::AbsoluteColor;
-use style::str::{read_numbers, HTML_SPACE_CHARACTERS};
+use style::str::{HTML_SPACE_CHARACTERS, read_numbers};
 use style::values::computed::font::{
     FamilyName, FontFamilyNameSyntax, GenericFontFamily, SingleFontFamily,
 };
+use stylo_atoms::Atom;
 
 use crate::dom::attr::Attr;
 use crate::dom::bindings::codegen::Bindings::HTMLFontElementBinding::HTMLFontElementMethods;
@@ -24,9 +24,10 @@ use crate::dom::element::{Element, LayoutElementHelpers};
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::node::Node;
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct HTMLFontElement {
+pub(crate) struct HTMLFontElement {
     htmlelement: HTMLElement,
 }
 
@@ -41,17 +42,19 @@ impl HTMLFontElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLFontElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLFontElement::new_inherited(local_name, prefix, document)),
             document,
             proto,
+            can_gc,
         )
     }
 
@@ -87,7 +90,7 @@ impl HTMLFontElement {
     }
 }
 
-impl HTMLFontElementMethods for HTMLFontElement {
+impl HTMLFontElementMethods<crate::DomTypeHolder> for HTMLFontElement {
     // https://html.spec.whatwg.org/multipage/#dom-font-color
     make_getter!(Color, "color");
 
@@ -104,9 +107,9 @@ impl HTMLFontElementMethods for HTMLFontElement {
     make_getter!(Size, "size");
 
     // https://html.spec.whatwg.org/multipage/#dom-font-size
-    fn SetSize(&self, value: DOMString) {
+    fn SetSize(&self, value: DOMString, can_gc: CanGc) {
         let element = self.upcast::<Element>();
-        element.set_attribute(&local_name!("size"), parse_size(&value));
+        element.set_attribute(&local_name!("size"), parse_size(&value), can_gc);
     }
 }
 
@@ -141,7 +144,7 @@ impl VirtualMethods for HTMLFontElement {
     }
 }
 
-pub trait HTMLFontElementLayoutHelpers {
+pub(crate) trait HTMLFontElementLayoutHelpers {
     fn get_color(self) -> Option<AbsoluteColor>;
     fn get_face(self) -> Option<Atom>;
     fn get_size(self) -> Option<u32>;

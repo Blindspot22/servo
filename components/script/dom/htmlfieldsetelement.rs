@@ -5,9 +5,9 @@
 use std::default::Default;
 
 use dom_struct::dom_struct;
-use html5ever::{local_name, LocalName, Prefix};
+use html5ever::{LocalName, Prefix, local_name};
 use js::rust::HandleObject;
-use style_dom::ElementState;
+use stylo_dom::ElementState;
 
 use crate::dom::attr::Attr;
 use crate::dom::bindings::codegen::Bindings::HTMLFieldSetElementBinding::HTMLFieldSetElementMethods;
@@ -17,18 +17,19 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::customelementregistry::CallbackReaction;
 use crate::dom::document::Document;
 use crate::dom::element::{AttributeMutation, Element};
-use crate::dom::htmlcollection::{CollectionFilter, HTMLCollection};
+use crate::dom::htmlcollection::HTMLCollection;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmlformelement::{FormControl, HTMLFormElement};
 use crate::dom::htmllegendelement::HTMLLegendElement;
-use crate::dom::node::{window_from_node, Node, ShadowIncluding};
+use crate::dom::node::{Node, NodeTraits, ShadowIncluding};
 use crate::dom::validation::Validatable;
 use crate::dom::validitystate::ValidityState;
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
 use crate::script_thread::ScriptThread;
 
 #[dom_struct]
-pub struct HTMLFieldSetElement {
+pub(crate) struct HTMLFieldSetElement {
     htmlelement: HTMLElement,
     form_owner: MutNullableDom<HTMLFormElement>,
     validity_state: MutNullableDom<ValidityState>,
@@ -52,12 +53,13 @@ impl HTMLFieldSetElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLFieldSetElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLFieldSetElement::new_inherited(
@@ -65,15 +67,16 @@ impl HTMLFieldSetElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 
-    pub fn update_validity(&self) {
+    pub(crate) fn update_validity(&self, can_gc: CanGc) {
         let has_invalid_child = self
             .upcast::<Node>()
             .traverse_preorder(ShadowIncluding::No)
             .flat_map(DomRoot::downcast::<Element>)
-            .any(|element| element.is_invalid(false));
+            .any(|element| element.is_invalid(false, can_gc));
 
         self.upcast::<Element>()
             .set_state(ElementState::VALID, !has_invalid_child);
@@ -82,20 +85,19 @@ impl HTMLFieldSetElement {
     }
 }
 
-impl HTMLFieldSetElementMethods for HTMLFieldSetElement {
+impl HTMLFieldSetElementMethods<crate::DomTypeHolder> for HTMLFieldSetElement {
     // https://html.spec.whatwg.org/multipage/#dom-fieldset-elements
-    fn Elements(&self) -> DomRoot<HTMLCollection> {
-        #[derive(JSTraceable, MallocSizeOf)]
-        struct ElementsFilter;
-        impl CollectionFilter for ElementsFilter {
-            fn filter<'a>(&self, elem: &'a Element, _root: &'a Node) -> bool {
-                elem.downcast::<HTMLElement>()
+    fn Elements(&self, can_gc: CanGc) -> DomRoot<HTMLCollection> {
+        HTMLCollection::new_with_filter_fn(
+            &self.owner_window(),
+            self.upcast(),
+            |element, _| {
+                element
+                    .downcast::<HTMLElement>()
                     .is_some_and(HTMLElement::is_listed_element)
-            }
-        }
-        let filter = Box::new(ElementsFilter);
-        let window = window_from_node(self);
-        HTMLCollection::create(&window, self.upcast(), filter)
+            },
+            can_gc,
+        )
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-fieldset-disabled
@@ -126,13 +128,13 @@ impl HTMLFieldSetElementMethods for HTMLFieldSetElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-checkvalidity
-    fn CheckValidity(&self) -> bool {
-        self.check_validity()
+    fn CheckValidity(&self, can_gc: CanGc) -> bool {
+        self.check_validity(can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-reportvalidity
-    fn ReportValidity(&self) -> bool {
-        self.report_validity()
+    fn ReportValidity(&self, can_gc: CanGc) -> bool {
+        self.report_validity(can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-validationmessage
@@ -156,8 +158,10 @@ impl VirtualMethods for HTMLFieldSetElement {
         Some(self.upcast::<HTMLElement>() as &dyn VirtualMethods)
     }
 
-    fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation) {
-        self.super_type().unwrap().attribute_mutated(attr, mutation);
+    fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation, can_gc: CanGc) {
+        self.super_type()
+            .unwrap()
+            .attribute_mutated(attr, mutation, can_gc);
         match *attr.local_name() {
             local_name!("disabled") => {
                 let disabled_state = match mutation {
@@ -219,7 +223,7 @@ impl VirtualMethods for HTMLFieldSetElement {
                                 );
                             }
                         }
-                        element.update_sequentially_focusable_status();
+                        element.update_sequentially_focusable_status(can_gc);
                     }
                 } else {
                     for field in fields {
@@ -240,13 +244,13 @@ impl VirtualMethods for HTMLFieldSetElement {
                                 );
                             }
                         }
-                        element.update_sequentially_focusable_status();
+                        element.update_sequentially_focusable_status(can_gc);
                     }
                 }
-                element.update_sequentially_focusable_status();
+                element.update_sequentially_focusable_status(can_gc);
             },
             local_name!("form") => {
-                self.form_attribute_mutated(mutation);
+                self.form_attribute_mutated(mutation, can_gc);
             },
             _ => {},
         }
@@ -274,7 +278,7 @@ impl Validatable for HTMLFieldSetElement {
 
     fn validity_state(&self) -> DomRoot<ValidityState> {
         self.validity_state
-            .or_init(|| ValidityState::new(&window_from_node(self), self.upcast()))
+            .or_init(|| ValidityState::new(&self.owner_window(), self.upcast(), CanGc::note()))
     }
 
     fn is_instance_validatable(&self) -> bool {

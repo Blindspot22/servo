@@ -10,13 +10,15 @@
 #![crate_type = "rlib"]
 #![deny(unsafe_code)]
 
+use core::fmt;
 use std::collections::HashMap;
 use std::net::TcpStream;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base::cross_process_instant::CrossProcessInstant;
-use base::id::{BrowsingContextId, PipelineId};
+use base::id::{BrowsingContextId, PipelineId, WebViewId};
 use bitflags::bitflags;
+use embedder_traits::Theme;
 use http::{HeaderMap, Method};
 use ipc_channel::ipc::IpcSender;
 use malloc_size_of_derive::MallocSizeOf;
@@ -31,6 +33,7 @@ use uuid::Uuid;
 pub struct DevtoolsPageInfo {
     pub title: String,
     pub url: ServoUrl,
+    pub is_top_level_global: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
@@ -52,6 +55,8 @@ pub enum DevtoolsControlMsg {
 }
 
 /// Events that the devtools server must act upon.
+// FIXME: https://github.com/servo/servo/issues/34591
+#[expect(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ChromeToDevtoolsControlMsg {
     /// A new client has connected to the server.
@@ -78,7 +83,7 @@ pub enum ScriptToDevtoolsControlMsg {
     /// A new global object was created, associated with a particular pipeline.
     /// The means of communicating directly with it are provided.
     NewGlobal(
-        (BrowsingContextId, PipelineId, Option<WorkerId>),
+        (BrowsingContextId, PipelineId, Option<WorkerId>, WebViewId),
         IpcSender<DevtoolScriptControlMsg>,
         DevtoolsPageInfo,
     ),
@@ -98,6 +103,9 @@ pub enum ScriptToDevtoolsControlMsg {
 
     /// Report a page title change
     TitleChanged(PipelineId, String),
+
+    /// Get source information from script
+    ScriptSourceLoaded(PipelineId, SourceInfo),
 }
 
 /// Serialized JS return values
@@ -123,6 +131,7 @@ pub struct AttrInfo {
 #[serde(rename_all = "camelCase")]
 pub struct NodeInfo {
     pub unique_id: String,
+    pub host: Option<String>,
     #[serde(rename = "baseURI")]
     pub base_uri: String,
     pub parent: String,
@@ -132,6 +141,18 @@ pub struct NodeInfo {
     pub num_children: usize,
     pub attrs: Vec<AttrInfo>,
     pub is_top_level_document: bool,
+    pub shadow_root_mode: Option<ShadowRootMode>,
+    pub is_shadow_host: bool,
+    pub display: Option<String>,
+
+    /// The `DOCTYPE` name if this is a `DocumentType` node, `None` otherwise
+    pub doctype_name: Option<String>,
+
+    /// The `DOCTYPE` public identifier if this is a `DocumentType` node , `None` otherwise
+    pub doctype_public_identifier: Option<String>,
+
+    /// The `DOCTYPE` system identifier if this is a `DocumentType` node, `None` otherwise
+    pub doctype_system_identifier: Option<String>,
 }
 
 pub struct StartedTimelineMarker {
@@ -250,6 +271,10 @@ pub enum DevtoolScriptControlMsg {
     Reload(PipelineId),
     /// Gets the list of all allowed CSS rules and possible values.
     GetCssDatabase(IpcSender<HashMap<String, CssDatabaseProperty>>),
+    /// Simulates a light or dark color scheme for the given pipeline
+    SimulateColorScheme(PipelineId, Theme),
+    /// Highlight the given DOM node
+    HighlightDomNode(PipelineId, Option<String>),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -278,16 +303,40 @@ pub enum LogLevel {
     Warn,
     Error,
     Clear,
+    Trace,
 }
 
+/// A console message as it is sent from script to the constellation
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConsoleMessage {
-    pub message: String,
     pub log_level: LogLevel,
     pub filename: String,
     pub line_number: usize,
     pub column_number: usize,
+    pub arguments: Vec<ConsoleMessageArgument>,
+    pub stacktrace: Option<Vec<StackFrame>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum ConsoleMessageArgument {
+    String(String),
+    Integer(i32),
+    Number(f64),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StackFrame {
+    pub filename: String,
+
+    #[serde(rename = "functionName")]
+    pub function_name: String,
+
+    #[serde(rename = "columnNumber")]
+    pub column_number: u32,
+
+    #[serde(rename = "lineNumber")]
+    pub line_number: u32,
 }
 
 bitflags! {
@@ -317,6 +366,7 @@ pub struct PageError {
     pub private: bool,
 }
 
+/// Represents a console message as it is sent to the devtools
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ConsoleLog {
     pub level: String,
@@ -324,8 +374,39 @@ pub struct ConsoleLog {
     pub line_number: u32,
     pub column_number: u32,
     pub time_stamp: u64,
-    pub arguments: Vec<String>,
-    // pub stacktrace: Vec<...>,
+    pub arguments: Vec<ConsoleArgument>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stacktrace: Option<Vec<StackFrame>>,
+}
+
+impl From<ConsoleMessage> for ConsoleLog {
+    fn from(value: ConsoleMessage) -> Self {
+        let level = match value.log_level {
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warn => "warn",
+            LogLevel::Error => "error",
+            LogLevel::Clear => "clear",
+            LogLevel::Trace => "trace",
+            LogLevel::Log => "log",
+        }
+        .to_owned();
+
+        let time_stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        Self {
+            level,
+            filename: value.filename,
+            line_number: value.line_number as u32,
+            column_number: value.column_number as u32,
+            time_stamp,
+            arguments: value.arguments.into_iter().map(|arg| arg.into()).collect(),
+            stacktrace: value.stacktrace,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -393,4 +474,93 @@ pub struct CssDatabaseProperty {
     pub values: Vec<String>,
     pub supports: Vec<String>,
     pub subproperties: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ConsoleArgument {
+    String(String),
+    Integer(i32),
+    Number(f64),
+}
+
+impl From<ConsoleMessageArgument> for ConsoleArgument {
+    fn from(value: ConsoleMessageArgument) -> Self {
+        match value {
+            ConsoleMessageArgument::String(string) => Self::String(string),
+            ConsoleMessageArgument::Integer(integer) => Self::Integer(integer),
+            ConsoleMessageArgument::Number(number) => Self::Number(number),
+        }
+    }
+}
+
+impl From<String> for ConsoleMessageArgument {
+    fn from(value: String) -> Self {
+        Self::String(value)
+    }
+}
+
+pub struct ConsoleMessageBuilder {
+    level: LogLevel,
+    filename: String,
+    line_number: u32,
+    column_number: u32,
+    arguments: Vec<ConsoleMessageArgument>,
+    stack_trace: Option<Vec<StackFrame>>,
+}
+
+impl ConsoleMessageBuilder {
+    pub fn new(level: LogLevel, filename: String, line_number: u32, column_number: u32) -> Self {
+        Self {
+            level,
+            filename,
+            line_number,
+            column_number,
+            arguments: vec![],
+            stack_trace: None,
+        }
+    }
+
+    pub fn attach_stack_trace(&mut self, stack_trace: Vec<StackFrame>) -> &mut Self {
+        self.stack_trace = Some(stack_trace);
+        self
+    }
+
+    pub fn add_argument(&mut self, argument: ConsoleMessageArgument) -> &mut Self {
+        self.arguments.push(argument);
+        self
+    }
+
+    pub fn finish(self) -> ConsoleMessage {
+        ConsoleMessage {
+            log_level: self.level,
+            filename: self.filename,
+            line_number: self.line_number as usize,
+            column_number: self.column_number as usize,
+            arguments: self.arguments,
+            stacktrace: self.stack_trace,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub enum ShadowRootMode {
+    Open,
+    Closed,
+}
+
+impl fmt::Display for ShadowRootMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open => write!(f, "open"),
+            Self::Closed => write!(f, "close"),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SourceInfo {
+    pub url: ServoUrl,
+    pub external: bool,
+    pub worker_id: Option<WorkerId>,
 }

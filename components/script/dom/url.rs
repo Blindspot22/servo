@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::URLBinding::URLMethods;
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
-use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomObject, Reflector};
+use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object_with_proto};
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::blob::Blob;
@@ -28,7 +28,7 @@ use crate::script_runtime::CanGc;
 /// <https://url.spec.whatwg.org/#url>
 #[dom_struct]
 #[allow(clippy::upper_case_acronyms)]
-pub struct URL {
+pub(crate) struct URL {
     reflector_: Reflector,
 
     /// <https://url.spec.whatwg.org/#concept-url-url>
@@ -57,7 +57,7 @@ impl URL {
         reflect_dom_object_with_proto(Box::new(URL::new_inherited(url)), global, proto, can_gc)
     }
 
-    pub fn query_pairs(&self) -> Vec<(String, String)> {
+    pub(crate) fn query_pairs(&self) -> Vec<(String, String)> {
         self.url
             .borrow()
             .as_url()
@@ -66,7 +66,7 @@ impl URL {
             .collect()
     }
 
-    pub fn set_query_pairs(&self, pairs: &[(String, String)]) {
+    pub(crate) fn set_query_pairs(&self, pairs: &[(String, String)]) {
         let mut url = self.url.borrow_mut();
 
         if pairs.is_empty() {
@@ -97,7 +97,7 @@ impl URL {
     }
 }
 
-impl URLMethods for URL {
+impl URLMethods<crate::DomTypeHolder> for URL {
     /// <https://url.spec.whatwg.org/#constructors>
     fn Constructor(
         global: &GlobalScope,
@@ -162,6 +162,7 @@ impl URLMethods for URL {
         global: &GlobalScope,
         url: USVString,
         base: Option<USVString>,
+        can_gc: CanGc,
     ) -> Option<DomRoot<URL>> {
         // Step 1: Let parsedURL be the result of running the API URL parser on url with base,
         // if given.
@@ -176,7 +177,7 @@ impl URLMethods for URL {
         // These steps are all handled while mapping the Result to an Option<ServoUrl>.
         // Regarding initialization, the same condition should apply here as stated in the comments
         // in Self::Constructor above - construct it on-demand inside `URL::SearchParams`.
-        Some(URL::new(global, None, parsed_url.ok()?, CanGc::note()))
+        Some(URL::new(global, None, parsed_url.ok()?, can_gc))
     }
 
     /// <https://w3c.github.io/FileAPI/#dfn-createObjectURL>
@@ -317,9 +318,9 @@ impl URLMethods for URL {
     }
 
     /// <https://url.spec.whatwg.org/#dom-url-searchparams>
-    fn SearchParams(&self) -> DomRoot<URLSearchParams> {
+    fn SearchParams(&self, can_gc: CanGc) -> DomRoot<URLSearchParams> {
         self.search_params
-            .or_init(|| URLSearchParams::new(&self.global(), Some(self)))
+            .or_init(|| URLSearchParams::new(&self.global(), Some(self), can_gc))
     }
 
     /// <https://url.spec.whatwg.org/#dom-url-username>

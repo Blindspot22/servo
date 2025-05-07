@@ -81,27 +81,6 @@ def copy_windows_dependencies(binary_path, destination):
             shutil.copy(path.join(binary_path, f), destination)
 
 
-def change_prefs(resources_path, platform):
-    print("Swapping prefs")
-    prefs_path = path.join(resources_path, "prefs.json")
-    package_prefs_path = path.join(resources_path, "package-prefs.json")
-    with open(prefs_path) as prefs, open(package_prefs_path) as package_prefs:
-        prefs = json.load(prefs)
-        pref_sets = []
-        package_prefs = json.load(package_prefs)
-        if "all" in package_prefs:
-            pref_sets += [package_prefs["all"]]
-        if platform in package_prefs:
-            pref_sets += [package_prefs[platform]]
-        for pref_set in pref_sets:
-            for pref in pref_set:
-                if pref in prefs:
-                    prefs[pref] = pref_set[pref]
-        with open(prefs_path, "w") as out:
-            json.dump(prefs, out, sort_keys=True, indent=2)
-    delete(package_prefs_path)
-
-
 def check_call_with_randomized_backoff(args: List[str], retries: int) -> int:
     """
     Run the given command-line arguments via `subprocess.check_call()`. If the command
@@ -172,7 +151,6 @@ class PackageCommands(CommandBase):
                 delete(dir_to_resources)
 
             shutil.copytree(path.join(dir_to_root, 'resources'), dir_to_resources)
-            change_prefs(dir_to_resources, "android")
 
             variant = ":assemble" + flavor_name + arch_string + build_type_string
             apk_task_name = ":servoapp" + variant
@@ -224,6 +202,12 @@ class PackageCommands(CommandBase):
                           "path to hvigorw or set the HVIGOR_PATH environment variable to the npm"
                           "installation containing `node_modules` directory with hvigor modules.")
                     sys.exit(1)
+                except subprocess.CalledProcessError as e:
+                    print(f"hvigor exited with the following error: {e}")
+                    print(f"stdout: `{e.stdout}`")
+                    print(f"stderr: `{e.stderr}`")
+                    sys.exit(1)
+
             else:
                 env["NODE_PATH"] = env["HVIGOR_PATH"] + "/node_modules"
                 hvigor_script = f"{env['HVIGOR_PATH']}/node_modules/@ohos/hvigor/bin/hvigor.js"
@@ -260,8 +244,6 @@ class PackageCommands(CommandBase):
             lib_dir = path.join(content_dir, 'lib')
             os.makedirs(lib_dir)
             shutil.copy2(binary_path, content_dir)
-
-            change_prefs(dir_to_resources, "macosx")
 
             print("Packaging GStreamer...")
             dmg_binary = path.join(content_dir, "servo")
@@ -325,8 +307,6 @@ class PackageCommands(CommandBase):
             shutil.copytree(path.join(dir_to_root, 'resources'), dir_to_resources)
             shutil.copy(binary_path, dir_to_temp)
             copy_windows_dependencies(target_dir, dir_to_temp)
-
-            change_prefs(dir_to_resources, "windows")
 
             # generate Servo.wxs
             import mako.template
@@ -394,8 +374,6 @@ class PackageCommands(CommandBase):
             dir_to_resources = path.join(dir_to_temp, 'resources')
             shutil.copytree(path.join(dir_to_root, 'resources'), dir_to_resources)
             shutil.copy(binary_path, dir_to_temp)
-
-            change_prefs(dir_to_resources, "linux")
 
             print("Creating tarball")
             tar_path = path.join(target_dir, 'servo-tech-demo.tar.gz')

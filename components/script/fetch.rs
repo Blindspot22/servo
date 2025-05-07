@@ -5,29 +5,30 @@
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+use base::id::WebViewId;
+use content_security_policy as csp;
 use ipc_channel::ipc;
-use ipc_channel::router::ROUTER;
+use net_traits::policy_container::{PolicyContainer, RequestPolicyContainer};
 use net_traits::request::{
-    CorsSettings, CredentialsMode, Destination, Referrer, Request as NetTraitsRequest,
-    RequestBuilder, RequestMode, ServiceWorkersMode,
+    CorsSettings, CredentialsMode, Destination, InsecureRequestsPolicy, Referrer,
+    Request as NetTraitsRequest, RequestBuilder, RequestId, RequestMode, ServiceWorkersMode,
 };
-use net_traits::CoreResourceMsg::Fetch as NetTraitsFetch;
 use net_traits::{
     CoreResourceMsg, CoreResourceThread, FetchChannels, FetchMetadata, FetchResponseListener,
     FetchResponseMsg, FilteredMetadata, Metadata, NetworkError, ResourceFetchTiming,
-    ResourceTimingType,
+    ResourceTimingType, cancel_async_fetch,
 };
 use servo_url::ServoUrl;
 
 use crate::dom::bindings::codegen::Bindings::RequestBinding::{
     RequestInfo, RequestInit, RequestMethods,
 };
-use crate::dom::bindings::codegen::Bindings::ResponseBinding::ResponseType as DOMResponseType;
 use crate::dom::bindings::codegen::Bindings::ResponseBinding::Response_Binding::ResponseMethods;
+use crate::dom::bindings::codegen::Bindings::ResponseBinding::ResponseType as DOMResponseType;
 use crate::dom::bindings::error::Error;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::{Trusted, TrustedPromise};
-use crate::dom::bindings::reflector::DomObject;
+use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::globalscope::GlobalScope;
@@ -37,12 +38,9 @@ use crate::dom::promise::Promise;
 use crate::dom::request::Request;
 use crate::dom::response::Response;
 use crate::dom::serviceworkerglobalscope::ServiceWorkerGlobalScope;
-use crate::network_listener::{
-    self, submit_timing_data, NetworkListener, PreInvoke, ResourceTimingListener,
-};
-use crate::realms::{enter_realm, InRealm};
+use crate::network_listener::{self, PreInvoke, ResourceTimingListener, submit_timing_data};
+use crate::realms::{InRealm, enter_realm};
 use crate::script_runtime::CanGc;
-use crate::task_source::TaskSourceName;
 
 struct FetchContext {
     fetch_promise: Option<TrustedPromise>,
@@ -55,45 +53,35 @@ struct FetchContext {
 /// in which case it will store the sender. You can manually cancel it
 /// or let it cancel on Drop in that case.
 #[derive(Default, JSTraceable, MallocSizeOf)]
-pub struct FetchCanceller {
-    #[ignore_malloc_size_of = "channels are hard"]
+pub(crate) struct FetchCanceller {
     #[no_trace]
-    cancel_chan: Option<ipc::IpcSender<()>>,
+    request_id: Option<RequestId>,
 }
 
 impl FetchCanceller {
     /// Create an empty FetchCanceller
-    pub fn new() -> Self {
-        Default::default()
-    }
-
-    /// Obtain an IpcReceiver to send over to Fetch, and initialize
-    /// the internal sender
-    pub fn initialize(&mut self) -> ipc::IpcReceiver<()> {
-        // cancel previous fetch
-        self.cancel();
-        let (rx, tx) = ipc::channel().unwrap();
-        self.cancel_chan = Some(rx);
-        tx
+    pub(crate) fn new(request_id: RequestId) -> Self {
+        Self {
+            request_id: Some(request_id),
+        }
     }
 
     /// Cancel a fetch if it is ongoing
-    pub fn cancel(&mut self) {
-        if let Some(chan) = self.cancel_chan.take() {
+    pub(crate) fn cancel(&mut self) {
+        if let Some(request_id) = self.request_id.take() {
             // stop trying to make fetch happen
             // it's not going to happen
 
-            // The receiver will be destroyed if the request has already completed;
-            // so we throw away the error. Cancellation is a courtesy call,
+            // No error handling here. Cancellation is a courtesy call,
             // we don't actually care if the other side heard.
-            let _ = chan.send(());
+            cancel_async_fetch(vec![request_id]);
         }
     }
 
     /// Use this if you don't want it to send a cancellation request
     /// on drop (e.g. if the fetch completes)
-    pub fn ignore(&mut self) {
-        let _ = self.cancel_chan.take();
+    pub(crate) fn ignore(&mut self) {
+        let _ = self.request_id.take();
     }
 }
 
@@ -105,6 +93,7 @@ impl Drop for FetchCanceller {
 
 fn request_init_from_request(request: NetTraitsRequest) -> RequestBuilder {
     RequestBuilder {
+        id: request.id,
         method: request.method.clone(),
         url: request.url(),
         headers: request.headers.clone(),
@@ -126,12 +115,16 @@ fn request_init_from_request(request: NetTraitsRequest) -> RequestBuilder {
         referrer: request.referrer.clone(),
         referrer_policy: request.referrer_policy,
         pipeline_id: request.pipeline_id,
+        target_webview_id: request.target_webview_id,
         redirect_mode: request.redirect_mode,
         integrity_metadata: request.integrity_metadata.clone(),
+        cryptographic_nonce_metadata: request.cryptographic_nonce_metadata.clone(),
         url_list: vec![],
         parser_metadata: request.parser_metadata,
         initiator: request.initiator,
-        csp_list: None,
+        policy_container: request.policy_container,
+        insecure_requests_policy: request.insecure_requests_policy,
+        has_trustworthy_ancestor_origin: request.has_trustworthy_ancestor_origin,
         https_state: request.https_state,
         response_tainting: request.response_tainting,
         crash: None,
@@ -139,30 +132,29 @@ fn request_init_from_request(request: NetTraitsRequest) -> RequestBuilder {
 }
 
 /// <https://fetch.spec.whatwg.org/#fetch-method>
-#[allow(crown::unrooted_must_root, non_snake_case)]
-pub fn Fetch(
+#[allow(non_snake_case)]
+#[cfg_attr(crown, allow(crown::unrooted_must_root))]
+pub(crate) fn Fetch(
     global: &GlobalScope,
     input: RequestInfo,
     init: RootedTraceableBox<RequestInit>,
     comp: InRealm,
     can_gc: CanGc,
 ) -> Rc<Promise> {
-    let core_resource_thread = global.core_resource_thread();
-
     // Step 1. Let p be a new promise.
-    let promise = Promise::new_in_current_realm(comp);
+    let promise = Promise::new_in_current_realm(comp, can_gc);
 
     // Step 7. Let responseObject be null.
     // NOTE: We do initialize the object earlier earlier so we can use it to track errors
     let response = Response::new(global, can_gc);
-    response.Headers().set_guard(Guard::Immutable);
+    response.Headers(can_gc).set_guard(Guard::Immutable);
 
     // Step 2. Let requestObject be the result of invoking the initial value of Request as constructor
     //         with input and init as arguments. If this throws an exception, reject p with it and return p.
     let request = match Request::Constructor(global, None, can_gc, input, init) {
         Err(e) => {
-            response.error_stream(e.clone());
-            promise.reject_error(e);
+            response.error_stream(e.clone(), can_gc);
+            promise.reject_error(e, can_gc);
             return promise;
         },
         Ok(r) => {
@@ -173,7 +165,8 @@ pub fn Fetch(
     let timing_type = request.timing_type();
 
     let mut request_init = request_init_from_request(request);
-    request_init.csp_list.clone_from(&global.get_csp_list());
+    request_init.policy_container =
+        RequestPolicyContainer::PolicyContainer(global.policy_container());
 
     // TODO: Step 4. If requestObject’s signal is aborted, then: [..]
 
@@ -190,30 +183,17 @@ pub fn Fetch(
 
     // Step 12. Set controller to the result of calling fetch given request and
     //           processResponse given response being these steps: [..]
-    let (action_sender, action_receiver) = ipc::channel().unwrap();
     let fetch_context = Arc::new(Mutex::new(FetchContext {
         fetch_promise: Some(TrustedPromise::new(promise.clone())),
         response_object: Trusted::new(&*response),
         resource_timing: ResourceFetchTiming::new(timing_type),
     }));
-    let listener = NetworkListener {
-        context: fetch_context,
-        task_source: global.networking_task_source(),
-        canceller: Some(global.task_canceller(TaskSourceName::Networking)),
-    };
 
-    ROUTER.add_route(
-        action_receiver.to_opaque(),
-        Box::new(move |message| {
-            listener.notify_fetch(message.to().unwrap());
-        }),
+    global.fetch(
+        request_init,
+        fetch_context,
+        global.task_manager().networking_task_source().to_sendable(),
     );
-    core_resource_thread
-        .send(NetTraitsFetch(
-            request_init,
-            FetchChannels::ResponseMsg(action_sender, None),
-        ))
-        .unwrap();
 
     // Step 13. Return p.
     promise
@@ -222,16 +202,20 @@ pub fn Fetch(
 impl PreInvoke for FetchContext {}
 
 impl FetchResponseListener for FetchContext {
-    fn process_request_body(&mut self) {
+    fn process_request_body(&mut self, _: RequestId) {
         // TODO
     }
 
-    fn process_request_eof(&mut self) {
+    fn process_request_eof(&mut self, _: RequestId) {
         // TODO
     }
 
-    #[allow(crown::unrooted_must_root)]
-    fn process_response(&mut self, fetch_metadata: Result<FetchMetadata, NetworkError>) {
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    fn process_response(
+        &mut self,
+        _: RequestId,
+        fetch_metadata: Result<FetchMetadata, NetworkError>,
+    ) {
         let promise = self
             .fetch_promise
             .take()
@@ -242,38 +226,48 @@ impl FetchResponseListener for FetchContext {
         match fetch_metadata {
             // Step 4.1
             Err(_) => {
-                promise.reject_error(Error::Type("Network error occurred".to_string()));
+                promise.reject_error(
+                    Error::Type("Network error occurred".to_string()),
+                    CanGc::note(),
+                );
                 self.fetch_promise = Some(TrustedPromise::new(promise));
                 let response = self.response_object.root();
-                response.set_type(DOMResponseType::Error);
-                response.error_stream(Error::Type("Network error occurred".to_string()));
+                response.set_type(DOMResponseType::Error, CanGc::note());
+                response.error_stream(
+                    Error::Type("Network error occurred".to_string()),
+                    CanGc::note(),
+                );
                 return;
             },
             // Step 4.2
             Ok(metadata) => match metadata {
                 FetchMetadata::Unfiltered(m) => {
-                    fill_headers_with_metadata(self.response_object.root(), m);
+                    fill_headers_with_metadata(self.response_object.root(), m, CanGc::note());
                     self.response_object
                         .root()
-                        .set_type(DOMResponseType::Default);
+                        .set_type(DOMResponseType::Default, CanGc::note());
                 },
                 FetchMetadata::Filtered { filtered, .. } => match filtered {
                     FilteredMetadata::Basic(m) => {
-                        fill_headers_with_metadata(self.response_object.root(), m);
-                        self.response_object.root().set_type(DOMResponseType::Basic);
+                        fill_headers_with_metadata(self.response_object.root(), m, CanGc::note());
+                        self.response_object
+                            .root()
+                            .set_type(DOMResponseType::Basic, CanGc::note());
                     },
                     FilteredMetadata::Cors(m) => {
-                        fill_headers_with_metadata(self.response_object.root(), m);
-                        self.response_object.root().set_type(DOMResponseType::Cors);
+                        fill_headers_with_metadata(self.response_object.root(), m, CanGc::note());
+                        self.response_object
+                            .root()
+                            .set_type(DOMResponseType::Cors, CanGc::note());
                     },
                     FilteredMetadata::Opaque => {
                         self.response_object
                             .root()
-                            .set_type(DOMResponseType::Opaque);
+                            .set_type(DOMResponseType::Opaque, CanGc::note());
                     },
                     FilteredMetadata::OpaqueRedirect(url) => {
                         let r = self.response_object.root();
-                        r.set_type(DOMResponseType::Opaqueredirect);
+                        r.set_type(DOMResponseType::Opaqueredirect, CanGc::note());
                         r.set_final_url(url);
                     },
                 },
@@ -281,19 +275,23 @@ impl FetchResponseListener for FetchContext {
         }
 
         // Step 4.3
-        promise.resolve_native(&self.response_object.root());
+        promise.resolve_native(&self.response_object.root(), CanGc::note());
         self.fetch_promise = Some(TrustedPromise::new(promise));
     }
 
-    fn process_response_chunk(&mut self, chunk: Vec<u8>) {
+    fn process_response_chunk(&mut self, _: RequestId, chunk: Vec<u8>) {
         let response = self.response_object.root();
-        response.stream_chunk(chunk);
+        response.stream_chunk(chunk, CanGc::note());
     }
 
-    fn process_response_eof(&mut self, _response: Result<ResourceFetchTiming, NetworkError>) {
+    fn process_response_eof(
+        &mut self,
+        _: RequestId,
+        _response: Result<ResourceFetchTiming, NetworkError>,
+    ) {
         let response = self.response_object.root();
         let _ac = enter_realm(&*response);
-        response.finish();
+        response.finish(CanGc::note());
         // TODO
         // ... trailerObject is not supported in Servo yet.
     }
@@ -309,8 +307,13 @@ impl FetchResponseListener for FetchContext {
     fn submit_resource_timing(&mut self) {
         // navigation submission is handled in servoparser/mod.rs
         if self.resource_timing.timing_type == ResourceTimingType::Resource {
-            network_listener::submit_timing(self)
+            network_listener::submit_timing(self, CanGc::note())
         }
+    }
+
+    fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<csp::Violation>) {
+        let global = &self.resource_timing_global();
+        global.report_csp_violations(violations);
     }
 }
 
@@ -327,18 +330,19 @@ impl ResourceTimingListener for FetchContext {
     }
 }
 
-fn fill_headers_with_metadata(r: DomRoot<Response>, m: Metadata) {
-    r.set_headers(m.headers);
+fn fill_headers_with_metadata(r: DomRoot<Response>, m: Metadata, can_gc: CanGc) {
+    r.set_headers(m.headers, can_gc);
     r.set_status(&m.status);
     r.set_final_url(m.final_url);
     r.set_redirected(m.redirected);
 }
 
 /// Convenience function for synchronously loading a whole resource.
-pub fn load_whole_resource(
+pub(crate) fn load_whole_resource(
     request: RequestBuilder,
     core_resource_thread: &CoreResourceThread,
     global: &GlobalScope,
+    can_gc: CanGc,
 ) -> Result<(Metadata, Vec<u8>), NetworkError> {
     let request = request.https_state(global.get_https_state());
     let (action_sender, action_receiver) = ipc::channel().unwrap();
@@ -346,7 +350,7 @@ pub fn load_whole_resource(
     core_resource_thread
         .send(CoreResourceMsg::Fetch(
             request,
-            FetchChannels::ResponseMsg(action_sender, None),
+            FetchChannels::ResponseMsg(action_sender),
         ))
         .unwrap();
 
@@ -354,36 +358,43 @@ pub fn load_whole_resource(
     let mut metadata = None;
     loop {
         match action_receiver.recv().unwrap() {
-            FetchResponseMsg::ProcessRequestBody | FetchResponseMsg::ProcessRequestEOF => (),
-            FetchResponseMsg::ProcessResponse(Ok(m)) => {
+            FetchResponseMsg::ProcessRequestBody(..) |
+            FetchResponseMsg::ProcessRequestEOF(..) |
+            FetchResponseMsg::ProcessCspViolations(..) => {},
+            FetchResponseMsg::ProcessResponse(_, Ok(m)) => {
                 metadata = Some(match m {
                     FetchMetadata::Unfiltered(m) => m,
                     FetchMetadata::Filtered { unsafe_, .. } => unsafe_,
                 })
             },
-            FetchResponseMsg::ProcessResponseChunk(data) => buf.extend_from_slice(&data),
-            FetchResponseMsg::ProcessResponseEOF(Ok(_)) => {
+            FetchResponseMsg::ProcessResponseChunk(_, data) => buf.extend_from_slice(&data),
+            FetchResponseMsg::ProcessResponseEOF(_, Ok(_)) => {
                 let metadata = metadata.unwrap();
                 if let Some(timing) = &metadata.timing {
-                    submit_timing_data(global, url, InitiatorType::Other, timing);
+                    submit_timing_data(global, url, InitiatorType::Other, timing, can_gc);
                 }
                 return Ok((metadata, buf));
             },
-            FetchResponseMsg::ProcessResponse(Err(e)) |
-            FetchResponseMsg::ProcessResponseEOF(Err(e)) => return Err(e),
+            FetchResponseMsg::ProcessResponse(_, Err(e)) |
+            FetchResponseMsg::ProcessResponseEOF(_, Err(e)) => return Err(e),
         }
     }
 }
 
 /// <https://html.spec.whatwg.org/multipage/#create-a-potential-cors-request>
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn create_a_potential_cors_request(
+    webview_id: Option<WebViewId>,
     url: ServoUrl,
     destination: Destination,
     cors_setting: Option<CorsSettings>,
     same_origin_fallback: Option<bool>,
     referrer: Referrer,
+    insecure_requests_policy: InsecureRequestsPolicy,
+    has_trustworthy_ancestor_origin: bool,
+    policy_container: PolicyContainer,
 ) -> RequestBuilder {
-    RequestBuilder::new(url, referrer)
+    RequestBuilder::new(webview_id, url, referrer)
         // https://html.spec.whatwg.org/multipage/#create-a-potential-cors-request
         // Step 1
         .mode(match cors_setting {
@@ -400,4 +411,7 @@ pub(crate) fn create_a_potential_cors_request(
         // Step 5
         .destination(destination)
         .use_url_credentials(true)
+        .insecure_requests_policy(insecure_requests_policy)
+        .has_trustworthy_ancestor_origin(has_trustworthy_ancestor_origin)
+        .policy_container(policy_container)
 }

@@ -6,15 +6,19 @@ use std::borrow::ToOwned;
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::ops::{Deref, RangeInclusive};
-use std::sync::Arc;
 use std::{fmt, thread};
 
 use app_units::Au;
-use atomic_refcell::AtomicRefCell;
+use compositing_traits::CrossProcessCompositorApi;
 use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
 use log::debug;
+use malloc_size_of::MallocSizeOf as MallocSizeOfTrait;
 use malloc_size_of_derive::MallocSizeOf;
 use parking_lot::{Mutex, RwLock};
+use profile_traits::mem::{
+    ProcessReports, ProfilerChan, Report, ReportKind, ReportsChan, perform_memory_report,
+};
+use profile_traits::path;
 use serde::{Deserialize, Serialize};
 use servo_config::pref;
 use servo_url::ServoUrl;
@@ -24,17 +28,15 @@ use style::values::computed::font::{
 };
 use style::values::computed::{FontStretch, FontWeight};
 use style::values::specified::FontStretch as SpecifiedFontStretch;
-use tracing::{instrument, span, Level};
 use webrender_api::{FontInstanceFlags, FontInstanceKey, FontKey};
-use webrender_traits::CrossProcessCompositorApi;
 
 use crate::font::FontDescriptor;
 use crate::font_store::FontStore;
 use crate::font_template::{FontTemplate, FontTemplateRef};
+use crate::platform::LocalFontIdentifier;
 use crate::platform::font_list::{
     default_system_generic_font_family, for_each_available_family, for_each_variation,
 };
-use crate::platform::LocalFontIdentifier;
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
 pub enum FontIdentifier {
@@ -67,11 +69,12 @@ pub enum SystemFontServiceMessage {
     ),
     GetFontKey(IpcSender<FontKey>),
     GetFontInstanceKey(IpcSender<FontInstanceKey>),
+    CollectMemoryReport(ReportsChan),
     Exit(IpcSender<()>),
     Ping,
 }
 
-#[derive(Default)]
+#[derive(Default, MallocSizeOf)]
 struct ResolvedGenericFontFamilies {
     default: OnceCell<LowercaseFontFamilyName>,
     serif: OnceCell<LowercaseFontFamilyName>,
@@ -85,6 +88,7 @@ struct ResolvedGenericFontFamilies {
 /// The system font service. There is one of these for every Servo instance. This is a thread,
 /// responsible for reading the list of system fonts, handling requests to match against
 /// them, and ensuring that only one copy of system font data is loaded at a time.
+#[derive(MallocSizeOf)]
 pub struct SystemFontService {
     port: IpcReceiver<SystemFontServiceMessage>,
     local_families: FontStore,
@@ -119,8 +123,12 @@ impl SystemFontServiceProxySender {
 }
 
 impl SystemFontService {
-    pub fn spawn(compositor_api: CrossProcessCompositorApi) -> SystemFontServiceProxySender {
+    pub fn spawn(
+        compositor_api: CrossProcessCompositorApi,
+        memory_profiler_sender: ProfilerChan,
+    ) -> SystemFontServiceProxySender {
         let (sender, receiver) = ipc::channel().unwrap();
+        let memory_reporter_sender = sender.clone();
 
         thread::Builder::new()
             .name("SystemFontService".to_owned())
@@ -139,24 +147,26 @@ impl SystemFontService {
 
                 cache.fetch_new_keys();
                 cache.refresh_local_families();
-                cache.run();
+
+                memory_profiler_sender.run_with_memory_reporting(
+                    || cache.run(),
+                    "system-fonts".to_owned(),
+                    memory_reporter_sender,
+                    SystemFontServiceMessage::CollectMemoryReport,
+                );
             })
             .expect("Thread spawning failed");
 
         SystemFontServiceProxySender(sender)
     }
 
-    #[instrument(skip_all, fields(servo_profiling = true))]
     fn run(&mut self) {
         loop {
             let msg = self.port.recv().unwrap();
 
-            let span = span!(
-                Level::TRACE,
-                "SystemFontServiceMessage",
-                servo_profiling = true
-            );
-            let _enter = span.enter();
+            #[cfg(feature = "tracing")]
+            let _span =
+                tracing::trace_span!("SystemFontServiceMessage", servo_profiling = true).entered();
             match msg {
                 SystemFontServiceMessage::GetFontTemplates(
                     font_descriptor,
@@ -177,6 +187,9 @@ impl SystemFontService {
                     self.fetch_new_keys();
                     let _ = result_sender.send(self.free_font_instance_keys.pop().unwrap());
                 },
+                SystemFontServiceMessage::CollectMemoryReport(report_sender) => {
+                    self.collect_memory_report(report_sender);
+                },
                 SystemFontServiceMessage::Ping => (),
                 SystemFontServiceMessage::Exit(result) => {
                     let _ = result.send(());
@@ -186,7 +199,21 @@ impl SystemFontService {
         }
     }
 
-    #[instrument(skip_all, fields(servo_profiling = true))]
+    fn collect_memory_report(&self, report_sender: ReportsChan) {
+        perform_memory_report(|ops| {
+            let reports = vec![Report {
+                path: path!["system-fonts"],
+                kind: ReportKind::ExplicitSystemHeapSize,
+                size: self.size_of(ops),
+            }];
+            report_sender.send(ProcessReports::new(reports));
+        });
+    }
+
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
+    )]
     fn fetch_new_keys(&mut self) {
         if !self.free_font_keys.is_empty() && !self.free_font_instance_keys.is_empty() {
             return;
@@ -203,7 +230,10 @@ impl SystemFontService {
             .append(&mut new_font_instance_keys);
     }
 
-    #[instrument(skip_all, fields(servo_profiling = true))]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
+    )]
     fn get_font_templates(
         &mut self,
         font_descriptor: Option<FontDescriptor>,
@@ -216,7 +246,10 @@ impl SystemFontService {
             .collect()
     }
 
-    #[instrument(skip_all, fields(servo_profiling = true))]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
+    )]
     fn refresh_local_families(&mut self) {
         self.local_families.clear();
         for_each_available_family(|family_name| {
@@ -227,7 +260,10 @@ impl SystemFontService {
         });
     }
 
-    #[instrument(skip_all, fields(servo_profiling = true))]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
+    )]
     fn find_font_templates(
         &mut self,
         descriptor_to_match: Option<&FontDescriptor>,
@@ -251,7 +287,10 @@ impl SystemFontService {
             .unwrap_or_default()
     }
 
-    #[instrument(skip_all, fields(servo_profiling = true))]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip_all, fields(servo_profiling = true), level = "trace")
+    )]
     fn get_font_instance(
         &mut self,
         identifier: FontIdentifier,
@@ -313,10 +352,10 @@ impl SystemFontService {
             .get_or_init(|| {
                 // First check whether the font is set in the preferences.
                 let family_name = match generic {
-                    GenericFontFamily::None => pref!(fonts.default),
-                    GenericFontFamily::Serif => pref!(fonts.serif),
-                    GenericFontFamily::SansSerif => pref!(fonts.sans_serif),
-                    GenericFontFamily::Monospace => pref!(fonts.monospace),
+                    GenericFontFamily::None => pref!(fonts_default),
+                    GenericFontFamily::Serif => pref!(fonts_serif),
+                    GenericFontFamily::SansSerif => pref!(fonts_sans_serif),
+                    GenericFontFamily::Monospace => pref!(fonts_monospace),
                     _ => String::new(),
                 };
 
@@ -349,7 +388,6 @@ pub struct SystemFontServiceProxy {
 /// because the specified version of `FontStyle` contains floats.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ComputedFontStyleDescriptor {
-    Normal,
     Italic,
     Oblique(FontStyleFixedPoint, FontStyleFixedPoint),
 }
@@ -406,7 +444,6 @@ impl From<&FontFaceRuleData> for CSSFontFaceDescriptors {
 
         fn style_to_computed(specified: &FontFaceStyle) -> ComputedFontStyleDescriptor {
             match specified {
-                FontFaceStyle::Normal => ComputedFontStyleDescriptor::Normal,
                 FontFaceStyle::Italic => ComputedFontStyleDescriptor::Italic,
                 FontFaceStyle::Oblique(angle_a, angle_b) => ComputedFontStyleDescriptor::Oblique(
                     FixedPoint::from_float(angle_a.degrees()),
@@ -519,11 +556,11 @@ impl SystemFontServiceProxy {
             );
             panic!("SystemFontService has already exited.");
         };
+
+        let templates: Vec<_> = templates.into_iter().map(FontTemplateRef::new).collect();
+        self.templates.write().insert(cache_key, templates.clone());
+
         templates
-            .into_iter()
-            .map(AtomicRefCell::new)
-            .map(Arc::new)
-            .collect()
     }
 
     pub(crate) fn generate_font_key(&self) -> FontKey {
@@ -551,7 +588,7 @@ impl SystemFontServiceProxy {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
 pub struct LowercaseFontFamilyName {
     inner: String,
 }

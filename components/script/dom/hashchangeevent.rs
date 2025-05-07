@@ -4,7 +4,7 @@
 
 use dom_struct::dom_struct;
 use js::rust::HandleObject;
-use servo_atoms::Atom;
+use stylo_atoms::Atom;
 
 use crate::dom::bindings::codegen::Bindings::EventBinding::EventMethods;
 use crate::dom::bindings::codegen::Bindings::HashChangeEventBinding;
@@ -20,7 +20,7 @@ use crate::script_runtime::CanGc;
 
 // https://html.spec.whatwg.org/multipage/#hashchangeevent
 #[dom_struct]
-pub struct HashChangeEvent {
+pub(crate) struct HashChangeEvent {
     event: Event,
     old_url: String,
     new_url: String,
@@ -35,39 +35,34 @@ impl HashChangeEvent {
         }
     }
 
-    pub fn new_uninitialized(window: &Window) -> DomRoot<HashChangeEvent> {
-        Self::new_uninitialized_with_proto(window, None)
+    pub(crate) fn new_uninitialized(window: &Window, can_gc: CanGc) -> DomRoot<HashChangeEvent> {
+        Self::new_uninitialized_with_proto(window, None, can_gc)
     }
 
     fn new_uninitialized_with_proto(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HashChangeEvent> {
         reflect_dom_object_with_proto(
             Box::new(HashChangeEvent::new_inherited(String::new(), String::new())),
             window,
             proto,
-            CanGc::note(),
+            can_gc,
         )
     }
 
-    pub fn new(
+    pub(crate) fn new(
         window: &Window,
         type_: Atom,
         bubbles: bool,
         cancelable: bool,
         old_url: String,
         new_url: String,
+        can_gc: CanGc,
     ) -> DomRoot<HashChangeEvent> {
         Self::new_with_proto(
-            window,
-            None,
-            type_,
-            bubbles,
-            cancelable,
-            old_url,
-            new_url,
-            CanGc::note(),
+            window, None, type_, bubbles, cancelable, old_url, new_url, can_gc,
         )
     }
 
@@ -96,7 +91,7 @@ impl HashChangeEvent {
     }
 }
 
-impl HashChangeEventMethods for HashChangeEvent {
+impl HashChangeEventMethods<crate::DomTypeHolder> for HashChangeEvent {
     // https://html.spec.whatwg.org/multipage/#hashchangeevent
     fn Constructor(
         window: &Window,

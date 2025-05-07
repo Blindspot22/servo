@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
-use html5ever::{local_name, namespace_url, ns};
+use html5ever::{local_name, ns};
 use script_traits::DocumentActivity;
 
 use crate::document_loader::DocumentLoader;
@@ -15,10 +15,12 @@ use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
 use crate::dom::bindings::codegen::UnionTypes::StringOrElementCreationOptions;
 use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
+use crate::dom::bindings::reflector::{Reflector, reflect_dom_object};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
-use crate::dom::bindings::xmlname::{namespace_from_domstring, validate_qualified_name};
+use crate::dom::bindings::xmlname::{
+    namespace_from_domstring, validate_and_extract_qualified_name,
+};
 use crate::dom::document::{Document, DocumentSource, HasBrowsingContext, IsHTMLDocument};
 use crate::dom::documenttype::DocumentType;
 use crate::dom::htmlbodyelement::HTMLBodyElement;
@@ -32,7 +34,7 @@ use crate::script_runtime::CanGc;
 
 // https://dom.spec.whatwg.org/#domimplementation
 #[dom_struct]
-pub struct DOMImplementation {
+pub(crate) struct DOMImplementation {
     reflector_: Reflector,
     document: Dom<Document>,
 }
@@ -45,31 +47,39 @@ impl DOMImplementation {
         }
     }
 
-    pub fn new(document: &Document) -> DomRoot<DOMImplementation> {
+    pub(crate) fn new(document: &Document, can_gc: CanGc) -> DomRoot<DOMImplementation> {
         let window = document.window();
-        reflect_dom_object(Box::new(DOMImplementation::new_inherited(document)), window)
+        reflect_dom_object(
+            Box::new(DOMImplementation::new_inherited(document)),
+            window,
+            can_gc,
+        )
     }
 }
 
 // https://dom.spec.whatwg.org/#domimplementation
-impl DOMImplementationMethods for DOMImplementation {
-    // https://dom.spec.whatwg.org/#dom-domimplementation-createdocumenttype
+impl DOMImplementationMethods<crate::DomTypeHolder> for DOMImplementation {
+    /// <https://dom.spec.whatwg.org/#dom-domimplementation-createdocumenttype>
     fn CreateDocumentType(
         &self,
         qualified_name: DOMString,
         pubid: DOMString,
         sysid: DOMString,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<DocumentType>> {
-        validate_qualified_name(&qualified_name)?;
+        // Step 1. Validate qualifiedName.
+        validate_and_extract_qualified_name(&qualified_name)?;
+
         Ok(DocumentType::new(
             qualified_name,
             Some(pubid),
             Some(sysid),
             &self.document,
+            can_gc,
         ))
     }
 
-    // https://dom.spec.whatwg.org/#dom-domimplementation-createdocument
+    /// <https://dom.spec.whatwg.org/#dom-domimplementation-createdocument>
     fn CreateDocument(
         &self,
         maybe_namespace: Option<DOMString>,
@@ -82,10 +92,12 @@ impl DOMImplementationMethods for DOMImplementation {
         let namespace = namespace_from_domstring(maybe_namespace.to_owned());
 
         let content_type = match namespace {
-            ns!(html) => "application/xhtml+xml".parse().unwrap(),
-            ns!(svg) => mime::IMAGE_SVG,
-            _ => "application/xml".parse().unwrap(),
-        };
+            ns!(html) => "application/xhtml+xml",
+            ns!(svg) => "image/svg+xml",
+            _ => "application/xml",
+        }
+        .parse()
+        .unwrap();
 
         // Step 1.
         let doc = XMLDocument::new(
@@ -99,8 +111,14 @@ impl DOMImplementationMethods for DOMImplementation {
             DocumentActivity::Inactive,
             DocumentSource::NotFromParser,
             loader,
+            Some(self.document.insecure_requests_policy()),
+            self.document.has_trustworthy_ancestor_or_current_origin(),
+            can_gc,
         );
-        // Step 2-3.
+
+        // Step 2. Let element be null.
+        // Step 3. If qualifiedName is not the empty string, then set element to the result of running
+        // the internal createElementNS steps, given document, namespace, qualifiedName, and an empty dictionary.
         let maybe_elem = if qname.is_empty() {
             None
         } else {
@@ -122,12 +140,12 @@ impl DOMImplementationMethods for DOMImplementation {
 
             // Step 4.
             if let Some(doc_type) = maybe_doctype {
-                doc_node.AppendChild(doc_type.upcast()).unwrap();
+                doc_node.AppendChild(doc_type.upcast(), can_gc).unwrap();
             }
 
             // Step 5.
             if let Some(ref elem) = maybe_elem {
-                doc_node.AppendChild(elem.upcast()).unwrap();
+                doc_node.AppendChild(elem.upcast(), can_gc).unwrap();
             }
         }
 
@@ -157,16 +175,19 @@ impl DOMImplementationMethods for DOMImplementation {
             loader,
             None,
             None,
-            None,
             Default::default(),
+            false,
+            self.document.allow_declarative_shadow_roots(),
+            Some(self.document.insecure_requests_policy()),
+            self.document.has_trustworthy_ancestor_or_current_origin(),
             can_gc,
         );
 
         {
             // Step 3.
             let doc_node = doc.upcast::<Node>();
-            let doc_type = DocumentType::new(DOMString::from("html"), None, None, &doc);
-            doc_node.AppendChild(doc_type.upcast()).unwrap();
+            let doc_type = DocumentType::new(DOMString::from("html"), None, None, &doc, can_gc);
+            doc_node.AppendChild(doc_type.upcast(), can_gc).unwrap();
         }
 
         {
@@ -177,8 +198,11 @@ impl DOMImplementationMethods for DOMImplementation {
                 None,
                 &doc,
                 None,
+                can_gc,
             ));
-            doc_node.AppendChild(&doc_html).expect("Appending failed");
+            doc_node
+                .AppendChild(&doc_html, can_gc)
+                .expect("Appending failed");
 
             {
                 // Step 5.
@@ -187,8 +211,9 @@ impl DOMImplementationMethods for DOMImplementation {
                     None,
                     &doc,
                     None,
+                    can_gc,
                 ));
-                doc_html.AppendChild(&doc_head).unwrap();
+                doc_html.AppendChild(&doc_head, can_gc).unwrap();
 
                 // Step 6.
                 if let Some(title_str) = title {
@@ -198,18 +223,19 @@ impl DOMImplementationMethods for DOMImplementation {
                         None,
                         &doc,
                         None,
+                        can_gc,
                     ));
-                    doc_head.AppendChild(&doc_title).unwrap();
+                    doc_head.AppendChild(&doc_title, can_gc).unwrap();
 
                     // Step 6.2.
-                    let title_text = Text::new(title_str, &doc);
-                    doc_title.AppendChild(title_text.upcast()).unwrap();
+                    let title_text = Text::new(title_str, &doc, can_gc);
+                    doc_title.AppendChild(title_text.upcast(), can_gc).unwrap();
                 }
             }
 
             // Step 7.
-            let doc_body = HTMLBodyElement::new(local_name!("body"), None, &doc, None);
-            doc_html.AppendChild(doc_body.upcast()).unwrap();
+            let doc_body = HTMLBodyElement::new(local_name!("body"), None, &doc, None, can_gc);
+            doc_html.AppendChild(doc_body.upcast(), can_gc).unwrap();
         }
 
         // Step 8.

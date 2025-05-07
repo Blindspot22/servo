@@ -2,28 +2,27 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::ptr::NonNull;
 use std::rc::Rc;
 use std::str::FromStr;
 
 use cssparser::match_ignore_ascii_case;
 use dom_struct::dom_struct;
+use http::Method as HttpMethod;
 use http::header::{HeaderName, HeaderValue};
 use http::method::InvalidMethod;
-use http::Method as HttpMethod;
-use js::jsapi::JSObject;
 use js::rust::HandleObject;
+use net_traits::ReferrerPolicy as MsgReferrerPolicy;
 use net_traits::fetch::headers::is_forbidden_method;
 use net_traits::request::{
     CacheMode as NetTraitsRequestCache, CredentialsMode as NetTraitsRequestCredentials,
     Destination as NetTraitsRequestDestination, Origin, RedirectMode as NetTraitsRequestRedirect,
-    Referrer as NetTraitsRequestReferrer, Request as NetTraitsRequest,
+    Referrer as NetTraitsRequestReferrer, Request as NetTraitsRequest, RequestBuilder,
     RequestMode as NetTraitsRequestMode, Window,
 };
-use net_traits::ReferrerPolicy as MsgReferrerPolicy;
 use servo_url::ServoUrl;
 
-use crate::body::{consume_body, BodyMixin, BodyType, Extractable};
+use crate::body::{BodyMixin, BodyType, Extractable, consume_body};
+use crate::conversions::Convert;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::HeadersBinding::{HeadersInit, HeadersMethods};
 use crate::dom::bindings::codegen::Bindings::RequestBinding::{
@@ -31,7 +30,7 @@ use crate::dom::bindings::codegen::Bindings::RequestBinding::{
     RequestMethods, RequestMode, RequestRedirect,
 };
 use crate::dom::bindings::error::{Error, Fallible};
-use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomObject, Reflector};
+use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object_with_proto};
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::{ByteString, DOMString, USVString};
 use crate::dom::bindings::trace::RootedTraceableBox;
@@ -39,10 +38,10 @@ use crate::dom::globalscope::GlobalScope;
 use crate::dom::headers::{Guard, Headers};
 use crate::dom::promise::Promise;
 use crate::dom::readablestream::ReadableStream;
-use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct Request {
+pub(crate) struct Request {
     reflector_: Reflector,
     #[no_trace]
     request: DomRefCell<NetTraitsRequest>,
@@ -88,7 +87,7 @@ impl Request {
     fn clone_from(r: &Request, can_gc: CanGc) -> Fallible<DomRoot<Request>> {
         let req = r.request.borrow();
         let url = req.url();
-        let headers_guard = r.Headers().get_guard();
+        let headers_guard = r.Headers(can_gc).get_guard();
         let r_clone = Request::new(&r.global(), None, url, can_gc);
         r_clone.request.borrow_mut().pipeline_id = req.pipeline_id;
         {
@@ -96,22 +95,26 @@ impl Request {
             borrowed_r_request.origin = req.origin.clone();
         }
         *r_clone.request.borrow_mut() = req.clone();
-        r_clone.Headers().copy_from_headers(r.Headers())?;
-        r_clone.Headers().set_guard(headers_guard);
+        r_clone
+            .Headers(can_gc)
+            .copy_from_headers(r.Headers(can_gc))?;
+        r_clone.Headers(can_gc).set_guard(headers_guard);
         Ok(r_clone)
     }
 
-    pub fn get_request(&self) -> NetTraitsRequest {
+    pub(crate) fn get_request(&self) -> NetTraitsRequest {
         self.request.borrow().clone()
     }
 }
 
 fn net_request_from_global(global: &GlobalScope, url: ServoUrl) -> NetTraitsRequest {
-    let origin = Origin::Origin(global.get_url().origin());
-    let https_state = global.get_https_state();
-    let pipeline_id = global.pipeline_id();
-    let referrer = global.get_referrer();
-    NetTraitsRequest::new(url, Some(origin), referrer, Some(pipeline_id), https_state)
+    RequestBuilder::new(global.webview_id(), url, global.get_referrer())
+        .origin(global.get_url().origin())
+        .pipeline_id(Some(global.pipeline_id()))
+        .https_state(global.get_https_state())
+        .insecure_requests_policy(global.insecure_requests_policy())
+        .has_trustworthy_ancestor_origin(global.has_trustworthy_ancestor_or_current_origin())
+        .build()
 }
 
 // https://fetch.spec.whatwg.org/#concept-method-normalize
@@ -154,7 +157,7 @@ fn request_is_locked(input: &Request) -> bool {
     input.is_locked()
 }
 
-impl RequestMethods for Request {
+impl RequestMethods<crate::DomTypeHolder> for Request {
     // https://fetch.spec.whatwg.org/#dom-request
     fn Constructor(
         global: &GlobalScope,
@@ -265,7 +268,7 @@ impl RequestMethods for Request {
             // Step 13.4
             request.referrer = global.get_referrer();
             // Step 13.5
-            request.referrer_policy = None;
+            request.referrer_policy = MsgReferrerPolicy::EmptyString;
         }
 
         // Step 14
@@ -300,12 +303,12 @@ impl RequestMethods for Request {
 
         // Step 15
         if let Some(init_referrerpolicy) = init.referrerPolicy.as_ref() {
-            let init_referrer_policy = (*init_referrerpolicy).into();
-            request.referrer_policy = Some(init_referrer_policy);
+            let init_referrer_policy = (*init_referrerpolicy).convert();
+            request.referrer_policy = init_referrer_policy;
         }
 
         // Step 16
-        let mode = init.mode.as_ref().map(|m| (*m).into()).or(fallback_mode);
+        let mode = init.mode.as_ref().map(|m| (*m).convert()).or(fallback_mode);
 
         // Step 17
         if let Some(NetTraitsRequestMode::Navigate) = mode {
@@ -319,13 +322,13 @@ impl RequestMethods for Request {
 
         // Step 19
         if let Some(init_credentials) = init.credentials.as_ref() {
-            let credentials = (*init_credentials).into();
+            let credentials = (*init_credentials).convert();
             request.credentials_mode = credentials;
         }
 
         // Step 20
         if let Some(init_cache) = init.cache.as_ref() {
-            let cache = (*init_cache).into();
+            let cache = (*init_cache).convert();
             request.cache_mode = cache;
         }
 
@@ -340,7 +343,7 @@ impl RequestMethods for Request {
 
         // Step 22
         if let Some(init_redirect) = init.redirect.as_ref() {
-            let redirect = (*init_redirect).into();
+            let redirect = (*init_redirect).convert();
             request.redirect_mode = redirect;
         }
 
@@ -384,7 +387,7 @@ impl RequestMethods for Request {
         // "or_init" looks unclear here, but it always enters the block since r
         // hasn't had any other way to initialize its headers
         r.headers
-            .or_init(|| Headers::for_request(&r.global(), CanGc::note()));
+            .or_init(|| Headers::for_request(&r.global(), can_gc));
 
         // Step 33 - but spec says this should only be when non-empty init?
         let headers_copy = init
@@ -419,7 +422,7 @@ impl RequestMethods for Request {
                 ));
             }
             // Step 32.2
-            r.Headers().set_guard(Guard::RequestNoCors);
+            r.Headers(can_gc).set_guard(Guard::RequestNoCors);
         }
 
         // Step 33.5
@@ -430,15 +433,16 @@ impl RequestMethods for Request {
                 // but an input with headers is given, set request's
                 // headers as the input's Headers.
                 if let RequestInfo::Request(ref input_request) = input {
-                    r.Headers().copy_from_headers(input_request.Headers())?;
+                    r.Headers(can_gc)
+                        .copy_from_headers(input_request.Headers(can_gc))?;
                 }
             },
-            Some(headers_copy) => r.Headers().fill(Some(headers_copy))?,
+            Some(headers_copy) => r.Headers(can_gc).fill(Some(headers_copy))?,
         }
 
         // Step 33.5 depending on how we got here
         // Copy the headers list onto the headers of net_traits::Request
-        r.request.borrow_mut().headers = r.Headers().get_headers_list();
+        r.request.borrow_mut().headers = r.Headers(can_gc).get_headers_list();
 
         // Step 34
         let mut input_body = if let RequestInfo::Request(ref mut input_request) = input {
@@ -474,18 +478,18 @@ impl RequestMethods for Request {
             // Step 37.1 TODO "If init["keepalive"] exists and is true..."
 
             // Step 37.2
-            let mut extracted_body = init_body.extract(global)?;
+            let mut extracted_body = init_body.extract(global, can_gc)?;
 
             // Step 37.3
             if let Some(contents) = extracted_body.content_type.take() {
                 let ct_header_name = b"Content-Type";
                 if !r
-                    .Headers()
+                    .Headers(can_gc)
                     .Has(ByteString::new(ct_header_name.to_vec()))
                     .unwrap()
                 {
                     let ct_header_val = contents.as_bytes();
-                    r.Headers().Append(
+                    r.Headers(can_gc).Append(
                         ByteString::new(ct_header_name.to_vec()),
                         ByteString::new(ct_header_val.to_vec()),
                     )?;
@@ -536,14 +540,14 @@ impl RequestMethods for Request {
     }
 
     // https://fetch.spec.whatwg.org/#dom-request-headers
-    fn Headers(&self) -> DomRoot<Headers> {
+    fn Headers(&self, can_gc: CanGc) -> DomRoot<Headers> {
         self.headers
-            .or_init(|| Headers::new(&self.global(), CanGc::note()))
+            .or_init(|| Headers::new(&self.global(), can_gc))
     }
 
     // https://fetch.spec.whatwg.org/#dom-request-destination
     fn Destination(&self) -> RequestDestination {
-        self.request.borrow().destination.into()
+        self.request.borrow().destination.convert()
     }
 
     // https://fetch.spec.whatwg.org/#dom-request-referrer
@@ -561,34 +565,30 @@ impl RequestMethods for Request {
 
     // https://fetch.spec.whatwg.org/#dom-request-referrerpolicy
     fn ReferrerPolicy(&self) -> ReferrerPolicy {
-        self.request
-            .borrow()
-            .referrer_policy
-            .map(|m| m.into())
-            .unwrap_or(ReferrerPolicy::_empty)
+        self.request.borrow().referrer_policy.convert()
     }
 
     // https://fetch.spec.whatwg.org/#dom-request-mode
     fn Mode(&self) -> RequestMode {
-        self.request.borrow().mode.clone().into()
+        self.request.borrow().mode.clone().convert()
     }
 
     // https://fetch.spec.whatwg.org/#dom-request-credentials
     fn Credentials(&self) -> RequestCredentials {
         let r = self.request.borrow().clone();
-        r.credentials_mode.into()
+        r.credentials_mode.convert()
     }
 
     // https://fetch.spec.whatwg.org/#dom-request-cache
     fn Cache(&self) -> RequestCache {
         let r = self.request.borrow().clone();
-        r.cache_mode.into()
+        r.cache_mode.convert()
     }
 
     // https://fetch.spec.whatwg.org/#dom-request-redirect
     fn Redirect(&self) -> RequestRedirect {
         let r = self.request.borrow().clone();
-        r.redirect_mode.into()
+        r.redirect_mode.convert()
     }
 
     // https://fetch.spec.whatwg.org/#dom-request-integrity
@@ -598,8 +598,8 @@ impl RequestMethods for Request {
     }
 
     /// <https://fetch.spec.whatwg.org/#dom-body-body>
-    fn GetBody(&self, _cx: SafeJSContext) -> Option<NonNull<JSObject>> {
-        self.body().map(|stream| stream.get_js_stream())
+    fn GetBody(&self) -> Option<DomRoot<ReadableStream>> {
+        self.body()
     }
 
     // https://fetch.spec.whatwg.org/#dom-body-bodyused
@@ -608,7 +608,7 @@ impl RequestMethods for Request {
     }
 
     // https://fetch.spec.whatwg.org/#dom-request-clone
-    fn Clone(&self) -> Fallible<DomRoot<Request>> {
+    fn Clone(&self, can_gc: CanGc) -> Fallible<DomRoot<Request>> {
         // Step 1
         if request_is_locked(self) {
             return Err(Error::Type("Request is locked".to_string()));
@@ -618,32 +618,37 @@ impl RequestMethods for Request {
         }
 
         // Step 2
-        Request::clone_from(self, CanGc::note())
+        Request::clone_from(self, can_gc)
     }
 
     // https://fetch.spec.whatwg.org/#dom-body-text
-    fn Text(&self) -> Rc<Promise> {
-        consume_body(self, BodyType::Text)
+    fn Text(&self, can_gc: CanGc) -> Rc<Promise> {
+        consume_body(self, BodyType::Text, can_gc)
     }
 
     // https://fetch.spec.whatwg.org/#dom-body-blob
-    fn Blob(&self) -> Rc<Promise> {
-        consume_body(self, BodyType::Blob)
+    fn Blob(&self, can_gc: CanGc) -> Rc<Promise> {
+        consume_body(self, BodyType::Blob, can_gc)
     }
 
     // https://fetch.spec.whatwg.org/#dom-body-formdata
-    fn FormData(&self) -> Rc<Promise> {
-        consume_body(self, BodyType::FormData)
+    fn FormData(&self, can_gc: CanGc) -> Rc<Promise> {
+        consume_body(self, BodyType::FormData, can_gc)
     }
 
     // https://fetch.spec.whatwg.org/#dom-body-json
-    fn Json(&self) -> Rc<Promise> {
-        consume_body(self, BodyType::Json)
+    fn Json(&self, can_gc: CanGc) -> Rc<Promise> {
+        consume_body(self, BodyType::Json, can_gc)
     }
 
     // https://fetch.spec.whatwg.org/#dom-body-arraybuffer
-    fn ArrayBuffer(&self) -> Rc<Promise> {
-        consume_body(self, BodyType::ArrayBuffer)
+    fn ArrayBuffer(&self, can_gc: CanGc) -> Rc<Promise> {
+        consume_body(self, BodyType::ArrayBuffer, can_gc)
+    }
+
+    /// <https://fetch.spec.whatwg.org/#dom-body-bytes>
+    fn Bytes(&self, can_gc: CanGc) -> std::rc::Rc<Promise> {
+        consume_body(self, BodyType::Bytes, can_gc)
     }
 }
 
@@ -664,15 +669,15 @@ impl BodyMixin for Request {
         self.body_stream.get()
     }
 
-    fn get_mime_type(&self) -> Vec<u8> {
-        let headers = self.Headers();
+    fn get_mime_type(&self, can_gc: CanGc) -> Vec<u8> {
+        let headers = self.Headers(can_gc);
         headers.extract_mime_type()
     }
 }
 
-impl From<RequestCache> for NetTraitsRequestCache {
-    fn from(cache: RequestCache) -> Self {
-        match cache {
+impl Convert<NetTraitsRequestCache> for RequestCache {
+    fn convert(self) -> NetTraitsRequestCache {
+        match self {
             RequestCache::Default => NetTraitsRequestCache::Default,
             RequestCache::No_store => NetTraitsRequestCache::NoStore,
             RequestCache::Reload => NetTraitsRequestCache::Reload,
@@ -683,9 +688,9 @@ impl From<RequestCache> for NetTraitsRequestCache {
     }
 }
 
-impl From<NetTraitsRequestCache> for RequestCache {
-    fn from(cache: NetTraitsRequestCache) -> Self {
-        match cache {
+impl Convert<RequestCache> for NetTraitsRequestCache {
+    fn convert(self) -> RequestCache {
+        match self {
             NetTraitsRequestCache::Default => RequestCache::Default,
             NetTraitsRequestCache::NoStore => RequestCache::No_store,
             NetTraitsRequestCache::Reload => RequestCache::Reload,
@@ -696,9 +701,9 @@ impl From<NetTraitsRequestCache> for RequestCache {
     }
 }
 
-impl From<RequestCredentials> for NetTraitsRequestCredentials {
-    fn from(credentials: RequestCredentials) -> Self {
-        match credentials {
+impl Convert<NetTraitsRequestCredentials> for RequestCredentials {
+    fn convert(self) -> NetTraitsRequestCredentials {
+        match self {
             RequestCredentials::Omit => NetTraitsRequestCredentials::Omit,
             RequestCredentials::Same_origin => NetTraitsRequestCredentials::CredentialsSameOrigin,
             RequestCredentials::Include => NetTraitsRequestCredentials::Include,
@@ -706,9 +711,9 @@ impl From<RequestCredentials> for NetTraitsRequestCredentials {
     }
 }
 
-impl From<NetTraitsRequestCredentials> for RequestCredentials {
-    fn from(credentials: NetTraitsRequestCredentials) -> Self {
-        match credentials {
+impl Convert<RequestCredentials> for NetTraitsRequestCredentials {
+    fn convert(self) -> RequestCredentials {
+        match self {
             NetTraitsRequestCredentials::Omit => RequestCredentials::Omit,
             NetTraitsRequestCredentials::CredentialsSameOrigin => RequestCredentials::Same_origin,
             NetTraitsRequestCredentials::Include => RequestCredentials::Include,
@@ -716,9 +721,9 @@ impl From<NetTraitsRequestCredentials> for RequestCredentials {
     }
 }
 
-impl From<RequestDestination> for NetTraitsRequestDestination {
-    fn from(destination: RequestDestination) -> Self {
-        match destination {
+impl Convert<NetTraitsRequestDestination> for RequestDestination {
+    fn convert(self) -> NetTraitsRequestDestination {
+        match self {
             RequestDestination::_empty => NetTraitsRequestDestination::None,
             RequestDestination::Audio => NetTraitsRequestDestination::Audio,
             RequestDestination::Document => NetTraitsRequestDestination::Document,
@@ -742,9 +747,9 @@ impl From<RequestDestination> for NetTraitsRequestDestination {
     }
 }
 
-impl From<NetTraitsRequestDestination> for RequestDestination {
-    fn from(destination: NetTraitsRequestDestination) -> Self {
-        match destination {
+impl Convert<RequestDestination> for NetTraitsRequestDestination {
+    fn convert(self) -> RequestDestination {
+        match self {
             NetTraitsRequestDestination::None => RequestDestination::_empty,
             NetTraitsRequestDestination::Audio => RequestDestination::Audio,
             NetTraitsRequestDestination::Document => RequestDestination::Document,
@@ -774,9 +779,9 @@ impl From<NetTraitsRequestDestination> for RequestDestination {
     }
 }
 
-impl From<RequestMode> for NetTraitsRequestMode {
-    fn from(mode: RequestMode) -> Self {
-        match mode {
+impl Convert<NetTraitsRequestMode> for RequestMode {
+    fn convert(self) -> NetTraitsRequestMode {
+        match self {
             RequestMode::Navigate => NetTraitsRequestMode::Navigate,
             RequestMode::Same_origin => NetTraitsRequestMode::SameOrigin,
             RequestMode::No_cors => NetTraitsRequestMode::NoCors,
@@ -785,9 +790,9 @@ impl From<RequestMode> for NetTraitsRequestMode {
     }
 }
 
-impl From<NetTraitsRequestMode> for RequestMode {
-    fn from(mode: NetTraitsRequestMode) -> Self {
-        match mode {
+impl Convert<RequestMode> for NetTraitsRequestMode {
+    fn convert(self) -> RequestMode {
+        match self {
             NetTraitsRequestMode::Navigate => RequestMode::Navigate,
             NetTraitsRequestMode::SameOrigin => RequestMode::Same_origin,
             NetTraitsRequestMode::NoCors => RequestMode::No_cors,
@@ -799,10 +804,10 @@ impl From<NetTraitsRequestMode> for RequestMode {
     }
 }
 
-impl From<ReferrerPolicy> for MsgReferrerPolicy {
-    fn from(policy: ReferrerPolicy) -> Self {
-        match policy {
-            ReferrerPolicy::_empty => MsgReferrerPolicy::NoReferrer,
+impl Convert<MsgReferrerPolicy> for ReferrerPolicy {
+    fn convert(self) -> MsgReferrerPolicy {
+        match self {
+            ReferrerPolicy::_empty => MsgReferrerPolicy::EmptyString,
             ReferrerPolicy::No_referrer => MsgReferrerPolicy::NoReferrer,
             ReferrerPolicy::No_referrer_when_downgrade => {
                 MsgReferrerPolicy::NoReferrerWhenDowngrade
@@ -819,9 +824,10 @@ impl From<ReferrerPolicy> for MsgReferrerPolicy {
     }
 }
 
-impl From<MsgReferrerPolicy> for ReferrerPolicy {
-    fn from(policy: MsgReferrerPolicy) -> Self {
-        match policy {
+impl Convert<ReferrerPolicy> for MsgReferrerPolicy {
+    fn convert(self) -> ReferrerPolicy {
+        match self {
+            MsgReferrerPolicy::EmptyString => ReferrerPolicy::_empty,
             MsgReferrerPolicy::NoReferrer => ReferrerPolicy::No_referrer,
             MsgReferrerPolicy::NoReferrerWhenDowngrade => {
                 ReferrerPolicy::No_referrer_when_downgrade
@@ -838,9 +844,9 @@ impl From<MsgReferrerPolicy> for ReferrerPolicy {
     }
 }
 
-impl From<RequestRedirect> for NetTraitsRequestRedirect {
-    fn from(redirect: RequestRedirect) -> Self {
-        match redirect {
+impl Convert<NetTraitsRequestRedirect> for RequestRedirect {
+    fn convert(self) -> NetTraitsRequestRedirect {
+        match self {
             RequestRedirect::Follow => NetTraitsRequestRedirect::Follow,
             RequestRedirect::Error => NetTraitsRequestRedirect::Error,
             RequestRedirect::Manual => NetTraitsRequestRedirect::Manual,
@@ -848,25 +854,12 @@ impl From<RequestRedirect> for NetTraitsRequestRedirect {
     }
 }
 
-impl From<NetTraitsRequestRedirect> for RequestRedirect {
-    fn from(redirect: NetTraitsRequestRedirect) -> Self {
-        match redirect {
+impl Convert<RequestRedirect> for NetTraitsRequestRedirect {
+    fn convert(self) -> RequestRedirect {
+        match self {
             NetTraitsRequestRedirect::Follow => RequestRedirect::Follow,
             NetTraitsRequestRedirect::Error => RequestRedirect::Error,
             NetTraitsRequestRedirect::Manual => RequestRedirect::Manual,
-        }
-    }
-}
-
-impl Clone for HeadersInit {
-    fn clone(&self) -> HeadersInit {
-        match self {
-            HeadersInit::ByteStringSequenceSequence(b) => {
-                HeadersInit::ByteStringSequenceSequence(b.clone())
-            },
-            HeadersInit::ByteStringByteStringRecord(m) => {
-                HeadersInit::ByteStringByteStringRecord(m.clone())
-            },
         }
     }
 }

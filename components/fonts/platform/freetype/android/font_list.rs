@@ -2,20 +2,16 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 use std::sync::LazyLock;
 
-use base::text::{is_cjk, UnicodeBlock, UnicodeBlockMethod};
+use base::text::{UnicodeBlock, UnicodeBlockMethod, is_cjk};
 use log::warn;
-use malloc_size_of_derive::MallocSizeOf;
-use serde::{Deserialize, Serialize};
+use style::Atom;
 use style::values::computed::font::GenericFontFamily;
 use style::values::computed::{
     FontStretch as StyleFontStretch, FontStyle as StyleFontStyle, FontWeight as StyleFontWeight,
 };
-use style::Atom;
 
 use super::xml::{Attribute, Node};
 use crate::{
@@ -23,7 +19,7 @@ use crate::{
     LocalFontIdentifier, LowercaseFontFamilyName,
 };
 
-static FONT_LIST: LazyLock<FontList> = LazyLock::new(|| FontList::new());
+static FONT_LIST: LazyLock<FontList> = LazyLock::new(FontList::new);
 
 // Android doesn't provide an API to query system fonts until Android O:
 // https://developer.android.com/reference/android/text/FontConfig.html
@@ -145,7 +141,7 @@ impl FontList {
         let mut result = None;
         paths.iter().all(|path| {
             result = Self::from_path(path);
-            !result.is_some()
+            result.is_none()
         });
 
         if result.is_none() {
@@ -198,10 +194,7 @@ impl FontList {
             }
         }
 
-        Some(FontList {
-            families: families,
-            aliases: aliases,
-        })
+        Some(FontList { families, aliases })
     }
 
     // Fonts expected to exist in Android devices.
@@ -281,24 +274,19 @@ impl FontList {
         let mut fonts = Vec::new();
         // Parse font variants
         for node in familyset {
-            match node {
-                Node::Element {
-                    name,
-                    attributes,
-                    children,
-                } => {
-                    if name.local_name == "font" {
-                        FontList::parse_font(&children, attributes, &mut fonts);
-                    }
-                },
-                _ => {},
+            if let Node::Element {
+                name,
+                attributes,
+                children,
+            } = node
+            {
+                if name.local_name == "font" {
+                    FontList::parse_font(children, attributes, &mut fonts);
+                }
             }
         }
 
-        out.push(FontFamily {
-            name: name,
-            fonts: fonts,
-        });
+        out.push(FontFamily { name, fonts });
     }
 
     // Parse family and font file names for Androi API < 21
@@ -343,10 +331,7 @@ impl FontList {
                 .collect();
 
             if !fonts.is_empty() {
-                out.push(FontFamily {
-                    name: name,
-                    fonts: fonts,
-                })
+                out.push(FontFamily { name, fonts })
             }
         }
     }
@@ -397,11 +382,7 @@ impl FontList {
         // Parse optional weight filter
         let weight = Self::find_attrib("weight", attrs).and_then(|w| w.parse().ok());
 
-        out.push(FontAlias {
-            from: from,
-            to: to,
-            weight: weight,
-        })
+        out.push(FontAlias { from, to, weight })
     }
 
     fn find_attrib(name: &str, attrs: &[Attribute]) -> Option<String> {
@@ -412,7 +393,7 @@ impl FontList {
     }
 
     fn text_content(nodes: &[Node]) -> Option<String> {
-        nodes.get(0).and_then(|child| match child {
+        nodes.first().and_then(|child| match child {
             Node::Text(contents) => Some(contents.trim().into()),
             Node::Element { .. } => None,
         })

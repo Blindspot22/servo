@@ -3,344 +3,466 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use app_units::Au;
-use euclid::default::{Point2D, Size2D, Vector2D};
+use euclid::Size2D;
+use style::Zero;
 use style::color::mix::ColorInterpolationMethod;
 use style::properties::ComputedValues;
-use style::values::computed::image::{EndingShape, LineDirection};
-use style::values::computed::{Angle, Color, LengthPercentage, Percentage, Position};
+use style::values::computed::image::{EndingShape, Gradient, LineDirection};
+use style::values::computed::{Angle, AngleOrPercentage, Color, LengthPercentage, Position};
 use style::values::generics::image::{
     Circle, ColorStop, Ellipse, GradientFlags, GradientItem, ShapeExtent,
 };
-use webrender_api::{ExtendMode, Gradient, GradientBuilder, GradientStop, RadialGradient};
+use webrender_api::units::LayoutPixel;
+use webrender_api::{
+    self as wr, ConicGradient as WebRenderConicGradient, Gradient as WebRenderLinearGradient,
+    RadialGradient as WebRenderRadialGradient, units,
+};
+use wr::ColorF;
 
-use crate::display_list::ToLayout;
-
-/// A helper data structure for gradients.
-#[derive(Clone, Copy)]
-struct StopRun {
-    start_offset: f32,
-    end_offset: f32,
-    start_index: usize,
-    stop_count: usize,
+pub(super) enum WebRenderGradient {
+    Linear(WebRenderLinearGradient),
+    Radial(WebRenderRadialGradient),
+    Conic(WebRenderConicGradient),
 }
 
-/// Determines the radius of a circle if it was not explicitly provided.
-/// <https://drafts.csswg.org/css-images-3/#typedef-size>
-fn circle_size_keyword(
-    keyword: ShapeExtent,
-    size: &Size2D<Au>,
-    center: &Point2D<Au>,
-) -> Size2D<Au> {
-    let radius = match keyword {
-        ShapeExtent::ClosestSide | ShapeExtent::Contain => {
-            let dist = distance_to_sides(size, center, ::std::cmp::min);
-            ::std::cmp::min(dist.width, dist.height)
-        },
-        ShapeExtent::FarthestSide => {
-            let dist = distance_to_sides(size, center, ::std::cmp::max);
-            ::std::cmp::max(dist.width, dist.height)
-        },
-        ShapeExtent::ClosestCorner => distance_to_corner(size, center, ::std::cmp::min),
-        ShapeExtent::FarthestCorner | ShapeExtent::Cover => {
-            distance_to_corner(size, center, ::std::cmp::max)
-        },
-    };
-    Size2D::new(radius, radius)
-}
-
-/// Returns the radius for an ellipse with the same ratio as if it was matched to the sides.
-fn ellipse_radius<F>(size: &Size2D<Au>, center: &Point2D<Au>, cmp: F) -> Size2D<Au>
-where
-    F: Fn(Au, Au) -> Au,
-{
-    let dist = distance_to_sides(size, center, cmp);
-    Size2D::new(
-        dist.width.scale_by(::std::f32::consts::FRAC_1_SQRT_2 * 2.0),
-        dist.height
-            .scale_by(::std::f32::consts::FRAC_1_SQRT_2 * 2.0),
-    )
-}
-
-/// Determines the radius of an ellipse if it was not explicitly provided.
-/// <https://drafts.csswg.org/css-images-3/#typedef-size>
-fn ellipse_size_keyword(
-    keyword: ShapeExtent,
-    size: &Size2D<Au>,
-    center: &Point2D<Au>,
-) -> Size2D<Au> {
-    match keyword {
-        ShapeExtent::ClosestSide | ShapeExtent::Contain => {
-            distance_to_sides(size, center, ::std::cmp::min)
-        },
-        ShapeExtent::FarthestSide => distance_to_sides(size, center, ::std::cmp::max),
-        ShapeExtent::ClosestCorner => ellipse_radius(size, center, ::std::cmp::min),
-        ShapeExtent::FarthestCorner | ShapeExtent::Cover => {
-            ellipse_radius(size, center, ::std::cmp::max)
-        },
-    }
-}
-
-fn convert_gradient_stops(
+pub(super) fn build(
     style: &ComputedValues,
-    gradient_items: &[GradientItem<Color, LengthPercentage>],
-    total_length: Au,
-) -> GradientBuilder {
-    // Determine the position of each stop per CSS-IMAGES § 3.4.
-
-    // Only keep the color stops, discard the color interpolation hints.
-    let mut stop_items = gradient_items
-        .iter()
-        .filter_map(|item| match item {
-            GradientItem::SimpleColorStop(color) => Some(ColorStop {
-                color,
-                position: None,
-            }),
-            GradientItem::ComplexColorStop {
-                color,
-                ref position,
-            } => Some(ColorStop {
-                color,
-                position: Some(position.clone()),
-            }),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-
-    assert!(stop_items.len() >= 2);
-
-    // Run the algorithm from
-    // https://drafts.csswg.org/css-images-3/#color-stop-syntax
-
-    // Step 1:
-    // If the first color stop does not have a position, set its position to 0%.
-    {
-        let first = stop_items.first_mut().unwrap();
-        if first.position.is_none() {
-            first.position = Some(LengthPercentage::new_percent(Percentage(0.)));
-        }
-    }
-    // If the last color stop does not have a position, set its position to 100%.
-    {
-        let last = stop_items.last_mut().unwrap();
-        if last.position.is_none() {
-            last.position = Some(LengthPercentage::new_percent(Percentage(1.0)));
-        }
-    }
-
-    // Step 2: Move any stops placed before earlier stops to the
-    // same position as the preceding stop.
-    //
-    // FIXME(emilio): Once we know the offsets, it seems like converting the
-    // positions to absolute at once then process that would be cheaper.
-    let mut last_stop_position = stop_items
-        .first()
-        .unwrap()
-        .position
-        .as_ref()
-        .unwrap()
-        .clone();
-    for stop in stop_items.iter_mut().skip(1) {
-        if let Some(ref pos) = stop.position {
-            if position_to_offset(&last_stop_position, total_length) >
-                position_to_offset(pos, total_length)
-            {
-                stop.position = Some(last_stop_position);
-            }
-            last_stop_position = stop.position.as_ref().unwrap().clone();
-        }
-    }
-
-    // Step 3: Evenly space stops without position.
-    let mut stops = GradientBuilder::new();
-    let mut stop_run = None;
-    for (i, stop) in stop_items.iter().enumerate() {
-        let offset = match stop.position {
-            None => {
-                if stop_run.is_none() {
-                    // Initialize a new stop run.
-                    // `unwrap()` here should never fail because this is the beginning of
-                    // a stop run, which is always bounded by a length or percentage.
-                    let start_offset = position_to_offset(
-                        stop_items[i - 1].position.as_ref().unwrap(),
-                        total_length,
-                    );
-                    // `unwrap()` here should never fail because this is the end of
-                    // a stop run, which is always bounded by a length or percentage.
-                    let (end_index, end_stop) = stop_items[(i + 1)..]
-                        .iter()
-                        .enumerate()
-                        .find(|(_, stop)| stop.position.is_some())
-                        .unwrap();
-                    let end_offset =
-                        position_to_offset(end_stop.position.as_ref().unwrap(), total_length);
-                    stop_run = Some(StopRun {
-                        start_offset,
-                        end_offset,
-                        start_index: i - 1,
-                        stop_count: end_index,
-                    })
-                }
-
-                let stop_run = stop_run.unwrap();
-                let stop_run_length = stop_run.end_offset - stop_run.start_offset;
-                stop_run.start_offset +
-                    stop_run_length * (i - stop_run.start_index) as f32 /
-                        ((2 + stop_run.stop_count) as f32)
-            },
-            Some(ref position) => {
-                stop_run = None;
-                position_to_offset(position, total_length)
-            },
-        };
-        assert!(offset.is_finite());
-        stops.push(GradientStop {
-            offset,
-            color: style.resolve_color(stop.color.clone()).to_layout(),
-        })
-    }
-    stops
-}
-
-fn extend_mode(repeating: bool) -> ExtendMode {
-    if repeating {
-        ExtendMode::Repeat
-    } else {
-        ExtendMode::Clamp
+    gradient: &Gradient,
+    size: Size2D<f32, LayoutPixel>,
+    builder: &mut super::DisplayListBuilder,
+) -> WebRenderGradient {
+    match gradient {
+        Gradient::Linear {
+            items,
+            direction,
+            color_interpolation_method,
+            flags,
+            compat_mode: _,
+        } => build_linear(
+            style,
+            items,
+            direction,
+            color_interpolation_method,
+            *flags,
+            size,
+            builder,
+        ),
+        Gradient::Radial {
+            shape,
+            position,
+            color_interpolation_method,
+            items,
+            flags,
+            compat_mode: _,
+        } => build_radial(
+            style,
+            items,
+            shape,
+            position,
+            color_interpolation_method,
+            *flags,
+            size,
+            builder,
+        ),
+        Gradient::Conic {
+            angle,
+            position,
+            color_interpolation_method,
+            items,
+            flags,
+        } => build_conic(
+            style,
+            *angle,
+            position,
+            *color_interpolation_method,
+            items,
+            *flags,
+            size,
+            builder,
+        ),
     }
 }
-/// Returns the the distance to the nearest or farthest corner depending on the comperator.
-fn distance_to_corner<F>(size: &Size2D<Au>, center: &Point2D<Au>, cmp: F) -> Au
-where
-    F: Fn(Au, Au) -> Au,
-{
-    let dist = distance_to_sides(size, center, cmp);
-    Au::from_f32_px(dist.width.to_f32_px().hypot(dist.height.to_f32_px()))
-}
 
-/// Returns the distance to the nearest or farthest sides depending on the comparator.
-///
-/// The first return value is horizontal distance the second vertical distance.
-fn distance_to_sides<F>(size: &Size2D<Au>, center: &Point2D<Au>, cmp: F) -> Size2D<Au>
-where
-    F: Fn(Au, Au) -> Au,
-{
-    let top_side = center.y;
-    let right_side = size.width - center.x;
-    let bottom_side = size.height - center.y;
-    let left_side = center.x;
-    Size2D::new(cmp(left_side, right_side), cmp(top_side, bottom_side))
-}
-
-fn position_to_offset(position: &LengthPercentage, total_length: Au) -> f32 {
-    if total_length == Au(0) {
-        return 0.0;
-    }
-    position.to_used_value(total_length).0 as f32 / total_length.0 as f32
-}
-
-pub fn linear(
+/// <https://drafts.csswg.org/css-images-3/#linear-gradients>
+pub(super) fn build_linear(
     style: &ComputedValues,
-    size: Size2D<Au>,
-    stops: &[GradientItem<Color, LengthPercentage>],
-    direction: LineDirection,
+    items: &[GradientItem<Color, LengthPercentage>],
+    line_direction: &LineDirection,
     _color_interpolation_method: &ColorInterpolationMethod,
     flags: GradientFlags,
-) -> (Gradient, Vec<GradientStop>) {
+    gradient_box: Size2D<f32, LayoutPixel>,
+    builder: &mut super::DisplayListBuilder,
+) -> WebRenderGradient {
     use style::values::specified::position::HorizontalPositionKeyword::*;
     use style::values::specified::position::VerticalPositionKeyword::*;
-    let repeating = flags.contains(GradientFlags::REPEATING);
-    let angle = match direction {
-        LineDirection::Angle(angle) => angle.radians(),
-        LineDirection::Horizontal(x) => match x {
-            Left => Angle::from_degrees(270.).radians(),
-            Right => Angle::from_degrees(90.).radians(),
+    use units::LayoutVector2D as Vec2;
+
+    // A vector of length 1.0 in the direction of the gradient line
+    let direction = match line_direction {
+        LineDirection::Horizontal(Right) => Vec2::new(1., 0.),
+        LineDirection::Vertical(Top) => Vec2::new(0., -1.),
+        LineDirection::Horizontal(Left) => Vec2::new(-1., 0.),
+        LineDirection::Vertical(Bottom) => Vec2::new(0., 1.),
+
+        LineDirection::Angle(angle) => {
+            let radians = angle.radians();
+            // “`0deg` points upward,
+            //  and positive angles represent clockwise rotation,
+            //  so `90deg` point toward the right.”
+            Vec2::new(radians.sin(), -radians.cos())
         },
-        LineDirection::Vertical(y) => match y {
-            Top => Angle::from_degrees(0.).radians(),
-            Bottom => Angle::from_degrees(180.).radians(),
-        },
+
         LineDirection::Corner(horizontal, vertical) => {
-            // This the angle for one of the diagonals of the box. Our angle
-            // will either be this one, this one + PI, or one of the other
-            // two perpendicular angles.
-            let atan = (size.height.to_f32_px() / size.width.to_f32_px()).atan();
-            match (horizontal, vertical) {
-                (Right, Bottom) => ::std::f32::consts::PI - atan,
-                (Left, Bottom) => ::std::f32::consts::PI + atan,
-                (Right, Top) => atan,
-                (Left, Top) => -atan,
-            }
+            // “If the argument instead specifies a corner of the box such as `to top left`,
+            //  the gradient line must be angled such that it points
+            //  into the same quadrant as the specified corner,
+            //  and is perpendicular to a line intersecting
+            //  the two neighboring corners of the gradient box.”
+
+            // Note that that last line is a diagonal of the gradient box rectangle,
+            // since two neighboring corners of a third corner
+            // are necessarily opposite to each other.
+
+            // `{ x: gradient_box.width, y: gradient_box.height }` is such a diagonal vector,
+            // from the bottom left corner to the top right corner of the gradient box.
+            // (Both coordinates are positive.)
+            // Changing either or both signs produces the other three (oriented) diagonals.
+
+            // Swapping the coordinates `{ x: gradient_box.height, y: gradient_box.height }`
+            // produces a vector perpendicular to some diagonal of the rectangle.
+            // Finally, we choose the sign of each cartesian coordinate
+            // such that our vector points to the desired quadrant.
+
+            let x = match horizontal {
+                Right => gradient_box.height,
+                Left => -gradient_box.height,
+            };
+            let y = match vertical {
+                Top => gradient_box.width,
+                Bottom => -gradient_box.width,
+            };
+
+            // `{ x, y }` is now a vector of arbitrary length
+            // with the same direction as the gradient line.
+            // This normalizes the length to 1.0:
+            Vec2::new(x, y).normalize()
         },
     };
 
-    // Get correct gradient line length, based on:
-    // https://drafts.csswg.org/css-images-3/#linear-gradients
-    let dir = Point2D::new(angle.sin(), -angle.cos());
+    // This formula is given as `abs(W * sin(A)) + abs(H * cos(A))` in a note in the spec, under
+    // https://drafts.csswg.org/css-images-3/#linear-gradient-syntax
+    //
+    // Sketch of a proof:
+    //
+    // * Take the top side of the gradient box rectangle. It is a segment of length `W`
+    // * Project onto the gradient line. You get a segment of length `abs(W * sin(A))`
+    // * Similarly, the left side of the rectangle (length `H`)
+    //   projects to a segment of length `abs(H * cos(A))`
+    // * These two segments add up to exactly the gradient line.
+    //
+    // See the illustration in the example under
+    // https://drafts.csswg.org/css-images-3/#linear-gradient-syntax
+    let gradient_line_length =
+        (gradient_box.width * direction.x).abs() + (gradient_box.height * direction.y).abs();
 
-    let line_length =
-        (dir.x * size.width.to_f32_px()).abs() + (dir.y * size.height.to_f32_px()).abs();
+    let half_gradient_line = direction * (gradient_line_length / 2.);
+    let center = (gradient_box / 2.).to_vector().to_point();
+    let start_point = center - half_gradient_line;
+    let end_point = center + half_gradient_line;
 
-    let inv_dir_length = 1.0 / (dir.x * dir.x + dir.y * dir.y).sqrt();
-
-    // This is the vector between the center and the ending point; i.e. half
-    // of the distance between the starting point and the ending point.
-    let delta = Vector2D::new(
-        Au::from_f32_px(dir.x * inv_dir_length * line_length / 2.0),
-        Au::from_f32_px(dir.y * inv_dir_length * line_length / 2.0),
-    );
-
-    // This is the length of the gradient line.
-    let length = Au::from_f32_px((delta.x.to_f32_px() * 2.0).hypot(delta.y.to_f32_px() * 2.0));
-
-    let mut builder = convert_gradient_stops(style, stops, length);
-
-    let center = Point2D::new(size.width / 2, size.height / 2);
-
-    (
-        builder.gradient(
-            (center - delta).to_layout(),
-            (center + delta).to_layout(),
-            extend_mode(repeating),
-        ),
-        builder.into_stops(),
-    )
+    let mut color_stops =
+        gradient_items_to_color_stops(style, items, Au::from_f32_px(gradient_line_length));
+    let stops = fixup_stops(&mut color_stops);
+    let extend_mode = if flags.contains(GradientFlags::REPEATING) {
+        wr::ExtendMode::Repeat
+    } else {
+        wr::ExtendMode::Clamp
+    };
+    WebRenderGradient::Linear(builder.wr().create_gradient(
+        start_point,
+        end_point,
+        stops,
+        extend_mode,
+    ))
 }
 
-pub fn radial(
+/// <https://drafts.csswg.org/css-images-3/#radial-gradients>
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_radial(
     style: &ComputedValues,
-    size: Size2D<Au>,
-    stops: &[GradientItem<Color, LengthPercentage>],
+    items: &[GradientItem<Color, LengthPercentage>],
     shape: &EndingShape,
     center: &Position,
     _color_interpolation_method: &ColorInterpolationMethod,
     flags: GradientFlags,
-) -> (RadialGradient, Vec<GradientStop>) {
-    let repeating = flags.contains(GradientFlags::REPEATING);
-    let center = Point2D::new(
-        center.horizontal.to_used_value(size.width),
-        center.vertical.to_used_value(size.height),
+    gradient_box: Size2D<f32, LayoutPixel>,
+    builder: &mut super::DisplayListBuilder,
+) -> WebRenderGradient {
+    let center = units::LayoutPoint::new(
+        center
+            .horizontal
+            .to_used_value(Au::from_f32_px(gradient_box.width))
+            .to_f32_px(),
+        center
+            .vertical
+            .to_used_value(Au::from_f32_px(gradient_box.height))
+            .to_f32_px(),
     );
-    let radius = match shape {
-        EndingShape::Circle(Circle::Radius(length)) => {
-            let length = Au::from(*length);
-            Size2D::new(length, length)
+    let radii = match shape {
+        EndingShape::Circle(circle) => {
+            let radius = match circle {
+                Circle::Radius(r) => r.0.px(),
+                Circle::Extent(extent) => match extent {
+                    ShapeExtent::ClosestSide | ShapeExtent::Contain => {
+                        let vec = abs_vector_to_corner(gradient_box, center, f32::min);
+                        vec.x.min(vec.y)
+                    },
+                    ShapeExtent::FarthestSide => {
+                        let vec = abs_vector_to_corner(gradient_box, center, f32::max);
+                        vec.x.max(vec.y)
+                    },
+                    ShapeExtent::ClosestCorner => {
+                        abs_vector_to_corner(gradient_box, center, f32::min).length()
+                    },
+                    ShapeExtent::FarthestCorner | ShapeExtent::Cover => {
+                        abs_vector_to_corner(gradient_box, center, f32::max).length()
+                    },
+                },
+            };
+            units::LayoutSize::new(radius, radius)
         },
-        EndingShape::Circle(Circle::Extent(extent)) => circle_size_keyword(*extent, &size, &center),
-        EndingShape::Ellipse(Ellipse::Radii(x, y)) => {
-            Size2D::new(x.to_used_value(size.width), y.to_used_value(size.height))
-        },
-        EndingShape::Ellipse(Ellipse::Extent(extent)) => {
-            ellipse_size_keyword(*extent, &size, &center)
+        EndingShape::Ellipse(Ellipse::Radii(rx, ry)) => units::LayoutSize::new(
+            rx.0.to_used_value(Au::from_f32_px(gradient_box.width))
+                .to_f32_px(),
+            ry.0.to_used_value(Au::from_f32_px(gradient_box.height))
+                .to_f32_px(),
+        ),
+        EndingShape::Ellipse(Ellipse::Extent(extent)) => match extent {
+            ShapeExtent::ClosestSide | ShapeExtent::Contain => {
+                abs_vector_to_corner(gradient_box, center, f32::min).to_size()
+            },
+            ShapeExtent::FarthestSide => {
+                abs_vector_to_corner(gradient_box, center, f32::max).to_size()
+            },
+            ShapeExtent::ClosestCorner => {
+                abs_vector_to_corner(gradient_box, center, f32::min).to_size() *
+                    (std::f32::consts::FRAC_1_SQRT_2 * 2.0)
+            },
+            ShapeExtent::FarthestCorner | ShapeExtent::Cover => {
+                abs_vector_to_corner(gradient_box, center, f32::max).to_size() *
+                    (std::f32::consts::FRAC_1_SQRT_2 * 2.0)
+            },
         },
     };
 
-    let mut builder = convert_gradient_stops(style, stops, radius.width);
-    (
-        builder.radial_gradient(
-            center.to_layout(),
-            radius.to_layout(),
-            extend_mode(repeating),
-        ),
-        builder.into_stops(),
-    )
+    /// Returns the distance to the nearest or farthest sides in the respective dimension,
+    /// depending on `select`.
+    fn abs_vector_to_corner(
+        gradient_box: units::LayoutSize,
+        center: units::LayoutPoint,
+        select: impl Fn(f32, f32) -> f32,
+    ) -> units::LayoutVector2D {
+        let left = center.x.abs();
+        let top = center.y.abs();
+        let right = (gradient_box.width - center.x).abs();
+        let bottom = (gradient_box.height - center.y).abs();
+        units::LayoutVector2D::new(select(left, right), select(top, bottom))
+    }
+
+    // “The gradient line’s starting point is at the center of the gradient,
+    //  and it extends toward the right, with the ending point on the point
+    //  where the gradient line intersects the ending shape.”
+    let gradient_line_length = radii.width;
+
+    let mut color_stops =
+        gradient_items_to_color_stops(style, items, Au::from_f32_px(gradient_line_length));
+    let stops = fixup_stops(&mut color_stops);
+    let extend_mode = if flags.contains(GradientFlags::REPEATING) {
+        wr::ExtendMode::Repeat
+    } else {
+        wr::ExtendMode::Clamp
+    };
+    WebRenderGradient::Radial(builder.wr().create_radial_gradient(
+        center,
+        radii,
+        stops,
+        extend_mode,
+    ))
+}
+
+/// <https://drafts.csswg.org/css-images-4/#conic-gradients>
+#[allow(clippy::too_many_arguments)]
+fn build_conic(
+    style: &ComputedValues,
+    angle: Angle,
+    center: &Position,
+    _color_interpolation_method: ColorInterpolationMethod,
+    items: &[GradientItem<Color, AngleOrPercentage>],
+    flags: GradientFlags,
+    gradient_box: Size2D<f32, LayoutPixel>,
+    builder: &mut super::DisplayListBuilder<'_>,
+) -> WebRenderGradient {
+    let center = units::LayoutPoint::new(
+        center
+            .horizontal
+            .to_used_value(Au::from_f32_px(gradient_box.width))
+            .to_f32_px(),
+        center
+            .vertical
+            .to_used_value(Au::from_f32_px(gradient_box.height))
+            .to_f32_px(),
+    );
+    let mut color_stops = conic_gradient_items_to_color_stops(style, items);
+    let stops = fixup_stops(&mut color_stops);
+    let extend_mode = if flags.contains(GradientFlags::REPEATING) {
+        wr::ExtendMode::Repeat
+    } else {
+        wr::ExtendMode::Clamp
+    };
+    WebRenderGradient::Conic(builder.wr().create_conic_gradient(
+        center,
+        angle.radians(),
+        stops,
+        extend_mode,
+    ))
+}
+
+fn conic_gradient_items_to_color_stops(
+    style: &ComputedValues,
+    items: &[GradientItem<Color, AngleOrPercentage>],
+) -> Vec<ColorStop<ColorF, f32>> {
+    // Remove color transititon hints, which are not supported yet.
+    // https://drafts.csswg.org/css-images-4/#color-transition-hint
+    //
+    // This gives an approximation of the gradient that might be visibly wrong,
+    // but maybe better than not parsing that value at all?
+    // It’s debatble whether that’s better or worse
+    // than not parsing and allowing authors to set a fallback.
+    // Either way, the best outcome is to add support.
+    // Gecko does so by approximating the non-linear interpolation
+    // by up to 10 piece-wise linear segments (9 intermediate color stops)
+    items
+        .iter()
+        .filter_map(|item| {
+            match item {
+                GradientItem::SimpleColorStop(color) => Some(ColorStop {
+                    color: super::rgba(style.resolve_color(color)),
+                    position: None,
+                }),
+                GradientItem::ComplexColorStop { color, position } => Some(ColorStop {
+                    color: super::rgba(style.resolve_color(color)),
+                    position: match position {
+                        AngleOrPercentage::Percentage(percentage) => Some(percentage.0),
+                        AngleOrPercentage::Angle(angle) => Some(angle.degrees() / 360.),
+                    },
+                }),
+                // FIXME: approximate like in:
+                // https://searchfox.org/mozilla-central/rev/f98dad153b59a985efd4505912588d4651033395/layout/painting/nsCSSRenderingGradients.cpp#315-391
+                GradientItem::InterpolationHint(_) => None,
+            }
+        })
+        .collect()
+}
+
+fn gradient_items_to_color_stops(
+    style: &ComputedValues,
+    items: &[GradientItem<Color, LengthPercentage>],
+    gradient_line_length: Au,
+) -> Vec<ColorStop<ColorF, f32>> {
+    // Remove color transititon hints, which are not supported yet.
+    // https://drafts.csswg.org/css-images-4/#color-transition-hint
+    //
+    // This gives an approximation of the gradient that might be visibly wrong,
+    // but maybe better than not parsing that value at all?
+    // It’s debatble whether that’s better or worse
+    // than not parsing and allowing authors to set a fallback.
+    // Either way, the best outcome is to add support.
+    // Gecko does so by approximating the non-linear interpolation
+    // by up to 10 piece-wise linear segments (9 intermediate color stops)
+    items
+        .iter()
+        .filter_map(|item| {
+            match item {
+                GradientItem::SimpleColorStop(color) => Some(ColorStop {
+                    color: super::rgba(style.resolve_color(color)),
+                    position: None,
+                }),
+                GradientItem::ComplexColorStop { color, position } => Some(ColorStop {
+                    color: super::rgba(style.resolve_color(color)),
+                    position: Some(if gradient_line_length.is_zero() {
+                        0.
+                    } else {
+                        position
+                            .to_used_value(gradient_line_length)
+                            .scale_by(1. / gradient_line_length.to_f32_px())
+                            .to_f32_px()
+                    }),
+                }),
+                // FIXME: approximate like in:
+                // https://searchfox.org/mozilla-central/rev/f98dad153b59a985efd4505912588d4651033395/layout/painting/nsCSSRenderingGradients.cpp#315-391
+                GradientItem::InterpolationHint(_) => None,
+            }
+        })
+        .collect()
+}
+
+/// <https://drafts.csswg.org/css-images-4/#color-stop-fixup>
+fn fixup_stops(stops: &mut [ColorStop<ColorF, f32>]) -> Vec<wr::GradientStop> {
+    assert!(!stops.is_empty());
+
+    // https://drafts.csswg.org/css-images-4/#color-stop-fixup
+    if let first_position @ None = &mut stops.first_mut().unwrap().position {
+        *first_position = Some(0.);
+    }
+    if let last_position @ None = &mut stops.last_mut().unwrap().position {
+        *last_position = Some(1.);
+    }
+
+    let mut iter = stops.iter_mut();
+    let mut max_so_far = iter.next().unwrap().position.unwrap();
+    for stop in iter {
+        if let Some(position) = &mut stop.position {
+            if *position < max_so_far {
+                *position = max_so_far
+            } else {
+                max_so_far = *position
+            }
+        }
+    }
+
+    let mut wr_stops = Vec::with_capacity(stops.len());
+    let mut iter = stops.iter().enumerate();
+    let (_, first) = iter.next().unwrap();
+    let first_stop_position = first.position.unwrap();
+    wr_stops.push(wr::GradientStop {
+        offset: first_stop_position,
+        color: first.color,
+    });
+    if stops.len() == 1 {
+        wr_stops.push(wr_stops[0]);
+    }
+
+    let mut last_positioned_stop_index = 0;
+    let mut last_positioned_stop_position = first_stop_position;
+    for (i, stop) in iter {
+        if let Some(position) = stop.position {
+            let step_count = i - last_positioned_stop_index;
+            if step_count > 1 {
+                let step = (position - last_positioned_stop_position) / step_count as f32;
+                for j in 1..step_count {
+                    let color = stops[last_positioned_stop_index + j].color;
+                    let offset = last_positioned_stop_position + j as f32 * step;
+                    wr_stops.push(wr::GradientStop { offset, color })
+                }
+            }
+            last_positioned_stop_index = i;
+            last_positioned_stop_position = position;
+            wr_stops.push(wr::GradientStop {
+                offset: position,
+                color: stop.color,
+            })
+        }
+    }
+
+    wr_stops
 }

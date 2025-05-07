@@ -10,16 +10,21 @@ use dom_struct::dom_struct;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::ImageBitmapBinding::ImageBitmapMethods;
 use crate::dom::bindings::error::Fallible;
-use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
+use crate::dom::bindings::reflector::{Reflector, reflect_dom_object};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::globalscope::GlobalScope;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct ImageBitmap {
+pub(crate) struct ImageBitmap {
     reflector_: Reflector,
     width: u32,
     height: u32,
-    bitmap_data: DomRefCell<Vec<u8>>,
+    /// The actual pixel data of the bitmap
+    ///
+    /// If this is `None`, then the bitmap data has been released by calling
+    /// [`close`](https://html.spec.whatwg.org/multipage/#dom-imagebitmap-close)
+    bitmap_data: DomRefCell<Option<Vec<u8>>>,
     origin_clean: Cell<bool>,
 }
 
@@ -29,40 +34,67 @@ impl ImageBitmap {
             reflector_: Reflector::new(),
             width: width_arg,
             height: height_arg,
-            bitmap_data: DomRefCell::new(vec![]),
+            bitmap_data: DomRefCell::new(Some(vec![])),
             origin_clean: Cell::new(true),
         }
     }
 
     #[allow(dead_code)]
-    pub fn new(global: &GlobalScope, width: u32, height: u32) -> Fallible<DomRoot<ImageBitmap>> {
+    pub(crate) fn new(
+        global: &GlobalScope,
+        width: u32,
+        height: u32,
+        can_gc: CanGc,
+    ) -> Fallible<DomRoot<ImageBitmap>> {
         //assigning to a variable the return object of new_inherited
         let imagebitmap = Box::new(ImageBitmap::new_inherited(width, height));
 
-        Ok(reflect_dom_object(imagebitmap, global))
+        Ok(reflect_dom_object(imagebitmap, global, can_gc))
     }
 
-    pub fn set_bitmap_data(&self, data: Vec<u8>) {
-        *self.bitmap_data.borrow_mut() = data;
+    pub(crate) fn set_bitmap_data(&self, data: Vec<u8>) {
+        *self.bitmap_data.borrow_mut() = Some(data);
     }
 
-    pub fn set_origin_clean(&self, origin_is_clean: bool) {
+    pub(crate) fn set_origin_clean(&self, origin_is_clean: bool) {
         self.origin_clean.set(origin_is_clean);
+    }
+
+    /// Return the value of the [`[[Detached]]`](https://html.spec.whatwg.org/multipage/#detached)
+    /// internal slot
+    fn is_detached(&self) -> bool {
+        self.bitmap_data.borrow().is_none()
     }
 }
 
-impl ImageBitmapMethods for ImageBitmap {
-    // https://html.spec.whatwg.org/multipage/#dom-imagebitmap-height
+impl ImageBitmapMethods<crate::DomTypeHolder> for ImageBitmap {
+    /// <https://html.spec.whatwg.org/multipage/#dom-imagebitmap-height>
     fn Height(&self) -> u32 {
-        //to do: add a condition for checking detached internal slot
-        //and return 0 if set to true
+        // Step 1. If this's [[Detached]] internal slot's value is true, then return 0.
+        if self.is_detached() {
+            return 0;
+        }
+
+        // Step 2. Return this's height, in CSS pixels.
         self.height
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-imagebitmap-width
+    /// <https://html.spec.whatwg.org/multipage/#dom-imagebitmap-width>
     fn Width(&self) -> u32 {
-        //to do: add a condition to check detached internal slot
-        ////and return 0 if set to true
+        // Step 1. If this's [[Detached]] internal slot's value is true, then return 0.
+        if self.is_detached() {
+            return 0;
+        }
+
+        // Step 2. Return this's width, in CSS pixels.
         self.width
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-imagebitmap-close>
+    fn Close(&self) {
+        // Step 1. Set this's [[Detached]] internal slot value to true.
+        // Step 2. Unset this's bitmap data.
+        // NOTE: The existence of the bitmap data is the internal slot in our implementation
+        self.bitmap_data.borrow_mut().take();
     }
 }

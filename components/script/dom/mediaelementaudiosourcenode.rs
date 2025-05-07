@@ -22,13 +22,13 @@ use crate::dom::window::Window;
 use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct MediaElementAudioSourceNode {
+pub(crate) struct MediaElementAudioSourceNode {
     node: AudioNode,
     media_element: Dom<HTMLMediaElement>,
 }
 
 impl MediaElementAudioSourceNode {
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn new_inherited(
         context: &AudioContext,
         media_element: &HTMLMediaElement,
@@ -54,15 +54,16 @@ impl MediaElementAudioSourceNode {
         })
     }
 
-    pub fn new(
+    pub(crate) fn new(
         window: &Window,
         context: &AudioContext,
         media_element: &HTMLMediaElement,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<MediaElementAudioSourceNode>> {
-        Self::new_with_proto(window, None, context, media_element, CanGc::note())
+        Self::new_with_proto(window, None, context, media_element, can_gc)
     }
 
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn new_with_proto(
         window: &Window,
         proto: Option<HandleObject>,
@@ -80,7 +81,7 @@ impl MediaElementAudioSourceNode {
     }
 }
 
-impl MediaElementAudioSourceNodeMethods for MediaElementAudioSourceNode {
+impl MediaElementAudioSourceNodeMethods<crate::DomTypeHolder> for MediaElementAudioSourceNode {
     /// <https://webaudio.github.io/web-audio-api/#dom-mediaelementaudiosourcenode-mediaelementaudiosourcenode>
     fn Constructor(
         window: &Window,

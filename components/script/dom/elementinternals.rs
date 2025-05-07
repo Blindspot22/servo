@@ -14,17 +14,19 @@ use crate::dom::bindings::codegen::Bindings::ElementInternalsBinding::{
 use crate::dom::bindings::codegen::UnionTypes::FileOrUSVStringOrFormData;
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
+use crate::dom::bindings::reflector::{Reflector, reflect_dom_object};
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::element::Element;
 use crate::dom::file::File;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmlformelement::{FormDatum, FormDatumValue, HTMLFormElement};
-use crate::dom::node::{window_from_node, Node};
+use crate::dom::node::{Node, NodeTraits};
 use crate::dom::nodelist::NodeList;
-use crate::dom::validation::{is_barred_by_datalist_ancestor, Validatable};
+use crate::dom::shadowroot::ShadowRoot;
+use crate::dom::validation::{Validatable, is_barred_by_datalist_ancestor};
 use crate::dom::validitystate::{ValidationFlags, ValidityState};
+use crate::script_runtime::CanGc;
 
 #[derive(Clone, JSTraceable, MallocSizeOf)]
 enum SubmissionValue {
@@ -52,7 +54,7 @@ impl From<Option<&FileOrUSVStringOrFormData>> for SubmissionValue {
 }
 
 #[dom_struct]
-pub struct ElementInternals {
+pub(crate) struct ElementInternals {
     reflector_: Reflector,
     /// If `attached` is false, we're using this to hold form-related state
     /// on an element for which `attachInternals()` wasn't called yet; this is
@@ -86,9 +88,13 @@ impl ElementInternals {
         }
     }
 
-    pub fn new(element: &HTMLElement) -> DomRoot<ElementInternals> {
-        let global = window_from_node(element);
-        reflect_dom_object(Box::new(ElementInternals::new_inherited(element)), &*global)
+    pub(crate) fn new(element: &HTMLElement, can_gc: CanGc) -> DomRoot<ElementInternals> {
+        let global = element.owner_window();
+        reflect_dom_object(
+            Box::new(ElementInternals::new_inherited(element)),
+            &*global,
+            can_gc,
+        )
     }
 
     fn is_target_form_associated(&self) -> bool {
@@ -111,23 +117,23 @@ impl ElementInternals {
         *self.state.borrow_mut() = value;
     }
 
-    pub fn set_form_owner(&self, form: Option<&HTMLFormElement>) {
+    pub(crate) fn set_form_owner(&self, form: Option<&HTMLFormElement>) {
         self.form_owner.set(form);
     }
 
-    pub fn form_owner(&self) -> Option<DomRoot<HTMLFormElement>> {
+    pub(crate) fn form_owner(&self) -> Option<DomRoot<HTMLFormElement>> {
         self.form_owner.get()
     }
 
-    pub fn set_attached(&self) {
+    pub(crate) fn set_attached(&self) {
         self.attached.set(true);
     }
 
-    pub fn attached(&self) -> bool {
+    pub(crate) fn attached(&self) -> bool {
         self.attached.get()
     }
 
-    pub fn perform_entry_construction(&self, entry_list: &mut Vec<FormDatum>) {
+    pub(crate) fn perform_entry_construction(&self, entry_list: &mut Vec<FormDatum>) {
         if self
             .target_element
             .upcast::<Element>()
@@ -175,14 +181,30 @@ impl ElementInternals {
         }
     }
 
-    pub fn is_invalid(&self) -> bool {
+    pub(crate) fn is_invalid(&self) -> bool {
         self.is_target_form_associated() &&
             self.is_instance_validatable() &&
             !self.satisfies_constraints()
     }
 }
 
-impl ElementInternalsMethods for ElementInternals {
+impl ElementInternalsMethods<crate::DomTypeHolder> for ElementInternals {
+    /// <https://html.spec.whatwg.org/multipage/#dom-elementinternals-shadowroot>
+    fn GetShadowRoot(&self) -> Option<DomRoot<ShadowRoot>> {
+        // Step 1. Let target be this's target element.
+        // Step 2. If target is not a shadow host, then return null.
+        // Step 3. Let shadow be target's shadow root.
+        let shadow = self.target_element.upcast::<Element>().shadow_root()?;
+
+        // Step 4. If shadow's available to element internals is false, then return null.
+        if !shadow.is_available_to_element_internals() {
+            return None;
+        }
+
+        // Step 5. Return shadow.
+        Some(shadow)
+    }
+
     /// <https://html.spec.whatwg.org/multipage#dom-elementinternals-setformvalue>
     fn SetFormValue(
         &self,
@@ -212,6 +234,7 @@ impl ElementInternalsMethods for ElementInternals {
         flags: &ValidityStateFlags,
         message: Option<DOMString>,
         anchor: Option<&HTMLElement>,
+        can_gc: CanGc,
     ) -> ErrorResult {
         // Steps 1-2: Check form-associated custom element
         if !self.is_target_form_associated() {
@@ -231,7 +254,7 @@ impl ElementInternalsMethods for ElementInternals {
         // Step 4: For each entry `flag` → `value` of `flags`, set element's validity flag with the name
         // `flag` to `value`.
         self.validity_state().update_invalid_flags(bits);
-        self.validity_state().update_pseudo_classes();
+        self.validity_state().update_pseudo_classes(can_gc);
 
         // Step 5: Set element's validation message to the empty string if message is not given
         // or all of element's validity flags are false, or to message otherwise.
@@ -287,7 +310,7 @@ impl ElementInternalsMethods for ElementInternals {
     }
 
     /// <https://html.spec.whatwg.org/multipage#dom-elementinternals-labels>
-    fn GetLabels(&self) -> Fallible<DomRoot<NodeList>> {
+    fn GetLabels(&self, can_gc: CanGc) -> Fallible<DomRoot<NodeList>> {
         if !self.is_target_form_associated() {
             return Err(Error::NotSupported);
         }
@@ -295,6 +318,7 @@ impl ElementInternalsMethods for ElementInternals {
             NodeList::new_labels_list(
                 self.target_element.upcast::<Node>().owner_doc().window(),
                 &self.target_element,
+                can_gc,
             )
         }))
     }
@@ -316,19 +340,19 @@ impl ElementInternalsMethods for ElementInternals {
     }
 
     /// <https://html.spec.whatwg.org/multipage#dom-elementinternals-checkvalidity>
-    fn CheckValidity(&self) -> Fallible<bool> {
+    fn CheckValidity(&self, can_gc: CanGc) -> Fallible<bool> {
         if !self.is_target_form_associated() {
             return Err(Error::NotSupported);
         }
-        Ok(self.check_validity())
+        Ok(self.check_validity(can_gc))
     }
 
     /// <https://html.spec.whatwg.org/multipage#dom-elementinternals-reportvalidity>
-    fn ReportValidity(&self) -> Fallible<bool> {
+    fn ReportValidity(&self, can_gc: CanGc) -> Fallible<bool> {
         if !self.is_target_form_associated() {
             return Err(Error::NotSupported);
         }
-        Ok(self.report_validity())
+        Ok(self.report_validity(can_gc))
     }
 }
 
@@ -343,8 +367,9 @@ impl Validatable for ElementInternals {
         debug_assert!(self.is_target_form_associated());
         self.validity_state.or_init(|| {
             ValidityState::new(
-                &window_from_node(self.target_element.upcast::<Node>()),
+                &self.target_element.owner_window(),
                 self.target_element.upcast(),
+                CanGc::note(),
             )
         })
     }

@@ -11,13 +11,14 @@ use embedder_traits::resources::{self, Resource};
 use headers::{HeaderMapExt, StrictTransportSecurity};
 use http::HeaderMap;
 use log::{error, info};
-use net_traits::pub_domains::reg_suffix;
+use malloc_size_of_derive::MallocSizeOf;
 use net_traits::IncludeSubdomains;
+use net_traits::pub_domains::reg_suffix;
 use serde::{Deserialize, Serialize};
 use servo_config::pref;
 use servo_url::{Host, ServoUrl};
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct HstsEntry {
     pub host: String,
     pub include_subdomains: bool,
@@ -60,7 +61,7 @@ impl HstsEntry {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, MallocSizeOf, Serialize)]
 pub struct HstsList {
     pub entries_map: HashMap<String, Vec<HstsEntry>>,
 }
@@ -144,8 +145,8 @@ impl HstsList {
             return;
         }
 
-        let upgrade_scheme = if pref!(network.enforce_tls.enabled) {
-            if (!pref!(network.enforce_tls.localhost) &&
+        let upgrade_scheme = if pref!(network_enforce_tls_enabled) {
+            if (!pref!(network_enforce_tls_localhost) &&
                 match url.host() {
                     Some(Host::Domain(domain)) => {
                         domain.ends_with(".localhost") || domain == "localhost"
@@ -154,7 +155,7 @@ impl HstsList {
                     Some(Host::Ipv6(ipv6)) => ipv6.is_loopback(),
                     _ => false,
                 }) ||
-                (!pref!(network.enforce_tls.onion) &&
+                (!pref!(network_enforce_tls_onion) &&
                     url.domain()
                         .is_some_and(|domain| domain.ends_with(".onion")))
             {

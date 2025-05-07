@@ -4,7 +4,7 @@
 
 use dom_struct::dom_struct;
 use js::rust::{HandleObject, HandleValue};
-use servo_atoms::Atom;
+use stylo_atoms::Atom;
 
 use crate::dom::bindings::codegen::Bindings::EventBinding::EventMethods;
 use crate::dom::bindings::codegen::Bindings::ExtendableEventBinding::{
@@ -21,27 +21,28 @@ use crate::script_runtime::{CanGc, JSContext};
 
 // https://w3c.github.io/ServiceWorker/#extendable-event
 #[dom_struct]
-pub struct ExtendableEvent {
+pub(crate) struct ExtendableEvent {
     event: Event,
     extensions_allowed: bool,
 }
 
 #[allow(non_snake_case)]
 impl ExtendableEvent {
-    pub fn new_inherited() -> ExtendableEvent {
+    pub(crate) fn new_inherited() -> ExtendableEvent {
         ExtendableEvent {
             event: Event::new_inherited(),
             extensions_allowed: true,
         }
     }
 
-    pub fn new(
+    pub(crate) fn new(
         worker: &ServiceWorkerGlobalScope,
         type_: Atom,
         bubbles: bool,
         cancelable: bool,
+        can_gc: CanGc,
     ) -> DomRoot<ExtendableEvent> {
-        Self::new_with_proto(worker, None, type_, bubbles, cancelable, CanGc::note())
+        Self::new_with_proto(worker, None, type_, bubbles, cancelable, can_gc)
     }
 
     fn new_with_proto(
@@ -66,7 +67,7 @@ impl ExtendableEvent {
     }
 }
 
-impl ExtendableEventMethods for ExtendableEvent {
+impl ExtendableEventMethods<crate::DomTypeHolder> for ExtendableEvent {
     // https://w3c.github.io/ServiceWorker/#dom-extendableevent-extendableevent
     fn Constructor(
         worker: &ServiceWorkerGlobalScope,
@@ -99,11 +100,5 @@ impl ExtendableEventMethods for ExtendableEvent {
     // https://dom.spec.whatwg.org/#dom-event-istrusted
     fn IsTrusted(&self) -> bool {
         self.event.IsTrusted()
-    }
-}
-
-impl Default for ExtendableEventInit {
-    fn default() -> Self {
-        Self::empty()
     }
 }

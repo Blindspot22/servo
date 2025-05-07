@@ -1,5 +1,5 @@
 // META: title=test WebNN API cumulativeSum operation
-// META: global=window,dedicatedworker
+// META: global=window
 // META: variant=?cpu
 // META: variant=?gpu
 // META: variant=?npu
@@ -166,7 +166,7 @@ const cumulativeSumTests = [
 if (navigator.ml) {
   cumulativeSumTests.forEach((test) => {
     webnn_conformance_test(
-        buildGraphAndCompute, getCumulativeSumPrecisionTolerance, test);
+        buildAndExecuteGraph, getCumulativeSumPrecisionTolerance, test);
   });
 } else {
   test(() => assert_implements(navigator.ml, 'missing navigator.ml'));

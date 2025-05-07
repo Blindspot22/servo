@@ -7,10 +7,11 @@
 use std::cell::Cell;
 
 use base::id::PipelineId;
+use constellation_traits::ScriptToConstellationMessage;
 use cssparser::ToCss;
+use embedder_traits::{AnimationState as AnimationsPresentState, UntrustedNodeAddress};
 use fxhash::{FxHashMap, FxHashSet};
 use libc::c_void;
-use script_traits::{AnimationState as AnimationsPresentState, ScriptMsg, UntrustedNodeAddress};
 use serde::{Deserialize, Serialize};
 use style::animation::{
     Animation, AnimationSetKey, AnimationState, DocumentAnimationSet, ElementAnimationSet,
@@ -30,18 +31,18 @@ use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::trace::NoTrace;
 use crate::dom::event::Event;
-use crate::dom::node::{from_untrusted_node_address, window_from_node, Node, NodeDamage};
+use crate::dom::node::{Node, NodeDamage, NodeTraits, from_untrusted_node_address};
 use crate::dom::transitionevent::TransitionEvent;
 use crate::dom::window::Window;
 use crate::script_runtime::CanGc;
 
 /// The set of animations for a document.
 #[derive(Default, JSTraceable, MallocSizeOf)]
-#[crown::unrooted_must_root_lint::must_root]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 pub(crate) struct Animations {
     /// The map of nodes to their animation states.
     #[no_trace]
-    pub sets: DocumentAnimationSet,
+    pub(crate) sets: DocumentAnimationSet,
 
     /// Whether or not we have animations that are running.
     has_running_animations: Cell<bool>,
@@ -185,7 +186,9 @@ impl Animations {
             true => AnimationsPresentState::AnimationsPresent,
             false => AnimationsPresentState::NoAnimationsPresent,
         };
-        window.send_to_constellation(ScriptMsg::ChangeRunningAnimationsState(state));
+        window.send_to_constellation(ScriptToConstellationMessage::ChangeRunningAnimationsState(
+            state,
+        ));
     }
 
     pub(crate) fn running_animation_count(&self) -> usize {
@@ -457,7 +460,12 @@ impl Animations {
             });
     }
 
+    /// An implementation of the final steps of
+    /// <https://drafts.csswg.org/web-animations-1/#update-animations-and-send-events>.
     pub(crate) fn send_pending_events(&self, window: &Window, can_gc: CanGc) {
+        // > 4. Let events to dispatch be a copy of doc’s pending animation event queue.
+        // > 5. Clear doc’s pending animation event queue.
+        //
         // Take all of the events here, in case sending one of these events
         // triggers adding new events by forcing a layout.
         let events = std::mem::take(&mut *self.pending_events.borrow_mut());
@@ -465,6 +473,18 @@ impl Animations {
             return;
         }
 
+        // > 6. Perform a stable sort of the animation events in events to dispatch as follows:
+        // >    1. Sort the events by their scheduled event time such that events that were
+        // >       scheduled to occur earlier sort before events scheduled to occur later, and
+        // >       events whose scheduled event time is unresolved sort before events with a
+        // >       resolved scheduled event time.
+        // >    2. Within events with equal scheduled event times, sort by their composite
+        // >       order.
+        //
+        // TODO: Sorting of animation events isn't done yet.
+
+        // 7. Dispatch each of the events in events to dispatch at their corresponding
+        // target using the order established in the previous step.
         for event in events.into_iter() {
             // We root the node here to ensure that sending this event doesn't
             // unroot it as a side-effect.
@@ -489,6 +509,7 @@ impl Animations {
             let parent = EventInit {
                 bubbles: true,
                 cancelable: false,
+                composed: false,
             };
 
             let property_or_animation_name =
@@ -499,7 +520,7 @@ impl Animations {
                     DOMString::from(pseudo_element.to_css_string())
                 });
             let elapsed_time = Finite::new(event.elapsed_time as f32).unwrap();
-            let window = window_from_node(&*node);
+            let window = node.owner_window();
 
             if event.event_type.is_transition_event() {
                 let event_init = TransitionEventInit {
@@ -508,9 +529,9 @@ impl Animations {
                     elapsedTime: elapsed_time,
                     pseudoElement: pseudo_element,
                 };
-                TransitionEvent::new(&window, event_atom, &event_init)
+                TransitionEvent::new(&window, event_atom, &event_init, can_gc)
                     .upcast::<Event>()
-                    .fire(node.upcast());
+                    .fire(node.upcast(), can_gc);
             } else {
                 let event_init = AnimationEventInit {
                     parent,
@@ -520,7 +541,7 @@ impl Animations {
                 };
                 AnimationEvent::new(&window, event_atom, &event_init, can_gc)
                     .upcast::<Event>()
-                    .fire(node.upcast());
+                    .fire(node.upcast(), can_gc);
             }
         }
 
@@ -533,7 +554,7 @@ impl Animations {
 /// The type of transition event to trigger. These are defined by
 /// CSS Transitions § 6.1 and CSS Animations § 4.2
 #[derive(Clone, Debug, Deserialize, JSTraceable, MallocSizeOf, Serialize)]
-pub enum TransitionOrAnimationEventType {
+pub(crate) enum TransitionOrAnimationEventType {
     /// "The transitionrun event occurs when a transition is created (i.e., when it
     /// is added to the set of running transitions)."
     TransitionRun,
@@ -560,7 +581,7 @@ pub enum TransitionOrAnimationEventType {
 
 impl TransitionOrAnimationEventType {
     /// Whether or not this event is a transition-related event.
-    pub fn is_transition_event(&self) -> bool {
+    pub(crate) fn is_transition_event(&self) -> bool {
         match *self {
             Self::TransitionRun |
             Self::TransitionEnd |
@@ -576,21 +597,21 @@ impl TransitionOrAnimationEventType {
 
 #[derive(Deserialize, JSTraceable, MallocSizeOf, Serialize)]
 /// A transition or animation event.
-pub struct TransitionOrAnimationEvent {
+pub(crate) struct TransitionOrAnimationEvent {
     /// The pipeline id of the layout task that sent this message.
     #[no_trace]
-    pub pipeline_id: PipelineId,
+    pub(crate) pipeline_id: PipelineId,
     /// The type of transition event this should trigger.
-    pub event_type: TransitionOrAnimationEventType,
+    pub(crate) event_type: TransitionOrAnimationEventType,
     /// The address of the node which owns this transition.
     #[no_trace]
-    pub node: OpaqueNode,
+    pub(crate) node: OpaqueNode,
     /// The pseudo element for this transition or animation, if applicable.
     #[no_trace]
-    pub pseudo_element: Option<PseudoElement>,
+    pub(crate) pseudo_element: Option<PseudoElement>,
     /// The name of the property that is transitioning (in the case of a transition)
     /// or the name of the animation (in the case of an animation).
-    pub property_or_animation_name: String,
+    pub(crate) property_or_animation_name: String,
     /// The elapsed time property to send with this transition event.
-    pub elapsed_time: f64,
+    pub(crate) elapsed_time: f64,
 }

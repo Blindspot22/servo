@@ -5,13 +5,13 @@
 use std::fs::File;
 use std::path::Path;
 
-use base::text::{unicode_plane, UnicodeBlock, UnicodeBlockMethod};
+use base::text::{UnicodeBlock, UnicodeBlockMethod, unicode_plane};
 use log::debug;
 use malloc_size_of_derive::MallocSizeOf;
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
-use style::values::computed::font::GenericFontFamily;
 use style::Atom;
+use style::values::computed::font::GenericFontFamily;
 use unicode_script::Script;
 use webrender_api::NativeFontHandle;
 
@@ -52,7 +52,7 @@ impl LocalFontIdentifier {
         // listed in the font.
         let file = File::open(Path::new(&*self.path)).ok()?;
         let mmap = unsafe { Mmap::map(&file).ok()? };
-        Some((&mmap[..]).to_vec())
+        Some(mmap[..].to_vec())
     }
 }
 

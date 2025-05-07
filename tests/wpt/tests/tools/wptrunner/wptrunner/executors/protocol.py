@@ -215,6 +215,7 @@ class TestharnessProtocolPart(ProtocolPart):
         contains the initial runner page.
 
         :param str url_protocol: "https" or "http" depending on the test metadata.
+        :returns: A browser-specific handle to the runner page.
         """
         pass
 
@@ -330,6 +331,56 @@ class AccessibilityProtocolPart(ProtocolPart):
         pass
 
 
+class BidiBluetoothProtocolPart(ProtocolPart):
+    """Protocol part for managing BiDi events"""
+    __metaclass__ = ABCMeta
+    name = "bidi_bluetooth"
+
+    @abstractmethod
+    async def handle_request_device_prompt(self,
+                                           context: str,
+                                           prompt: str,
+                                           accept: bool,
+                                           device: str
+                                           ) -> None:
+        """
+        Handles a bluetooth device prompt.
+        :param context: Browsing context to set the simulated adapter to.
+        :param prompt: The id of a bluetooth device prompt.
+        :param accept: Whether to accept a bluetooth device prompt.
+        :param device: The device id from a bluetooth device prompt to be accepted.
+        """
+        pass
+
+    @abstractmethod
+    async def simulate_adapter(self,
+                               context: str,
+                               state: str,
+                               type_: str) -> None:
+        """
+        Creates a simulated bluetooth adapter.
+        :param context: Browsing context to set the simulated adapter to.
+        :param state: The state of the simulated bluetooth adapter.
+        """
+        pass
+
+    @abstractmethod
+    async def simulate_preconnected_peripheral(self,
+                               context: str,
+                               address: str,
+                               name: str,
+                               manufacturer_data: List[Any],
+                               known_service_uuids: List[str]) -> None:
+        """
+        Creates a simulated bluetooth peripheral.
+        :param context: Browsing context to set the simulated peripheral to.
+        :param address: The address of the simulated bluetooth peripheral.
+        :param name: The name of the simulated bluetooth peripheral.
+        :param manufacturer_data: The manufacturer data of the simulated bluetooth peripheral.
+        :param known_service_uuids: The known service uuids of the simulated bluetooth peripheral.
+        """
+        pass
+
 class BidiBrowsingContextProtocolPart(ProtocolPart):
     """Protocol part for managing BiDi events"""
     __metaclass__ = ABCMeta
@@ -381,6 +432,28 @@ class BidiEventsProtocolPart(ProtocolPart):
         :param name: The name of the event to listen for. If None, the function will be called for all events.
         :param fn: The function to call when the event is received.
         :return: Function to remove the added listener."""
+        pass
+
+
+class BidiPermissionsProtocolPart(ProtocolPart):
+    """Protocol part for managing BiDi events"""
+    __metaclass__ = ABCMeta
+    name = "bidi_permissions"
+
+    @abstractmethod
+    async def set_permission(self, descriptor, state, origin):
+        pass
+
+
+class BidiEmulationProtocolPart(ProtocolPart):
+    """Protocol part for emulation"""
+    __metaclass__ = ABCMeta
+    name = "bidi_emulation"
+
+    @abstractmethod
+    async def set_geolocation_override(self,
+            coordinates: Optional[Mapping[str, Any]],
+            contexts: List[str]) -> None:
         pass
 
 
@@ -948,9 +1021,33 @@ class VirtualPressureSourceProtocolPart(ProtocolPart):
         pass
 
     @abstractmethod
-    def update_virtual_pressure_source(self, source_type, sample):
+    def update_virtual_pressure_source(self, source_type, sample, own_contribution_estimate):
         pass
 
     @abstractmethod
     def remove_virtual_pressure_source(self, source_type):
+        pass
+
+class ProtectedAudienceProtocolPart(ProtocolPart):
+    """Protocol part for Protected Audience"""
+    __metaclass__ = ABCMeta
+
+    name = "protected_audience"
+
+    @abstractmethod
+    def set_k_anonymity(self, owner, name, hashes):
+        pass
+
+class DisplayFeaturesProtocolPart(ProtocolPart):
+    """Protocol part for Display Features/Viewport Segments"""
+    __metaclass__ = ABCMeta
+
+    name = "display_features"
+
+    @abstractmethod
+    def set_display_features(self, features):
+        pass
+
+    @abstractmethod
+    def clear_display_features(self):
         pass

@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
-use html5ever::{local_name, namespace_url, ns, LocalName, Prefix, QualName};
+use html5ever::{LocalName, Prefix, QualName, local_name, ns};
 use js::rust::HandleObject;
 
 use crate::dom::bindings::codegen::Bindings::ElementBinding::Element_Binding::ElementMethods;
@@ -21,7 +21,7 @@ use crate::dom::window::Window;
 use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct HTMLAudioElement {
+pub(crate) struct HTMLAudioElement {
     htmlmediaelement: HTMLMediaElement,
 }
 
@@ -36,12 +36,13 @@ impl HTMLAudioElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLAudioElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLAudioElement::new_inherited(
@@ -49,11 +50,12 @@ impl HTMLAudioElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 }
 
-impl HTMLAudioElementMethods for HTMLAudioElement {
+impl HTMLAudioElementMethods<crate::DomTypeHolder> for HTMLAudioElement {
     // https://html.spec.whatwg.org/multipage/#dom-audio
     fn Audio(
         window: &Window,
@@ -75,12 +77,12 @@ impl HTMLAudioElementMethods for HTMLAudioElement {
 
         audio
             .upcast::<Element>()
-            .SetAttribute(DOMString::from("preload"), DOMString::from("auto"))
+            .SetAttribute(DOMString::from("preload"), DOMString::from("auto"), can_gc)
             .expect("should be infallible");
         if let Some(s) = src {
             audio
                 .upcast::<Element>()
-                .SetAttribute(DOMString::from("src"), s)
+                .SetAttribute(DOMString::from("src"), s, can_gc)
                 .expect("should be infallible");
         }
 

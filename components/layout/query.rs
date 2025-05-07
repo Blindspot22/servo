@@ -3,12 +3,13 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 //! Utilities for querying the layout, as needed by layout.
-
-use std::cmp::{max, min};
-use std::ops::Deref;
+use std::sync::Arc;
 
 use app_units::Au;
-use euclid::default::{Box2D, Point2D, Rect, Size2D, Vector2D};
+use euclid::default::{Point2D, Rect};
+use euclid::{SideOffsets2D, Size2D};
+use itertools::Itertools;
+use script::layout_dom::ServoLayoutNode;
 use script_layout_interface::wrapper_traits::{
     LayoutNode, ThreadSafeLayoutElement, ThreadSafeLayoutNode,
 };
@@ -18,734 +19,355 @@ use servo_url::ServoUrl;
 use style::computed_values::display::T as Display;
 use style::computed_values::position::T as Position;
 use style::computed_values::visibility::T as Visibility;
+use style::computed_values::white_space_collapse::T as WhiteSpaceCollapseValue;
 use style::context::{QuirksMode, SharedStyleContext, StyleContext, ThreadLocalStyleContext};
-use style::dom::TElement;
-use style::logical_geometry::{BlockFlowDirection, InlineBaseDirection, WritingMode};
-use style::properties::style_structs::{self, Font};
+use style::dom::{NodeInfo, OpaqueNode, TElement, TNode};
+use style::properties::style_structs::Font;
 use style::properties::{
-    parse_one_declaration_into, ComputedValues, Importance, LonghandId, PropertyDeclarationBlock,
-    PropertyDeclarationId, PropertyId, ShorthandId, SourcePropertyDeclaration,
+    ComputedValues, Importance, LonghandId, PropertyDeclarationBlock, PropertyDeclarationId,
+    PropertyId, ShorthandId, SourcePropertyDeclaration, parse_one_declaration_into,
 };
 use style::selector_parser::PseudoElement;
 use style::shared_lock::SharedRwLock;
 use style::stylesheets::{CssRuleType, Origin, UrlExtraData};
+use style::stylist::RuleInclusion;
+use style::traversal::resolve_style;
+use style::values::computed::{Float, Size};
+use style::values::generics::font::LineHeight;
+use style::values::generics::position::AspectRatio;
+use style::values::specified::GenericGridTemplateComponent;
+use style::values::specified::box_::DisplayInside;
 use style_traits::{ParsingMode, ToCss};
 
-use crate::construct::ConstructionResult;
-use crate::display_list::items::OpaqueNode;
-use crate::display_list::IndexableText;
-use crate::flow::{Flow, GetBaseFlow};
-use crate::fragment::{Fragment, FragmentBorderBoxIterator, FragmentFlags, SpecificFragmentInfo};
-use crate::inline::InlineFragmentNodeFlags;
-use crate::sequential;
-use crate::wrapper::ThreadSafeLayoutNodeHelpers;
+use crate::ArcRefCell;
+use crate::dom::NodeExt;
+use crate::flow::inline::construct::{TextTransformation, WhitespaceCollapse};
+use crate::fragment_tree::{
+    BoxFragment, Fragment, FragmentFlags, FragmentTree, SpecificLayoutInfo,
+};
+use crate::taffy::SpecificTaffyGridInfo;
 
-// https://drafts.csswg.org/cssom-view/#overflow-directions
-fn overflow_direction(writing_mode: &WritingMode) -> OverflowDirection {
-    match (
-        writing_mode.block_flow_direction(),
-        writing_mode.inline_base_direction(),
-    ) {
-        (BlockFlowDirection::TopToBottom, InlineBaseDirection::LeftToRight) |
-        (BlockFlowDirection::LeftToRight, InlineBaseDirection::LeftToRight) => {
-            OverflowDirection::RightAndDown
-        },
-        (BlockFlowDirection::TopToBottom, InlineBaseDirection::RightToLeft) |
-        (BlockFlowDirection::RightToLeft, InlineBaseDirection::LeftToRight) => {
-            OverflowDirection::LeftAndDown
-        },
-        (BlockFlowDirection::RightToLeft, InlineBaseDirection::RightToLeft) => {
-            OverflowDirection::LeftAndUp
-        },
-        (BlockFlowDirection::LeftToRight, InlineBaseDirection::RightToLeft) => {
-            OverflowDirection::RightAndUp
-        },
-    }
-}
-
-struct UnioningFragmentBorderBoxIterator {
-    node_address: OpaqueNode,
-    rect: Option<Rect<Au>>,
-}
-
-impl UnioningFragmentBorderBoxIterator {
-    fn new(node_address: OpaqueNode) -> UnioningFragmentBorderBoxIterator {
-        UnioningFragmentBorderBoxIterator {
-            node_address,
-            rect: None,
-        }
-    }
-}
-
-impl FragmentBorderBoxIterator for UnioningFragmentBorderBoxIterator {
-    fn process(&mut self, _: &Fragment, _: i32, border_box: &Rect<Au>) {
-        self.rect = match self.rect {
-            Some(rect) => Some(rect.union(border_box)),
-            None => Some(*border_box),
-        };
+pub fn process_content_box_request(node: ServoLayoutNode<'_>) -> Option<Rect<Au>> {
+    let rects: Vec<_> = node
+        .fragments_for_pseudo(None)
+        .iter()
+        .filter_map(Fragment::cumulative_border_box_rect)
+        .collect();
+    if rects.is_empty() {
+        return None;
     }
 
-    fn should_process(&mut self, fragment: &Fragment) -> bool {
-        fragment.contains_node(self.node_address)
-    }
+    Some(rects.iter().fold(Rect::zero(), |unioned_rect, rect| {
+        rect.to_untyped().union(&unioned_rect)
+    }))
 }
 
-struct CollectingFragmentBorderBoxIterator {
-    node_address: OpaqueNode,
-    rects: Vec<Rect<Au>>,
+pub fn process_content_boxes_request(node: ServoLayoutNode<'_>) -> Vec<Rect<Au>> {
+    node.fragments_for_pseudo(None)
+        .iter()
+        .filter_map(Fragment::cumulative_border_box_rect)
+        .map(|rect| rect.to_untyped())
+        .collect()
 }
 
-impl CollectingFragmentBorderBoxIterator {
-    fn new(node_address: OpaqueNode) -> CollectingFragmentBorderBoxIterator {
-        CollectingFragmentBorderBoxIterator {
-            node_address,
-            rects: Vec::new(),
-        }
-    }
-}
-
-impl FragmentBorderBoxIterator for CollectingFragmentBorderBoxIterator {
-    fn process(&mut self, _: &Fragment, _: i32, border_box: &Rect<Au>) {
-        self.rects.push(*border_box);
-    }
-
-    fn should_process(&mut self, fragment: &Fragment) -> bool {
-        fragment.contains_node(self.node_address)
-    }
-}
-
-enum Side {
-    Left,
-    Right,
-    Bottom,
-    Top,
-}
-
-enum MarginPadding {
-    Margin,
-    Padding,
-}
-
-enum PositionProperty {
-    Left,
-    Right,
-    Top,
-    Bottom,
-    Width,
-    Height,
-}
-
-#[derive(Debug)]
-enum OverflowDirection {
-    RightAndDown,
-    LeftAndDown,
-    LeftAndUp,
-    RightAndUp,
-}
-
-struct PositionRetrievingFragmentBorderBoxIterator {
-    node_address: OpaqueNode,
-    result: Option<Au>,
-    position: Point2D<Au>,
-    property: PositionProperty,
-}
-
-impl PositionRetrievingFragmentBorderBoxIterator {
-    fn new(
-        node_address: OpaqueNode,
-        property: PositionProperty,
-        position: Point2D<Au>,
-    ) -> PositionRetrievingFragmentBorderBoxIterator {
-        PositionRetrievingFragmentBorderBoxIterator {
-            node_address,
-            position,
-            property,
-            result: None,
-        }
-    }
-}
-
-impl FragmentBorderBoxIterator for PositionRetrievingFragmentBorderBoxIterator {
-    fn process(&mut self, fragment: &Fragment, _: i32, border_box: &Rect<Au>) {
-        let border_padding = fragment
-            .border_padding
-            .to_physical(fragment.style.writing_mode);
-        self.result = Some(match self.property {
-            PositionProperty::Left => self.position.x,
-            PositionProperty::Top => self.position.y,
-            PositionProperty::Width => border_box.size.width - border_padding.horizontal(),
-            PositionProperty::Height => border_box.size.height - border_padding.vertical(),
-            // TODO: the following 2 calculations are completely wrong.
-            // They should return the difference between the parent's and this
-            // fragment's border boxes.
-            PositionProperty::Right => border_box.max_x() + self.position.x,
-            PositionProperty::Bottom => border_box.max_y() + self.position.y,
-        });
-    }
-
-    fn should_process(&mut self, fragment: &Fragment) -> bool {
-        fragment.contains_node(self.node_address)
-    }
-}
-
-struct MarginRetrievingFragmentBorderBoxIterator {
-    node_address: OpaqueNode,
-    result: Option<Au>,
-    writing_mode: WritingMode,
-    margin_padding: MarginPadding,
-    side: Side,
-}
-
-impl MarginRetrievingFragmentBorderBoxIterator {
-    fn new(
-        node_address: OpaqueNode,
-        side: Side,
-        margin_padding: MarginPadding,
-        writing_mode: WritingMode,
-    ) -> MarginRetrievingFragmentBorderBoxIterator {
-        MarginRetrievingFragmentBorderBoxIterator {
-            node_address,
-            side,
-            margin_padding,
-            result: None,
-            writing_mode,
-        }
-    }
-}
-
-impl FragmentBorderBoxIterator for MarginRetrievingFragmentBorderBoxIterator {
-    fn process(&mut self, fragment: &Fragment, _: i32, _: &Rect<Au>) {
-        let rect = match self.margin_padding {
-            MarginPadding::Margin => &fragment.margin,
-            MarginPadding::Padding => &fragment.border_padding,
-        };
-        self.result = Some(match self.side {
-            Side::Left => rect.left(self.writing_mode),
-            Side::Right => rect.right(self.writing_mode),
-            Side::Bottom => rect.bottom(self.writing_mode),
-            Side::Top => rect.top(self.writing_mode),
-        });
-    }
-
-    fn should_process(&mut self, fragment: &Fragment) -> bool {
-        fragment.contains_node(self.node_address)
-    }
-}
-
-pub fn process_content_box_request(
-    requested_node: OpaqueNode,
-    layout_root: &mut dyn Flow,
-) -> Option<Rect<Au>> {
-    // FIXME(pcwalton): This has not been updated to handle the stacking context relative
-    // stuff. So the position is wrong in most cases.
-    let mut iterator = UnioningFragmentBorderBoxIterator::new(requested_node);
-    sequential::iterate_through_flow_tree_fragment_border_boxes(layout_root, &mut iterator);
-    iterator.rect
-}
-
-pub fn process_content_boxes_request(
-    requested_node: OpaqueNode,
-    layout_root: &mut dyn Flow,
-) -> Vec<Rect<Au>> {
-    // FIXME(pcwalton): This has not been updated to handle the stacking context relative
-    // stuff. So the position is wrong in most cases.
-    let mut iterator = CollectingFragmentBorderBoxIterator::new(requested_node);
-    sequential::iterate_through_flow_tree_fragment_border_boxes(layout_root, &mut iterator);
-    iterator.rects
-}
-
-struct FragmentClientRectQueryIterator {
-    node_address: OpaqueNode,
-    client_rect: Rect<i32>,
-}
-
-impl FragmentClientRectQueryIterator {
-    fn new(node_address: OpaqueNode) -> FragmentClientRectQueryIterator {
-        FragmentClientRectQueryIterator {
-            node_address,
-            client_rect: Rect::zero(),
-        }
-    }
-}
-
-struct UnioningFragmentScrollAreaIterator {
-    node_address: OpaqueNode,
-    union_rect: Rect<i32>,
-    origin_rect: Rect<i32>,
-    level: Option<i32>,
-    is_child: bool,
-    overflow_direction: OverflowDirection,
-}
-
-impl UnioningFragmentScrollAreaIterator {
-    fn new(node_address: OpaqueNode) -> UnioningFragmentScrollAreaIterator {
-        UnioningFragmentScrollAreaIterator {
-            node_address,
-            union_rect: Rect::zero(),
-            origin_rect: Rect::zero(),
-            level: None,
-            is_child: false,
-            // FIXME(#20867)
-            overflow_direction: OverflowDirection::RightAndDown,
-        }
-    }
-}
-
-struct NodeOffsetBoxInfo {
-    offset: Point2D<Au>,
-    rectangle: Rect<Au>,
-}
-
-struct ParentBorderBoxInfo {
-    node_address: OpaqueNode,
-    origin: Point2D<Au>,
-}
-
-struct ParentOffsetBorderBoxIterator {
-    node_address: OpaqueNode,
-    has_processed_node: bool,
-    node_offset_box: Option<NodeOffsetBoxInfo>,
-    parent_nodes: Vec<Option<ParentBorderBoxInfo>>,
-}
-
-impl ParentOffsetBorderBoxIterator {
-    fn new(node_address: OpaqueNode) -> ParentOffsetBorderBoxIterator {
-        ParentOffsetBorderBoxIterator {
-            node_address,
-            has_processed_node: false,
-            node_offset_box: None,
-            parent_nodes: Vec::new(),
-        }
-    }
-}
-
-impl FragmentBorderBoxIterator for FragmentClientRectQueryIterator {
-    fn process(&mut self, fragment: &Fragment, _: i32, border_box: &Rect<Au>) {
-        let style_structs::Border {
-            border_top_width: top_width,
-            border_right_width: right_width,
-            border_bottom_width: bottom_width,
-            border_left_width: left_width,
-            ..
-        } = *fragment.style.get_border();
-        let (left_width, right_width) = (left_width.to_px(), right_width.to_px());
-        let (top_width, bottom_width) = (top_width.to_px(), bottom_width.to_px());
-        self.client_rect.origin.y = top_width;
-        self.client_rect.origin.x = left_width;
-        self.client_rect.size.width = border_box.size.width.to_px() - left_width - right_width;
-        self.client_rect.size.height = border_box.size.height.to_px() - top_width - bottom_width;
-    }
-
-    fn should_process(&mut self, fragment: &Fragment) -> bool {
-        fragment.node == self.node_address
-    }
-}
-
-// https://drafts.csswg.org/cssom-view/#scrolling-area
-impl FragmentBorderBoxIterator for UnioningFragmentScrollAreaIterator {
-    fn process(&mut self, fragment: &Fragment, level: i32, border_box: &Rect<Au>) {
-        // In cases in which smaller child elements contain less padding than the parent
-        // the a union of the two elements padding rectangles could result in an unwanted
-        // increase in size. To work around this, we store the original elements padding
-        // rectangle as `origin_rect` and the union of all child elements padding and
-        // margin rectangles as `union_rect`.
-        let style_structs::Border {
-            border_top_width: top_border,
-            border_right_width: right_border,
-            border_bottom_width: bottom_border,
-            border_left_width: left_border,
-            ..
-        } = *fragment.style.get_border();
-        let (left_border, right_border) = (left_border.to_px(), right_border.to_px());
-        let (top_border, bottom_border) = (top_border.to_px(), bottom_border.to_px());
-        let right_padding = border_box.size.width.to_px() - right_border - left_border;
-        let bottom_padding = border_box.size.height.to_px() - bottom_border - top_border;
-        let top_padding = top_border;
-        let left_padding = left_border;
-
-        match self.level {
-            Some(start_level) if level <= start_level => {
-                self.is_child = false;
-            },
-            Some(_) => {
-                let padding = Rect::new(
-                    Point2D::new(left_padding, top_padding),
-                    Size2D::new(right_padding, bottom_padding),
-                );
-                let top_margin = fragment.margin.top(fragment.style.writing_mode).to_px();
-                let left_margin = fragment.margin.left(fragment.style.writing_mode).to_px();
-                let bottom_margin = fragment.margin.bottom(fragment.style.writing_mode).to_px();
-                let right_margin = fragment.margin.right(fragment.style.writing_mode).to_px();
-                let margin = Rect::new(
-                    Point2D::new(left_margin, top_margin),
-                    Size2D::new(right_margin, bottom_margin),
-                );
-
-                // This is a workaround because euclid does not support unioning empty
-                // rectangles.
-                // TODO: The way that this iterator is calculating scroll area is very
-                // suspect and the code below is a workaround until it can be written
-                // in a better way.
-                self.union_rect = Box2D::new(
-                    Point2D::new(
-                        min(
-                            padding.min_x(),
-                            min(margin.min_x(), self.union_rect.min_x()),
-                        ),
-                        min(
-                            padding.min_y(),
-                            min(margin.min_y(), self.union_rect.min_y()),
-                        ),
-                    ),
-                    Point2D::new(
-                        max(
-                            padding.max_x(),
-                            max(margin.max_x(), self.union_rect.max_x()),
-                        ),
-                        max(
-                            padding.max_y(),
-                            max(margin.max_y(), self.union_rect.max_y()),
-                        ),
-                    ),
-                )
-                .to_rect();
-            },
-            None => {
-                self.level = Some(level);
-                self.is_child = true;
-                self.overflow_direction = overflow_direction(&fragment.style.writing_mode);
-                self.origin_rect = Rect::new(
-                    Point2D::new(left_padding, top_padding),
-                    Size2D::new(right_padding, bottom_padding),
-                );
-            },
-        };
-    }
-
-    fn should_process(&mut self, fragment: &Fragment) -> bool {
-        fragment.contains_node(self.node_address) || self.is_child
-    }
-}
-
-// https://drafts.csswg.org/cssom-view/#extensions-to-the-htmlelement-interface
-impl FragmentBorderBoxIterator for ParentOffsetBorderBoxIterator {
-    fn process(&mut self, fragment: &Fragment, level: i32, border_box: &Rect<Au>) {
-        if self.node_offset_box.is_none() {
-            // We haven't found the node yet, so we're still looking
-            // for its parent. Remove all nodes at this level or
-            // higher, as they can't be parents of this node.
-            self.parent_nodes.truncate(level as usize);
-            assert_eq!(
-                self.parent_nodes.len(),
-                level as usize,
-                "Skipped at least one level in the flow tree!"
-            );
-        }
-
-        if !fragment.is_primary_fragment() {
-            // This fragment doesn't correspond to anything worth
-            // taking measurements from.
-
-            if self.node_offset_box.is_none() {
-                // If this is the only fragment in the flow, we need to
-                // do this to avoid failing the above assertion.
-                self.parent_nodes.push(None);
-            }
-
-            return;
-        }
-
-        if fragment.node == self.node_address {
-            // Found the fragment in the flow tree that matches the
-            // DOM node being looked for.
-
-            assert!(
-                self.node_offset_box.is_none(),
-                "Node was being treated as inline, but it has an associated fragment!"
-            );
-
-            self.has_processed_node = true;
-            self.node_offset_box = Some(NodeOffsetBoxInfo {
-                offset: border_box.origin,
-                rectangle: *border_box,
-            });
-
-            // offsetParent returns null if the node is fixed.
-            if fragment.style.get_box().position == Position::Fixed {
-                self.parent_nodes.clear();
-            }
-        } else if let Some(node) = fragment.inline_context.as_ref().and_then(|inline_context| {
-            inline_context
-                .nodes
-                .iter()
-                .find(|node| node.address == self.node_address)
-        }) {
-            // TODO: Handle cases where the `offsetParent` is an inline
-            // element. This will likely be impossible until
-            // https://github.com/servo/servo/issues/13982 is fixed.
-
-            // Found a fragment in the flow tree whose inline context
-            // contains the DOM node we're looking for, i.e. the node
-            // is inline and contains this fragment.
-            match self.node_offset_box {
-                Some(NodeOffsetBoxInfo {
-                    ref mut rectangle, ..
-                }) => {
-                    *rectangle = rectangle.union(border_box);
-                },
-                None => {
-                    // https://github.com/servo/servo/issues/13982 will
-                    // cause this assertion to fail sometimes, so it's
-                    // commented out for now.
-                    /*assert!(node.flags.contains(FIRST_FRAGMENT_OF_ELEMENT),
-                    "First fragment of inline node found wasn't its first fragment!");*/
-
-                    self.node_offset_box = Some(NodeOffsetBoxInfo {
-                        offset: border_box.origin,
-                        rectangle: *border_box,
-                    });
-                },
-            }
-
-            if node
-                .flags
-                .contains(InlineFragmentNodeFlags::LAST_FRAGMENT_OF_ELEMENT)
-            {
-                self.has_processed_node = true;
-            }
-        } else if self.node_offset_box.is_none() {
-            let is_body_element = fragment
-                .flags
-                .contains(FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT);
-            let is_valid_parent = match (
-                is_body_element,
-                fragment.style.get_box().position,
-                &fragment.specific,
-            ) {
-                // Spec says it's valid if any of these are true:
-                //  1) Is the body element
-                //  2) Is static position *and* is a table or table cell
-                //  3) Is not static position
-                (true, _, _) |
-                (false, Position::Static, &SpecificFragmentInfo::Table) |
-                (false, Position::Static, &SpecificFragmentInfo::TableCell) |
-                (false, Position::Sticky, _) |
-                (false, Position::Absolute, _) |
-                (false, Position::Relative, _) |
-                (false, Position::Fixed, _) => true,
-
-                // Otherwise, it's not a valid parent
-                (false, Position::Static, _) => false,
-            };
-
-            let parent_info = if is_valid_parent {
-                let border_width = fragment
-                    .border_width()
-                    .to_physical(fragment.style.writing_mode);
-
-                Some(ParentBorderBoxInfo {
-                    node_address: fragment.node,
-                    origin: border_box.origin + Vector2D::new(border_width.left, border_width.top),
-                })
-            } else {
-                None
-            };
-
-            self.parent_nodes.push(parent_info);
-        }
-    }
-
-    fn should_process(&mut self, _: &Fragment) -> bool {
-        !self.has_processed_node
-    }
-}
-
-pub fn process_client_rect_query(
-    requested_node: OpaqueNode,
-    layout_root: &mut dyn Flow,
-) -> Rect<i32> {
-    let mut iterator = FragmentClientRectQueryIterator::new(requested_node);
-    sequential::iterate_through_flow_tree_fragment_border_boxes(layout_root, &mut iterator);
-    iterator.client_rect
+pub fn process_client_rect_request(node: ServoLayoutNode<'_>) -> Rect<i32> {
+    node.fragments_for_pseudo(None)
+        .first()
+        .map(Fragment::client_rect)
+        .unwrap_or_default()
 }
 
 /// <https://drafts.csswg.org/cssom-view/#scrolling-area>
-pub fn process_scrolling_area_request(
-    requested_node: Option<OpaqueNode>,
-    layout_root: &mut dyn Flow,
+pub fn process_node_scroll_area_request(
+    requested_node: Option<ServoLayoutNode<'_>>,
+    fragment_tree: Option<Arc<FragmentTree>>,
 ) -> Rect<i32> {
-    let requested_node = match requested_node {
-        Some(node) => node,
-        None => {
-            let rect = layout_root.base().overflow.scroll;
-            return Rect::new(
-                Point2D::new(rect.origin.x.to_nearest_px(), rect.origin.y.to_nearest_px()),
-                Size2D::new(rect.width().ceil_to_px(), rect.height().ceil_to_px()),
-            );
-        },
+    let Some(tree) = fragment_tree else {
+        return Rect::zero();
     };
 
-    let mut iterator = UnioningFragmentScrollAreaIterator::new(requested_node);
-    sequential::iterate_through_flow_tree_fragment_border_boxes(layout_root, &mut iterator);
-    match iterator.overflow_direction {
-        OverflowDirection::RightAndDown => {
-            let right = max(
-                iterator.union_rect.size.width,
-                iterator.origin_rect.size.width,
-            );
-            let bottom = max(
-                iterator.union_rect.size.height,
-                iterator.origin_rect.size.height,
-            );
-            Rect::new(iterator.origin_rect.origin, Size2D::new(right, bottom))
-        },
-        OverflowDirection::LeftAndDown => {
-            let bottom = max(
-                iterator.union_rect.size.height,
-                iterator.origin_rect.size.height,
-            );
-            let left = min(iterator.union_rect.origin.x, iterator.origin_rect.origin.x);
-            Rect::new(
-                Point2D::new(left, iterator.origin_rect.origin.y),
-                Size2D::new(iterator.origin_rect.size.width, bottom),
-            )
-        },
-        OverflowDirection::LeftAndUp => {
-            let top = min(iterator.union_rect.origin.y, iterator.origin_rect.origin.y);
-            let left = min(iterator.union_rect.origin.x, iterator.origin_rect.origin.x);
-            Rect::new(Point2D::new(left, top), iterator.origin_rect.size)
-        },
-        OverflowDirection::RightAndUp => {
-            let top = min(iterator.union_rect.origin.y, iterator.origin_rect.origin.y);
-            let right = max(
-                iterator.union_rect.size.width,
-                iterator.origin_rect.size.width,
-            );
-            Rect::new(
-                Point2D::new(iterator.origin_rect.origin.x, top),
-                Size2D::new(right, iterator.origin_rect.size.height),
-            )
-        },
-    }
-}
-
-fn create_font_declaration(
-    value: &str,
-    url_data: &ServoUrl,
-    quirks_mode: QuirksMode,
-) -> Option<PropertyDeclarationBlock> {
-    let mut declarations = SourcePropertyDeclaration::default();
-    let result = parse_one_declaration_into(
-        &mut declarations,
-        PropertyId::NonCustom(ShorthandId::Font.into()),
-        value,
-        Origin::Author,
-        &UrlExtraData(url_data.get_arc()),
-        None,
-        ParsingMode::DEFAULT,
-        quirks_mode,
-        CssRuleType::Style,
-    );
-    let declarations = match result {
-        Ok(()) => {
-            let mut block = PropertyDeclarationBlock::new();
-            block.extend(declarations.drain(), Importance::Normal);
-            block
-        },
-        Err(_) => return None,
-    };
-    // TODO: Force to set line-height property to 'normal' font property.
-    Some(declarations)
-}
-
-fn resolve_for_declarations<'dom, E>(
-    context: &SharedStyleContext,
-    parent_style: Option<&ComputedValues>,
-    declarations: PropertyDeclarationBlock,
-    shared_lock: &SharedRwLock,
-) -> ServoArc<ComputedValues>
-where
-    E: LayoutNode<'dom>,
-{
-    let parent_style = match parent_style {
-        Some(parent) => parent,
-        None => context.stylist.device().default_computed_values(),
-    };
-    context
-        .stylist
-        .compute_for_declarations::<E::ConcreteElement>(
-            &context.guards,
-            parent_style,
-            ServoArc::new(shared_lock.wrap(declarations)),
-        )
-}
-
-pub fn process_resolved_font_style_request<'dom, E>(
-    context: &SharedStyleContext,
-    node: E,
-    value: &str,
-    url_data: ServoUrl,
-    shared_lock: &SharedRwLock,
-) -> Option<ServoArc<Font>>
-where
-    E: LayoutNode<'dom>,
-{
-    use style::stylist::RuleInclusion;
-    use style::traversal::resolve_style;
-
-    // 1. Parse the given font property value
-    let quirks_mode = context.quirks_mode();
-    let declarations = create_font_declaration(value, &url_data, quirks_mode)?;
-
-    // TODO: Reject 'inherit' and 'initial' values for the font property.
-
-    // 2. Get resolved styles for the parent element
-    let element = node.as_element().unwrap();
-    let parent_style = if node.is_connected() {
-        if element.has_data() {
-            node.to_threadsafe().as_element().unwrap().resolved_style()
-        } else {
-            let mut tlc = ThreadLocalStyleContext::new();
-            let mut context = StyleContext {
-                shared: context,
-                thread_local: &mut tlc,
-            };
-            let styles = resolve_style(&mut context, element, RuleInclusion::All, None, None);
-            styles.primary().clone()
-        }
-    } else {
-        let default_declarations =
-            create_font_declaration("10px sans-serif", &url_data, quirks_mode).unwrap();
-        resolve_for_declarations::<E>(context, None, default_declarations, shared_lock)
+    let rect = match requested_node {
+        Some(node) => node
+            .fragments_for_pseudo(None)
+            .first()
+            .map(Fragment::scrolling_area)
+            .unwrap_or_default(),
+        None => tree.get_scrolling_area_for_viewport(),
     };
 
-    // 3. Resolve the parsed value with resolved styles of the parent element
-    let computed_values =
-        resolve_for_declarations::<E>(context, Some(&*parent_style), declarations, shared_lock);
-
-    Some(computed_values.clone_font())
+    Rect::new(
+        Point2D::new(rect.origin.x.to_f32_px(), rect.origin.y.to_f32_px()),
+        Size2D::new(rect.size.width.to_f32_px(), rect.size.height.to_f32_px()),
+    )
+    .round()
+    .to_i32()
+    .to_untyped()
 }
 
 /// Return the resolved value of property for a given (pseudo)element.
 /// <https://drafts.csswg.org/cssom/#resolved-value>
-pub fn process_resolved_style_request<'dom>(
+pub fn process_resolved_style_request(
     context: &SharedStyleContext,
-    node: impl LayoutNode<'dom>,
+    node: ServoLayoutNode<'_>,
     pseudo: &Option<PseudoElement>,
     property: &PropertyId,
-    layout_root: &mut dyn Flow,
 ) -> String {
-    use style::stylist::RuleInclusion;
-    use style::traversal::resolve_style;
-
-    let element = node.as_element().unwrap();
+    if !node.as_element().unwrap().has_data() {
+        return process_resolved_style_request_for_unstyled_node(context, node, pseudo, property);
+    }
 
     // We call process_resolved_style_request after performing a whole-document
     // traversal, so in the common case, the element is styled.
-    if element.has_data() {
-        return process_resolved_style_request_internal(node, pseudo, property, layout_root);
+    let layout_element = node.to_threadsafe().as_element().unwrap();
+    let layout_element = match pseudo {
+        Some(pseudo_element_type) => {
+            match layout_element.with_pseudo(*pseudo_element_type) {
+                Some(layout_element) => layout_element,
+                None => {
+                    // The pseudo doesn't exist, return nothing.  Chrome seems to query
+                    // the element itself in this case, Firefox uses the resolved value.
+                    // https://www.w3.org/Bugs/Public/show_bug.cgi?id=29006
+                    return String::new();
+                },
+            }
+        },
+        None => layout_element,
+    };
+
+    let style = &*layout_element.style(context);
+    let longhand_id = match *property {
+        PropertyId::NonCustom(id) => match id.longhand_or_shorthand() {
+            Ok(longhand_id) => longhand_id,
+            Err(shorthand_id) => return shorthand_to_css_string(shorthand_id, style),
+        },
+        PropertyId::Custom(ref name) => {
+            return style.computed_value_to_string(PropertyDeclarationId::Custom(name));
+        },
+    }
+    .to_physical(style.writing_mode);
+
+    let computed_style = |fragment: Option<&Fragment>| match longhand_id {
+        LonghandId::MinWidth
+            if style.clone_min_width() == Size::Auto &&
+                !should_honor_min_size_auto(fragment, style) =>
+        {
+            String::from("0px")
+        },
+        LonghandId::MinHeight
+            if style.clone_min_height() == Size::Auto &&
+                !should_honor_min_size_auto(fragment, style) =>
+        {
+            String::from("0px")
+        },
+        _ => style.computed_value_to_string(PropertyDeclarationId::Longhand(longhand_id)),
+    };
+
+    // https://drafts.csswg.org/cssom/#dom-window-getcomputedstyle
+    // Here we are trying to conform to the specification that says that getComputedStyle
+    // should return the used values in certain circumstances. For size and positional
+    // properties we might need to walk the Fragment tree to figure those out. We always
+    // fall back to returning the computed value.
+
+    // For line height, the resolved value is the computed value if it
+    // is "normal" and the used value otherwise.
+    if longhand_id == LonghandId::LineHeight {
+        let font = style.get_font();
+        let font_size = font.font_size.computed_size();
+        return match font.line_height {
+            // There could be a fragment, but it's only interesting for `min-width` and `min-height`,
+            // so just pass None.
+            LineHeight::Normal => computed_style(None),
+            LineHeight::Number(value) => (font_size * value.0).to_css_string(),
+            LineHeight::Length(value) => value.0.to_css_string(),
+        };
     }
 
+    // https://drafts.csswg.org/cssom/#dom-window-getcomputedstyle
+    // The properties that we calculate below all resolve to the computed value
+    // when the element is display:none or display:contents.
+    let display = style.get_box().display;
+    if display.is_none() || display.is_contents() {
+        return computed_style(None);
+    }
+
+    let resolve_for_fragment = |fragment: &Fragment| {
+        let (content_rect, margins, padding, specific_layout_info) = match fragment {
+            Fragment::Box(box_fragment) | Fragment::Float(box_fragment) => {
+                let box_fragment = box_fragment.borrow();
+                if style.get_box().position != Position::Static {
+                    let resolved_insets = || box_fragment.calculate_resolved_insets_if_positioned();
+                    match longhand_id {
+                        LonghandId::Top => return resolved_insets().top.to_css_string(),
+                        LonghandId::Right => {
+                            return resolved_insets().right.to_css_string();
+                        },
+                        LonghandId::Bottom => {
+                            return resolved_insets().bottom.to_css_string();
+                        },
+                        LonghandId::Left => {
+                            return resolved_insets().left.to_css_string();
+                        },
+                        _ => {},
+                    }
+                }
+                let content_rect = box_fragment.content_rect;
+                let margins = box_fragment.margin;
+                let padding = box_fragment.padding;
+                let specific_layout_info = box_fragment.specific_layout_info.clone();
+                (content_rect, margins, padding, specific_layout_info)
+            },
+            Fragment::Positioning(positioning_fragment) => {
+                let content_rect = positioning_fragment.borrow().rect;
+                (
+                    content_rect,
+                    SideOffsets2D::zero(),
+                    SideOffsets2D::zero(),
+                    None,
+                )
+            },
+            _ => return computed_style(Some(fragment)),
+        };
+
+        // https://drafts.csswg.org/css-grid/#resolved-track-list
+        // > The grid-template-rows and grid-template-columns properties are
+        // > resolved value special case properties.
+        //
+        // > When an element generates a grid container box...
+        if display.inside() == DisplayInside::Grid {
+            if let Some(SpecificLayoutInfo::Grid(info)) = specific_layout_info {
+                if let Some(value) = resolve_grid_template(&info, style, longhand_id) {
+                    return value;
+                }
+            }
+        }
+
+        // https://drafts.csswg.org/cssom/#resolved-value-special-case-property-like-height
+        // > If the property applies to the element or pseudo-element and the resolved value of the
+        // > display property is not none or contents, then the resolved value is the used value.
+        // > Otherwise the resolved value is the computed value.
+        //
+        // However, all browsers ignore that for margin and padding properties, and resolve to a length
+        // even if the property doesn't apply: https://github.com/w3c/csswg-drafts/issues/10391
+        match longhand_id {
+            LonghandId::Width if resolved_size_should_be_used_value(fragment) => {
+                content_rect.size.width
+            },
+            LonghandId::Height if resolved_size_should_be_used_value(fragment) => {
+                content_rect.size.height
+            },
+            LonghandId::MarginBottom => margins.bottom,
+            LonghandId::MarginTop => margins.top,
+            LonghandId::MarginLeft => margins.left,
+            LonghandId::MarginRight => margins.right,
+            LonghandId::PaddingBottom => padding.bottom,
+            LonghandId::PaddingTop => padding.top,
+            LonghandId::PaddingLeft => padding.left,
+            LonghandId::PaddingRight => padding.right,
+            _ => return computed_style(Some(fragment)),
+        }
+        .to_css_string()
+    };
+
+    node.fragments_for_pseudo(*pseudo)
+        .first()
+        .map(resolve_for_fragment)
+        .unwrap_or_else(|| computed_style(None))
+}
+
+fn resolved_size_should_be_used_value(fragment: &Fragment) -> bool {
+    // https://drafts.csswg.org/css-sizing-3/#preferred-size-properties
+    // > Applies to: all elements except non-replaced inlines
+    match fragment {
+        Fragment::Box(box_fragment) => !box_fragment.borrow().is_inline_box(),
+        Fragment::Float(_) |
+        Fragment::Positioning(_) |
+        Fragment::AbsoluteOrFixedPositioned(_) |
+        Fragment::Image(_) |
+        Fragment::IFrame(_) => true,
+        Fragment::Text(_) => false,
+    }
+}
+
+fn should_honor_min_size_auto(fragment: Option<&Fragment>, style: &ComputedValues) -> bool {
+    // <https://drafts.csswg.org/css-sizing-3/#automatic-minimum-size>
+    // For backwards-compatibility, the resolved value of an automatic minimum size is zero
+    // for boxes of all CSS2 display types: block and inline boxes, inline blocks, and all
+    // the table layout boxes. It also resolves to zero when no box is generated.
+    //
+    // <https://github.com/w3c/csswg-drafts/issues/11716>
+    // However, when a box is generated and `aspect-ratio` isn't `auto`, we need to preserve
+    // the automatic minimum size as `auto`.
+    let Some(Fragment::Box(box_fragment)) = fragment else {
+        return false;
+    };
+    let flags = box_fragment.borrow().base.flags;
+    flags.contains(FragmentFlags::IS_FLEX_OR_GRID_ITEM) ||
+        style.clone_aspect_ratio() != AspectRatio::auto()
+}
+
+fn resolve_grid_template(
+    grid_info: &SpecificTaffyGridInfo,
+    style: &ComputedValues,
+    longhand_id: LonghandId,
+) -> Option<String> {
+    // https://drafts.csswg.org/css-grid/#resolved-track-list-standalone
+    fn serialize_standalone_non_subgrid_track_list(track_sizes: &[Au]) -> Option<String> {
+        match track_sizes.is_empty() {
+            // Standalone non subgrid grids with empty track lists should compute to `none`.
+            // As of current standard, this behaviour should only invoked by `none` computed value,
+            // therefore we can fallback into computed value resolving.
+            true => None,
+            // <https://drafts.csswg.org/css-grid/#resolved-track-list-standalone>
+            // > - Every track listed individually, whether implicitly or explicitly created,
+            //     without using the repeat() notation.
+            // > - Every track size given as a length in pixels, regardless of sizing function.
+            // > - Adjacent line names collapsed into a single bracketed set.
+            // TODO: implement line names
+            false => Some(
+                track_sizes
+                    .iter()
+                    .map(|size| size.to_css_string())
+                    .join(" "),
+            ),
+        }
+    }
+
+    let (track_info, computed_value) = match longhand_id {
+        LonghandId::GridTemplateRows => (&grid_info.rows, &style.get_position().grid_template_rows),
+        LonghandId::GridTemplateColumns => (
+            &grid_info.columns,
+            &style.get_position().grid_template_columns,
+        ),
+        _ => return None,
+    };
+
+    match computed_value {
+        // <https://drafts.csswg.org/css-grid/#resolved-track-list-standalone>
+        // > When an element generates a grid container box, the resolved value of its grid-template-rows or
+        // > grid-template-columns property in a standalone axis is the used value, serialized with:
+        GenericGridTemplateComponent::None |
+        GenericGridTemplateComponent::TrackList(_) |
+        GenericGridTemplateComponent::Masonry => {
+            serialize_standalone_non_subgrid_track_list(&track_info.sizes)
+        },
+
+        // <https://drafts.csswg.org/css-grid/#resolved-track-list-subgrid>
+        // > When an element generates a grid container box that is a subgrid, the resolved value of the
+        // > grid-template-rows and grid-template-columns properties represents the used number of columns,
+        // > serialized as the subgrid keyword followed by a list representing each of its lines as a
+        // > line name set of all the line’s names explicitly defined on the subgrid (not including those
+        // > adopted from the parent grid), without using the repeat() notation.
+        // TODO: implement subgrid
+        GenericGridTemplateComponent::Subgrid(_) => None,
+    }
+}
+
+pub fn process_resolved_style_request_for_unstyled_node(
+    context: &SharedStyleContext,
+    node: ServoLayoutNode<'_>,
+    pseudo: &Option<PseudoElement>,
+    property: &PropertyId,
+) -> String {
     // In a display: none subtree. No pseudo-element exists.
     if pseudo.is_some() {
         return String::new();
@@ -757,6 +379,7 @@ pub fn process_resolved_style_request<'dom>(
         thread_local: &mut tlc,
     };
 
+    let element = node.as_element().unwrap();
     let styles = resolve_style(
         &mut context,
         element,
@@ -775,153 +398,14 @@ pub fn process_resolved_style_request<'dom>(
         },
     };
 
-    // No need to care about used values here, since we're on a display: none
-    // subtree, use the resolved value.
-    style.computed_value_to_string(PropertyDeclarationId::Longhand(longhand_id))
-}
-
-/// The primary resolution logic, which assumes that the element is styled.
-fn process_resolved_style_request_internal<'dom>(
-    requested_node: impl LayoutNode<'dom>,
-    pseudo: &Option<PseudoElement>,
-    property: &PropertyId,
-    layout_root: &mut dyn Flow,
-) -> String {
-    let layout_el = requested_node.to_threadsafe().as_element().unwrap();
-    let layout_el = match *pseudo {
-        Some(PseudoElement::Before) => layout_el.get_before_pseudo(),
-        Some(PseudoElement::After) => layout_el.get_after_pseudo(),
-        Some(PseudoElement::DetailsSummary) |
-        Some(PseudoElement::DetailsContent) |
-        Some(PseudoElement::Selection) => None,
-        // FIXME(emilio): What about the other pseudos? Probably they shouldn't
-        // just return the element's style!
-        _ => Some(layout_el),
-    };
-
-    let layout_el = match layout_el {
-        None => {
-            // The pseudo doesn't exist, return nothing.  Chrome seems to query
-            // the element itself in this case, Firefox uses the resolved value.
-            // https://www.w3.org/Bugs/Public/show_bug.cgi?id=29006
-            return String::new();
-        },
-        Some(layout_el) => layout_el,
-    };
-
-    let style = &*layout_el.resolved_style();
-    let longhand_id = match *property {
-        PropertyId::NonCustom(id) => match id.longhand_or_shorthand() {
-            Ok(longhand_id) => longhand_id,
-            Err(shorthand_id) => return shorthand_to_css_string(shorthand_id, style),
-        },
-        PropertyId::Custom(ref name) => {
-            return style.computed_value_to_string(PropertyDeclarationId::Custom(name));
-        },
-    };
-
-    let positioned = matches!(
-        style.get_box().position,
-        Position::Relative | Position::Sticky | Position::Fixed | Position::Absolute
-    );
-
-    //TODO: determine whether requested property applies to the element.
-    //      eg. width does not apply to non-replaced inline elements.
-    // Existing browsers disagree about when left/top/right/bottom apply
-    // (Chrome seems to think they never apply and always returns resolved values).
-    // There are probably other quirks.
-    let applies = true;
-
-    fn used_value_for_position_property<'dom, N>(
-        layout_el: <N::ConcreteThreadSafeLayoutNode as ThreadSafeLayoutNode<'dom>>::ConcreteThreadSafeLayoutElement,
-        layout_root: &mut dyn Flow,
-        requested_node: N,
-        longhand_id: LonghandId,
-    ) -> String
-    where
-        N: LayoutNode<'dom>,
-    {
-        let maybe_data = layout_el.as_node().borrow_layout_data();
-        let position = maybe_data.map_or(Point2D::zero(), |data| {
-            match data.flow_construction_result {
-                ConstructionResult::Flow(ref flow_ref, _) => flow_ref
-                    .deref()
-                    .base()
-                    .stacking_relative_position
-                    .to_point(),
-                // TODO(dzbarsky) search parents until we find node with a flow ref.
-                // https://github.com/servo/servo/issues/8307
-                _ => Point2D::zero(),
-            }
-        });
-        let property = match longhand_id {
-            LonghandId::Bottom => PositionProperty::Bottom,
-            LonghandId::Top => PositionProperty::Top,
-            LonghandId::Left => PositionProperty::Left,
-            LonghandId::Right => PositionProperty::Right,
-            LonghandId::Width => PositionProperty::Width,
-            LonghandId::Height => PositionProperty::Height,
-            _ => unreachable!(),
-        };
-        let mut iterator = PositionRetrievingFragmentBorderBoxIterator::new(
-            requested_node.opaque(),
-            property,
-            position,
-        );
-        sequential::iterate_through_flow_tree_fragment_border_boxes(layout_root, &mut iterator);
-        iterator
-            .result
-            .map(|r| r.to_css_string())
-            .unwrap_or_default()
-    }
-
-    // TODO: we will return neither the computed nor used value for margin and padding.
     match longhand_id {
-        LonghandId::MarginBottom |
-        LonghandId::MarginTop |
-        LonghandId::MarginLeft |
-        LonghandId::MarginRight |
-        LonghandId::PaddingBottom |
-        LonghandId::PaddingTop |
-        LonghandId::PaddingLeft |
-        LonghandId::PaddingRight
-            if applies && style.get_box().display != Display::None =>
-        {
-            let (margin_padding, side) = match longhand_id {
-                LonghandId::MarginBottom => (MarginPadding::Margin, Side::Bottom),
-                LonghandId::MarginTop => (MarginPadding::Margin, Side::Top),
-                LonghandId::MarginLeft => (MarginPadding::Margin, Side::Left),
-                LonghandId::MarginRight => (MarginPadding::Margin, Side::Right),
-                LonghandId::PaddingBottom => (MarginPadding::Padding, Side::Bottom),
-                LonghandId::PaddingTop => (MarginPadding::Padding, Side::Top),
-                LonghandId::PaddingLeft => (MarginPadding::Padding, Side::Left),
-                LonghandId::PaddingRight => (MarginPadding::Padding, Side::Right),
-                _ => unreachable!(),
-            };
-            let mut iterator = MarginRetrievingFragmentBorderBoxIterator::new(
-                requested_node.opaque(),
-                side,
-                margin_padding,
-                style.writing_mode,
-            );
-            sequential::iterate_through_flow_tree_fragment_border_boxes(layout_root, &mut iterator);
-            iterator
-                .result
-                .map(|r| r.to_css_string())
-                .unwrap_or_default()
-        },
+        // <https://drafts.csswg.org/css-sizing-3/#automatic-minimum-size>
+        // The resolved value of an automatic minimum size is zero when no box is generated.
+        LonghandId::MinWidth if style.clone_min_width() == Size::Auto => String::from("0px"),
+        LonghandId::MinHeight if style.clone_min_height() == Size::Auto => String::from("0px"),
 
-        LonghandId::Bottom | LonghandId::Top | LonghandId::Right | LonghandId::Left
-            if applies && positioned && style.get_box().display != Display::None =>
-        {
-            used_value_for_position_property(layout_el, layout_root, requested_node, longhand_id)
-        },
-        LonghandId::Width | LonghandId::Height
-            if applies && style.get_box().display != Display::None =>
-        {
-            used_value_for_position_property(layout_el, layout_root, requested_node, longhand_id)
-        },
-        // FIXME: implement used value computation for line-height
+        // No need to care about used values here, since we're on a display: none
+        // subtree, use the computed value.
         _ => style.computed_value_to_string(PropertyDeclarationId::Longhand(longhand_id)),
     }
 }
@@ -945,164 +429,673 @@ fn shorthand_to_css_string(
     }
 }
 
-pub fn process_offset_parent_query(
-    requested_node: OpaqueNode,
-    layout_root: &mut dyn Flow,
-) -> OffsetParentResponse {
-    let mut iterator = ParentOffsetBorderBoxIterator::new(requested_node);
-    sequential::iterate_through_flow_tree_fragment_border_boxes(layout_root, &mut iterator);
-
-    let node_offset_box = iterator.node_offset_box;
-    let parent_info = iterator.parent_nodes.into_iter().rev().flatten().next();
-    match (node_offset_box, parent_info) {
-        (Some(node_offset_box), Some(parent_info)) => {
-            let origin = node_offset_box.offset - parent_info.origin.to_vector();
-            let size = node_offset_box.rectangle.size;
-            OffsetParentResponse {
-                node_address: Some(parent_info.node_address.into()),
-                rect: Rect::new(origin, size),
-            }
-        },
-        _ => OffsetParentResponse::default(),
-    }
+struct OffsetParentFragments {
+    parent: ArcRefCell<BoxFragment>,
+    grandparent: Option<Fragment>,
 }
 
-enum InnerTextItem {
-    Text(String),
-    RequiredLineBreakCount(u32),
+/// <https://www.w3.org/TR/2016/WD-cssom-view-1-20160317/#dom-htmlelement-offsetparent>
+fn offset_parent_fragments(node: ServoLayoutNode<'_>) -> Option<OffsetParentFragments> {
+    // 1. If any of the following holds true return null and terminate this algorithm:
+    //  * The element does not have an associated CSS layout box.
+    //  * The element is the root element.
+    //  * The element is the HTML body element.
+    //  * The element’s computed value of the position property is fixed.
+    let fragment = node.fragments_for_pseudo(None).first().cloned()?;
+    let flags = fragment.base()?.flags;
+    if flags.intersects(
+        FragmentFlags::IS_ROOT_ELEMENT | FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT,
+    ) {
+        return None;
+    }
+    if matches!(
+        fragment, Fragment::Box(fragment) if fragment.borrow().style.get_box().position == Position::Fixed
+    ) {
+        return None;
+    }
+
+    // 2.  Return the nearest ancestor element of the element for which at least one of
+    //     the following is true and terminate this algorithm if such an ancestor is found:
+    //  * The computed value of the position property is not static.
+    //  * It is the HTML body element.
+    //  * The computed value of the position property of the element is static and the
+    //    ancestor is one of the following HTML elements: td, th, or table.
+    let mut maybe_parent_node = node.parent_node();
+    while let Some(parent_node) = maybe_parent_node {
+        maybe_parent_node = parent_node.parent_node();
+
+        if let Some(parent_fragment) = parent_node.fragments_for_pseudo(None).first() {
+            let parent_fragment = match parent_fragment {
+                Fragment::Box(box_fragment) | Fragment::Float(box_fragment) => box_fragment,
+                _ => continue,
+            };
+
+            let grandparent_fragment =
+                maybe_parent_node.and_then(|node| node.fragments_for_pseudo(None).first().cloned());
+
+            if parent_fragment.borrow().style.get_box().position != Position::Static {
+                return Some(OffsetParentFragments {
+                    parent: parent_fragment.clone(),
+                    grandparent: grandparent_fragment,
+                });
+            }
+
+            let flags = parent_fragment.borrow().base.flags;
+            if flags.intersects(
+                FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT |
+                    FragmentFlags::IS_TABLE_TH_OR_TD_ELEMENT,
+            ) {
+                return Some(OffsetParentFragments {
+                    parent: parent_fragment.clone(),
+                    grandparent: grandparent_fragment,
+                });
+            }
+        }
+    }
+
+    None
+}
+
+#[inline]
+pub fn process_offset_parent_query(node: ServoLayoutNode<'_>) -> Option<OffsetParentResponse> {
+    // Only consider the first fragment of the node found as per a
+    // possible interpretation of the specification: "[...] return the
+    // y-coordinate of the top border edge of the first CSS layout box
+    // associated with the element [...]"
+    //
+    // FIXME: Browsers implement this all differently (e.g., [1]) -
+    // Firefox does returns the union of all layout elements of some
+    // sort. Chrome returns the first fragment for a block element (the
+    // same as ours) or the union of all associated fragments in the
+    // first containing block fragment for an inline element. We could
+    // implement Chrome's behavior, but our fragment tree currently
+    // provides insufficient information.
+    //
+    // [1]: https://github.com/w3c/csswg-drafts/issues/4541
+    // > 1. If the element is the HTML body element or does not have any associated CSS
+    //      layout box return zero and terminate this algorithm.
+    let fragment = node.fragments_for_pseudo(None).first().cloned()?;
+    let mut border_box = fragment.cumulative_border_box_rect()?;
+
+    // 2.  If the offsetParent of the element is null return the x-coordinate of the left
+    //     border edge of the first CSS layout box associated with the element, relative to
+    //     the initial containing block origin, ignoring any transforms that apply to the
+    //     element and its ancestors, and terminate this algorithm.
+    let Some(offset_parent_fragment) = offset_parent_fragments(node) else {
+        return Some(OffsetParentResponse {
+            node_address: None,
+            rect: border_box.to_untyped(),
+        });
+    };
+
+    let parent_fragment = offset_parent_fragment.parent.borrow();
+    let parent_is_static_body_element = parent_fragment
+        .base
+        .flags
+        .contains(FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT) &&
+        parent_fragment.style.get_box().position == Position::Static;
+
+    // For `offsetLeft`:
+    // 3. Return the result of subtracting the y-coordinate of the top padding edge of the
+    //    first CSS layout box associated with the offsetParent of the element from the
+    //    y-coordinate of the top border edge of the first CSS layout box associated with the
+    //    element, relative to the initial containing block origin, ignoring any transforms
+    //    that apply to the element and its ancestors.
+    //
+    // We generalize this for `offsetRight` as described in the specification.
+    let grandparent_box_fragment = || match offset_parent_fragment.grandparent {
+        Some(Fragment::Box(box_fragment)) | Some(Fragment::Float(box_fragment)) => {
+            Some(box_fragment)
+        },
+        _ => None,
+    };
+
+    // The spec (https://www.w3.org/TR/cssom-view-1/#extensions-to-the-htmlelement-interface)
+    // says that offsetTop/offsetLeft are always relative to the padding box of the offsetParent.
+    // However, in practice this is not true in major browsers in the case that the offsetParent is the body
+    // element and the body element is position:static. In that case offsetLeft/offsetTop are computed
+    // relative to the root node's border box.
+    //
+    // See <https://github.com/w3c/csswg-drafts/issues/10549>.
+    let parent_offset_rect = if parent_is_static_body_element {
+        if let Some(grandparent_fragment) = grandparent_box_fragment() {
+            let grandparent_fragment = grandparent_fragment.borrow();
+            grandparent_fragment.offset_by_containing_block(&grandparent_fragment.border_rect())
+        } else {
+            parent_fragment.offset_by_containing_block(&parent_fragment.padding_rect())
+        }
+    } else {
+        parent_fragment.offset_by_containing_block(&parent_fragment.padding_rect())
+    };
+
+    border_box = border_box.translate(-parent_offset_rect.origin.to_vector());
+
+    Some(OffsetParentResponse {
+        node_address: parent_fragment.base.tag.map(|tag| tag.node.into()),
+        rect: border_box.to_untyped(),
+    })
 }
 
 /// <https://html.spec.whatwg.org/multipage/#get-the-text-steps>
-pub fn get_the_text_steps<'dom>(
-    node: impl LayoutNode<'dom>,
-    indexable_text: &IndexableText,
-) -> String {
-    // Step 1.
+pub fn get_the_text_steps(node: ServoLayoutNode<'_>) -> String {
+    // Step 1: If element is not being rendered or if the user agent is a non-CSS user agent, then
+    // return element's descendant text content.
+    // This is taken care of in HTMLElemnent code
+
+    // Step 2: Let results be a new empty list.
     let mut results = Vec::new();
-    // Step 2.
-    inner_text_collection_steps(node, indexable_text, &mut results);
     let mut max_req_line_break_count = 0;
-    let mut inner_text = Vec::new();
+
+    // Step 3: For each child node node of element:
+    let mut state = Default::default();
+    for child in node.dom_children() {
+        // Step 1: Let current be the list resulting in running the rendered text collection steps with node.
+        let mut current = rendered_text_collection_steps(child, &mut state);
+        // Step 2: For each item item in current, append item to results.
+        results.append(&mut current);
+    }
+
+    let mut output = Vec::new();
     for item in results {
         match item {
-            InnerTextItem::Text(s) => {
-                if max_req_line_break_count > 0 {
-                    // Step 5.
-                    for _ in 0..max_req_line_break_count {
-                        inner_text.push("\u{000A}".to_owned());
-                    }
-                    max_req_line_break_count = 0;
-                }
+            InnerOrOuterTextItem::Text(s) => {
                 // Step 3.
                 if !s.is_empty() {
-                    inner_text.push(s.to_owned());
+                    if max_req_line_break_count > 0 {
+                        // Step 5.
+                        output.push("\u{000A}".repeat(max_req_line_break_count));
+                        max_req_line_break_count = 0;
+                    }
+                    output.push(s);
                 }
             },
-            InnerTextItem::RequiredLineBreakCount(count) => {
+            InnerOrOuterTextItem::RequiredLineBreakCount(count) => {
                 // Step 4.
-                if inner_text.is_empty() {
+                if output.is_empty() {
                     // Remove required line break count at the start.
                     continue;
                 }
-                // Store the count if it's the max of this run,
-                // but it may be ignored if no text item is found afterwards,
-                // which means that these are consecutive line breaks at the end.
+                // Store the count if it's the max of this run, but it may be ignored if no text
+                // item is found afterwards, which means that these are consecutive line breaks at
+                // the end.
                 if count > max_req_line_break_count {
                     max_req_line_break_count = count;
                 }
             },
         }
     }
-    inner_text.into_iter().collect()
+    output.into_iter().collect()
 }
 
-// https://html.spec.whatwg.org/multipage/#inner-text-collection-steps
-#[allow(unsafe_code)]
-fn inner_text_collection_steps<'dom>(
-    node: impl LayoutNode<'dom>,
-    indexable_text: &IndexableText,
-    results: &mut Vec<InnerTextItem>,
-) {
-    let mut items = Vec::new();
-    for child in node.traverse_preorder() {
-        let node = match child.type_id() {
-            LayoutNodeType::Text => child.parent_node().unwrap(),
-            _ => child,
-        };
+enum InnerOrOuterTextItem {
+    Text(String),
+    RequiredLineBreakCount(usize),
+}
 
-        let element_data = match node.style_data() {
-            Some(data) => &data.element_data,
-            None => continue,
-        };
+#[derive(Clone)]
+struct RenderedTextCollectionState {
+    /// Used to make sure we don't add a `\n` before the first row
+    first_table_row: bool,
+    /// Used to make sure we don't add a `\t` before the first column
+    first_table_cell: bool,
+    /// Keeps track of whether we're inside a table, since there are special rules like ommiting everything that's not
+    /// inside a TableCell/TableCaption
+    within_table: bool,
+    /// Determines whether we truncate leading whitespaces for normal nodes or not
+    may_start_with_whitespace: bool,
+    /// Is set whenever we truncated a white space char, used to prepend a single space before the next element,
+    /// that way we truncate trailing white space without having to look ahead
+    did_truncate_trailing_white_space: bool,
+    /// Is set to true when we're rendering the children of TableCell/TableCaption elements, that way we render
+    /// everything inside those as normal, while omitting everything that's in a Table but NOT in a Cell/Caption
+    within_table_content: bool,
+}
 
-        let style = match element_data.borrow().styles.get_primary() {
-            None => continue,
-            Some(style) => style.clone(),
-        };
-
-        // Step 2.
-        if style.get_inherited_box().visibility != Visibility::Visible {
-            continue;
-        }
-
-        // Step 3.
-        let display = style.get_box().display;
-        if !child.is_connected() || display == Display::None {
-            continue;
-        }
-
-        match child.type_id() {
-            LayoutNodeType::Text => {
-                // Step 4.
-                if let Some(text_content) = indexable_text.get(child.opaque()) {
-                    for content in text_content {
-                        items.push(InnerTextItem::Text(content.text_run.text.to_string()));
-                    }
-                }
-            },
-            LayoutNodeType::Element(LayoutElementType::HTMLBRElement) => {
-                // Step 5.
-                items.push(InnerTextItem::Text(String::from(
-                    "\u{000A}", /* line feed */
-                )));
-            },
-            LayoutNodeType::Element(LayoutElementType::HTMLParagraphElement) => {
-                // Step 8.
-                items.insert(0, InnerTextItem::RequiredLineBreakCount(2));
-                items.push(InnerTextItem::RequiredLineBreakCount(2));
-            },
-            _ => {},
-        }
-
-        match display {
-            Display::TableCell if !is_last_table_cell() => {
-                // Step 6.
-                items.push(InnerTextItem::Text(String::from("\u{0009}" /* tab */)));
-            },
-            Display::TableRow if !is_last_table_row() => {
-                // Step 7.
-                items.push(InnerTextItem::Text(String::from(
-                    "\u{000A}", /* line feed */
-                )));
-            },
-            Display::Block | Display::Flex | Display::TableCaption | Display::Table => {
-                // Step 9.
-                items.insert(0, InnerTextItem::RequiredLineBreakCount(1));
-                items.push(InnerTextItem::RequiredLineBreakCount(1));
-            },
-            _ => {},
+impl Default for RenderedTextCollectionState {
+    fn default() -> Self {
+        RenderedTextCollectionState {
+            first_table_row: true,
+            first_table_cell: true,
+            may_start_with_whitespace: true,
+            did_truncate_trailing_white_space: false,
+            within_table: false,
+            within_table_content: false,
         }
     }
-
-    results.append(&mut items);
 }
 
-fn is_last_table_cell() -> bool {
-    // FIXME(ferjm) Implement this.
-    false
+/// <https://html.spec.whatwg.org/multipage/#rendered-text-collection-steps>
+fn rendered_text_collection_steps(
+    node: ServoLayoutNode<'_>,
+    state: &mut RenderedTextCollectionState,
+) -> Vec<InnerOrOuterTextItem> {
+    // Step 1. Let items be the result of running the rendered text collection
+    // steps with each child node of node in tree order,
+    // and then concatenating the results to a single list.
+    let mut items = vec![];
+    if !node.is_connected() || !(node.is_element() || node.is_text_node()) {
+        return items;
+    }
+
+    match node.type_id() {
+        LayoutNodeType::Text => {
+            if let Some(element) = node.parent_node() {
+                match element.type_id() {
+                    // Any text contained in these elements must be ignored.
+                    LayoutNodeType::Element(LayoutElementType::HTMLCanvasElement) |
+                    LayoutNodeType::Element(LayoutElementType::HTMLImageElement) |
+                    LayoutNodeType::Element(LayoutElementType::HTMLIFrameElement) |
+                    LayoutNodeType::Element(LayoutElementType::HTMLObjectElement) |
+                    LayoutNodeType::Element(LayoutElementType::HTMLInputElement) |
+                    LayoutNodeType::Element(LayoutElementType::HTMLTextAreaElement) |
+                    LayoutNodeType::Element(LayoutElementType::HTMLMediaElement) => {
+                        return items;
+                    },
+                    // Select/Option/OptGroup elements are handled a bit differently.
+                    // Basically: a Select can only contain Options or OptGroups, while
+                    // OptGroups may also contain Options. Everything else gets ignored.
+                    LayoutNodeType::Element(LayoutElementType::HTMLOptGroupElement) => {
+                        if let Some(element) = element.parent_node() {
+                            if !matches!(
+                                element.type_id(),
+                                LayoutNodeType::Element(LayoutElementType::HTMLSelectElement)
+                            ) {
+                                return items;
+                            }
+                        } else {
+                            return items;
+                        }
+                    },
+                    LayoutNodeType::Element(LayoutElementType::HTMLSelectElement) => return items,
+                    _ => {},
+                }
+
+                // Tables are also a bit special, mainly by only allowing
+                // content within TableCell or TableCaption elements once
+                // we're inside a Table.
+                if state.within_table && !state.within_table_content {
+                    return items;
+                }
+
+                let Some(style_data) = element.style_data() else {
+                    return items;
+                };
+
+                let element_data = style_data.element_data.borrow();
+                let Some(style) = element_data.styles.get_primary() else {
+                    return items;
+                };
+
+                // Step 2: If node's computed value of 'visibility' is not 'visible', then return items.
+                //
+                // We need to do this check here on the Text fragment, if we did it on the element and
+                // just skipped rendering all child nodes then there'd be no way to override the
+                // visibility in a child node.
+                if style.get_inherited_box().visibility != Visibility::Visible {
+                    return items;
+                }
+
+                // Step 3: If node is not being rendered, then return items. For the purpose of this step,
+                // the following elements must act as described if the computed value of the 'display'
+                // property is not 'none':
+                let display = style.get_box().display;
+                if display == Display::None {
+                    match element.type_id() {
+                        // Even if set to Display::None, Option/OptGroup elements need to
+                        // be rendered.
+                        LayoutNodeType::Element(LayoutElementType::HTMLOptGroupElement) |
+                        LayoutNodeType::Element(LayoutElementType::HTMLOptionElement) => {},
+                        _ => {
+                            return items;
+                        },
+                    }
+                }
+
+                let text_content = node.to_threadsafe().node_text_content();
+
+                let white_space_collapse = style.clone_white_space_collapse();
+                let preserve_whitespace = white_space_collapse == WhiteSpaceCollapseValue::Preserve;
+                let is_inline = matches!(
+                    display,
+                    Display::InlineBlock | Display::InlineFlex | Display::InlineGrid
+                );
+                // Now we need to decide on whether to remove beginning white space or not, this
+                // is mainly decided by the elements we rendered before, but may be overwritten by the white-space
+                // property.
+                let trim_beginning_white_space =
+                    !preserve_whitespace && (state.may_start_with_whitespace || is_inline);
+                let with_white_space_rules_applied = WhitespaceCollapse::new(
+                    text_content.chars(),
+                    white_space_collapse,
+                    trim_beginning_white_space,
+                );
+
+                // Step 4: If node is a Text node, then for each CSS text box produced by node, in
+                // content order, compute the text of the box after application of the CSS
+                // 'white-space' processing rules and 'text-transform' rules, set items to the list
+                // of the resulting strings, and return items. The CSS 'white-space' processing
+                // rules are slightly modified: collapsible spaces at the end of lines are always
+                // collapsed, but they are only removed if the line is the last line of the block,
+                // or it ends with a br element. Soft hyphens should be preserved.
+                let mut transformed_text: String = TextTransformation::new(
+                    with_white_space_rules_applied,
+                    style.clone_text_transform().case(),
+                )
+                .collect();
+
+                let is_preformatted_element =
+                    white_space_collapse == WhiteSpaceCollapseValue::Preserve;
+
+                let is_final_character_whitespace = transformed_text
+                    .chars()
+                    .next_back()
+                    .filter(char::is_ascii_whitespace)
+                    .is_some();
+
+                let is_first_character_whitespace = transformed_text
+                    .chars()
+                    .next()
+                    .filter(char::is_ascii_whitespace)
+                    .is_some();
+
+                // By truncating trailing white space and then adding it back in once we
+                // encounter another text node we can ensure no trailing white space for
+                // normal text without having to look ahead
+                if state.did_truncate_trailing_white_space && !is_first_character_whitespace {
+                    items.push(InnerOrOuterTextItem::Text(String::from(" ")));
+                };
+
+                if !transformed_text.is_empty() {
+                    // Here we decide whether to keep or truncate the final white
+                    // space character, if there is one.
+                    if is_final_character_whitespace && !is_preformatted_element {
+                        state.may_start_with_whitespace = false;
+                        state.did_truncate_trailing_white_space = true;
+                        transformed_text.pop();
+                    } else {
+                        state.may_start_with_whitespace = is_final_character_whitespace;
+                        state.did_truncate_trailing_white_space = false;
+                    }
+                    items.push(InnerOrOuterTextItem::Text(transformed_text));
+                }
+            } else {
+                // If we don't have a parent element then there's no style data available,
+                // in this (pretty unlikely) case we just return the Text fragment as is.
+                items.push(InnerOrOuterTextItem::Text(
+                    node.to_threadsafe().node_text_content().into(),
+                ));
+            }
+        },
+        LayoutNodeType::Element(LayoutElementType::HTMLBRElement) => {
+            // Step 5: If node is a br element, then append a string containing a single U+000A
+            // LF code point to items.
+            state.did_truncate_trailing_white_space = false;
+            state.may_start_with_whitespace = true;
+            items.push(InnerOrOuterTextItem::Text(String::from("\u{000A}")));
+        },
+        _ => {
+            // First we need to gather some infos to setup the various flags
+            // before rendering the child nodes
+            let Some(style_data) = node.style_data() else {
+                return items;
+            };
+
+            let element_data = style_data.element_data.borrow();
+            let Some(style) = element_data.styles.get_primary() else {
+                return items;
+            };
+            let inherited_box = style.get_inherited_box();
+
+            if inherited_box.visibility != Visibility::Visible {
+                // If the element is not visible then we'll immediatly render all children,
+                // skipping all other processing.
+                // We can't just stop here since a child can override a parents visibility.
+                for child in node.dom_children() {
+                    items.append(&mut rendered_text_collection_steps(child, state));
+                }
+                return items;
+            }
+
+            let style_box = style.get_box();
+            let display = style_box.display;
+            let mut surrounding_line_breaks = 0;
+
+            // Treat absolutely positioned or floated elements like Block elements
+            if style_box.position == Position::Absolute || style_box.float != Float::None {
+                surrounding_line_breaks = 1;
+            }
+
+            // Depending on the display property we have to do various things
+            // before we can render the child nodes.
+            match display {
+                Display::Table => {
+                    surrounding_line_breaks = 1;
+                    state.within_table = true;
+                },
+                // Step 6: If node's computed value of 'display' is 'table-cell',
+                // and node's CSS box is not the last 'table-cell' box of its
+                // enclosing 'table-row' box, then append a string containing
+                // a single U+0009 TAB code point to items.
+                Display::TableCell => {
+                    if !state.first_table_cell {
+                        items.push(InnerOrOuterTextItem::Text(String::from(
+                            "\u{0009}", /* tab */
+                        )));
+                        // Make sure we don't add a white-space we removed from the previous node
+                        state.did_truncate_trailing_white_space = false;
+                    }
+                    state.first_table_cell = false;
+                    state.within_table_content = true;
+                },
+                // Step 7: If node's computed value of 'display' is 'table-row',
+                // and node's CSS box is not the last 'table-row' box of the nearest
+                // ancestor 'table' box, then append a string containing a single U+000A
+                // LF code point to items.
+                Display::TableRow => {
+                    if !state.first_table_row {
+                        items.push(InnerOrOuterTextItem::Text(String::from(
+                            "\u{000A}", /* Line Feed */
+                        )));
+                        // Make sure we don't add a white-space we removed from the previous node
+                        state.did_truncate_trailing_white_space = false;
+                    }
+                    state.first_table_row = false;
+                    state.first_table_cell = true;
+                },
+                // Step 9: If node's used value of 'display' is block-level or 'table-caption',
+                // then append 1 (a required line break count) at the beginning and end of items.
+                Display::Block => {
+                    surrounding_line_breaks = 1;
+                },
+                Display::TableCaption => {
+                    surrounding_line_breaks = 1;
+                    state.within_table_content = true;
+                },
+                Display::InlineFlex | Display::InlineGrid | Display::InlineBlock => {
+                    // InlineBlock's are a bit strange, in that they don't produce a Linebreak, yet
+                    // disable white space truncation before and after it, making it one of the few
+                    // cases where one can have multiple white space characters following one another.
+                    if state.did_truncate_trailing_white_space {
+                        items.push(InnerOrOuterTextItem::Text(String::from(" ")));
+                        state.did_truncate_trailing_white_space = false;
+                        state.may_start_with_whitespace = true;
+                    }
+                },
+                _ => {},
+            }
+
+            match node.type_id() {
+                // Step 8: If node is a p element, then append 2 (a required line break count) at
+                // the beginning and end of items.
+                LayoutNodeType::Element(LayoutElementType::HTMLParagraphElement) => {
+                    surrounding_line_breaks = 2;
+                },
+                // Option/OptGroup elements should go on separate lines, by treating them like
+                // Block elements we can achieve that.
+                LayoutNodeType::Element(LayoutElementType::HTMLOptionElement) |
+                LayoutNodeType::Element(LayoutElementType::HTMLOptGroupElement) => {
+                    surrounding_line_breaks = 1;
+                },
+                _ => {},
+            }
+
+            if surrounding_line_breaks > 0 {
+                items.push(InnerOrOuterTextItem::RequiredLineBreakCount(
+                    surrounding_line_breaks,
+                ));
+                state.did_truncate_trailing_white_space = false;
+                state.may_start_with_whitespace = true;
+            }
+
+            match node.type_id() {
+                // Any text/content contained in these elements is ignored.
+                // However we still need to check whether we have to prepend a
+                // space, since for example <span>asd <input> qwe</span> must
+                // product "asd  qwe" (note the 2 spaces)
+                LayoutNodeType::Element(LayoutElementType::HTMLCanvasElement) |
+                LayoutNodeType::Element(LayoutElementType::HTMLImageElement) |
+                LayoutNodeType::Element(LayoutElementType::HTMLIFrameElement) |
+                LayoutNodeType::Element(LayoutElementType::HTMLObjectElement) |
+                LayoutNodeType::Element(LayoutElementType::HTMLInputElement) |
+                LayoutNodeType::Element(LayoutElementType::HTMLTextAreaElement) |
+                LayoutNodeType::Element(LayoutElementType::HTMLMediaElement) => {
+                    if display != Display::Block && state.did_truncate_trailing_white_space {
+                        items.push(InnerOrOuterTextItem::Text(String::from(" ")));
+                        state.did_truncate_trailing_white_space = false;
+                    };
+                    state.may_start_with_whitespace = false;
+                },
+                _ => {
+                    // Now we can finally iterate over all children, appending whatever
+                    // they produce to items.
+                    for child in node.dom_children() {
+                        items.append(&mut rendered_text_collection_steps(child, state));
+                    }
+                },
+            }
+
+            // Depending on the display property we still need to do some
+            // cleanup after rendering all child nodes
+            match display {
+                Display::InlineFlex | Display::InlineGrid | Display::InlineBlock => {
+                    state.did_truncate_trailing_white_space = false;
+                    state.may_start_with_whitespace = false;
+                },
+                Display::Table => {
+                    state.within_table = false;
+                },
+                Display::TableCell | Display::TableCaption => {
+                    state.within_table_content = false;
+                },
+                _ => {},
+            }
+
+            if surrounding_line_breaks > 0 {
+                items.push(InnerOrOuterTextItem::RequiredLineBreakCount(
+                    surrounding_line_breaks,
+                ));
+                state.did_truncate_trailing_white_space = false;
+                state.may_start_with_whitespace = true;
+            }
+        },
+    };
+    items
 }
 
-fn is_last_table_row() -> bool {
-    // FIXME(ferjm) Implement this.
-    false
+pub fn process_text_index_request(_node: OpaqueNode, _point: Point2D<Au>) -> Option<usize> {
+    None
+}
+
+pub fn process_resolved_font_style_query<'dom, E>(
+    context: &SharedStyleContext,
+    node: E,
+    value: &str,
+    url_data: ServoUrl,
+    shared_lock: &SharedRwLock,
+) -> Option<ServoArc<Font>>
+where
+    E: LayoutNode<'dom>,
+{
+    fn create_font_declaration(
+        value: &str,
+        url_data: &ServoUrl,
+        quirks_mode: QuirksMode,
+    ) -> Option<PropertyDeclarationBlock> {
+        let mut declarations = SourcePropertyDeclaration::default();
+        let result = parse_one_declaration_into(
+            &mut declarations,
+            PropertyId::NonCustom(ShorthandId::Font.into()),
+            value,
+            Origin::Author,
+            &UrlExtraData(url_data.get_arc()),
+            None,
+            ParsingMode::DEFAULT,
+            quirks_mode,
+            CssRuleType::Style,
+        );
+        let declarations = match result {
+            Ok(()) => {
+                let mut block = PropertyDeclarationBlock::new();
+                block.extend(declarations.drain(), Importance::Normal);
+                block
+            },
+            Err(_) => return None,
+        };
+        // TODO: Force to set line-height property to 'normal' font property.
+        Some(declarations)
+    }
+    fn resolve_for_declarations<'dom, E>(
+        context: &SharedStyleContext,
+        parent_style: Option<&ComputedValues>,
+        declarations: PropertyDeclarationBlock,
+        shared_lock: &SharedRwLock,
+    ) -> ServoArc<ComputedValues>
+    where
+        E: LayoutNode<'dom>,
+    {
+        let parent_style = match parent_style {
+            Some(parent) => parent,
+            None => context.stylist.device().default_computed_values(),
+        };
+        context
+            .stylist
+            .compute_for_declarations::<E::ConcreteElement>(
+                &context.guards,
+                parent_style,
+                ServoArc::new(shared_lock.wrap(declarations)),
+            )
+    }
+
+    // https://html.spec.whatwg.org/multipage/#dom-context-2d-font
+    // 1. Parse the given font property value
+    let quirks_mode = context.quirks_mode();
+    let declarations = create_font_declaration(value, &url_data, quirks_mode)?;
+
+    // TODO: Reject 'inherit' and 'initial' values for the font property.
+
+    // 2. Get resolved styles for the parent element
+    let element = node.as_element().unwrap();
+    let parent_style = if node.is_connected() {
+        if element.has_data() {
+            node.to_threadsafe().as_element().unwrap().style(context)
+        } else {
+            let mut tlc = ThreadLocalStyleContext::new();
+            let mut context = StyleContext {
+                shared: context,
+                thread_local: &mut tlc,
+            };
+            let styles = resolve_style(&mut context, element, RuleInclusion::All, None, None);
+            styles.primary().clone()
+        }
+    } else {
+        let default_declarations =
+            create_font_declaration("10px sans-serif", &url_data, quirks_mode).unwrap();
+        resolve_for_declarations::<E>(context, None, default_declarations, shared_lock)
+    };
+
+    // 3. Resolve the parsed value with resolved styles of the parent element
+    let computed_values =
+        resolve_for_declarations::<E>(context, Some(&*parent_style), declarations, shared_lock);
+
+    Some(computed_values.clone_font())
 }

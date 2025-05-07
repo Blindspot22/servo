@@ -10,20 +10,23 @@ use std::slice;
 use std::sync::{Arc, Mutex};
 
 use base::id::PipelineId;
+use compositing_traits::{WebrenderExternalImageRegistry, WebrenderImageHandlerType};
 use ipc_channel::ipc::{IpcReceiver, IpcSender, IpcSharedMemory};
 use log::{info, warn};
 use servo_config::pref;
+use webgpu_traits::{
+    Adapter, ComputePassId, DeviceLostReason, Error, ErrorScope, Mapping, Pipeline, PopError,
+    RenderPassId, ShaderCompilationInfo, WebGPU, WebGPUAdapter, WebGPUContextId, WebGPUDevice,
+    WebGPUMsg, WebGPUQueue, WebGPURequest, apply_render_command,
+};
 use webrender::{RenderApi, RenderApiSender};
 use webrender_api::{DocumentId, ExternalImageId};
-use webrender_traits::{WebrenderExternalImageRegistry, WebrenderImageHandlerType};
 use wgc::command::{ComputePass, ComputePassDescriptor, RenderPass};
-use wgc::device::queue::SubmittedWorkDoneClosure;
-use wgc::device::{DeviceDescriptor, DeviceLostClosure, ImplicitPipelineIds};
+use wgc::device::{DeviceDescriptor, ImplicitPipelineIds};
 use wgc::id;
 use wgc::id::DeviceId;
-use wgc::instance::parse_backends_from_comma_list;
 use wgc::pipeline::ShaderModuleDescriptor;
-use wgc::resource::{BufferMapCallback, BufferMapOperation};
+use wgc::resource::BufferMapOperation;
 use wgpu_core::command::RenderPassDescriptor;
 use wgpu_core::device::DeviceError;
 use wgpu_core::pipeline::{CreateComputePipelineError, CreateRenderPipelineError};
@@ -32,14 +35,8 @@ use wgpu_types::MemoryHints;
 use wgt::InstanceDescriptor;
 pub use {wgpu_core as wgc, wgpu_types as wgt};
 
-use crate::gpu_error::ErrorScope;
 use crate::poll_thread::Poller;
-use crate::render_commands::apply_render_command;
-use crate::swapchain::{WGPUImageMap, WebGPUContextId};
-use crate::{
-    Adapter, ComputePassId, Error, Mapping, Pipeline, PopError, RenderPassId, WebGPU,
-    WebGPUAdapter, WebGPUDevice, WebGPUMsg, WebGPUQueue, WebGPURequest, WebGPUResponse,
-};
+use crate::swapchain::WGPUImageMap;
 
 #[derive(Eq, Hash, PartialEq)]
 pub(crate) struct DeviceScope {
@@ -128,7 +125,7 @@ impl WGPU {
         external_images: Arc<Mutex<WebrenderExternalImageRegistry>>,
         wgpu_image_map: WGPUImageMap,
     ) -> Self {
-        let backend_pref = pref!(dom.webgpu.wgpu_backend);
+        let backend_pref = pref!(dom_webgpu_wgpu_backend);
         let backends = if backend_pref.is_empty() {
             wgt::Backends::PRIMARY
         } else {
@@ -136,11 +133,11 @@ impl WGPU {
                 "Selecting backends based on dom.webgpu.wgpu_backend pref: {:?}",
                 backend_pref
             );
-            parse_backends_from_comma_list(&backend_pref)
+            wgt::Backends::from_comma_list(&backend_pref)
         };
         let global = Arc::new(wgc::global::Global::new(
             "wgpu-core",
-            InstanceDescriptor {
+            &InstanceDescriptor {
                 backends,
                 ..Default::default()
             },
@@ -178,34 +175,30 @@ impl WGPU {
                         let glob = Arc::clone(&self.global);
                         let resp_sender = sender.clone();
                         let token = self.poller.token();
-                        let callback = BufferMapCallback::from_rust(Box::from(
-                            move |result: BufferAccessResult| {
-                                drop(token);
-                                let response = result.and_then(|_| {
-                                    let global = &glob;
-                                    let (slice_pointer, range_size) =
-                                        global.buffer_get_mapped_range(buffer_id, offset, size)?;
-                                    // SAFETY: guarantee to be safe from wgpu
-                                    let data = unsafe {
-                                        slice::from_raw_parts(
-                                            slice_pointer.as_ptr(),
-                                            range_size as usize,
-                                        )
-                                    };
+                        let callback = Box::from(move |result: BufferAccessResult| {
+                            drop(token);
+                            let response = result.and_then(|_| {
+                                let global = &glob;
+                                let (slice_pointer, range_size) =
+                                    global.buffer_get_mapped_range(buffer_id, offset, size)?;
+                                // SAFETY: guarantee to be safe from wgpu
+                                let data = unsafe {
+                                    slice::from_raw_parts(
+                                        slice_pointer.as_ptr(),
+                                        range_size as usize,
+                                    )
+                                };
 
-                                    Ok(Mapping {
-                                        data: IpcSharedMemory::from_bytes(data),
-                                        range: offset..offset + range_size,
-                                        mode: host_map,
-                                    })
-                                });
-                                if let Err(e) =
-                                    resp_sender.send(WebGPUResponse::BufferMapAsync(response))
-                                {
-                                    warn!("Could not send BufferMapAsync Response ({})", e);
-                                }
-                            },
-                        ));
+                                Ok(Mapping {
+                                    data: IpcSharedMemory::from_bytes(data),
+                                    range: offset..offset + range_size,
+                                    mode: host_map,
+                                })
+                            });
+                            if let Err(e) = resp_sender.send(response) {
+                                warn!("Could not send BufferMapAsync Response ({})", e);
+                            }
+                        });
 
                         let operation = BufferMapOperation {
                             host: host_map,
@@ -396,8 +389,8 @@ impl WGPU {
                                 }),
                                 Some(e) => Err(Error::from_error(e)),
                             };
-                            if let Err(e) = sender.send(WebGPUResponse::ComputePipeline(res)) {
-                                warn!("Failed sending WebGPUResponse::ComputePipeline {e:?}");
+                            if let Err(e) = sender.send(res) {
+                                warn!("Failed sending WebGPUComputePipelineResponse {e:?}");
                             }
                         } else {
                             self.maybe_dispatch_wgpu_error(device_id, error);
@@ -455,8 +448,8 @@ impl WGPU {
                                 }),
                                 Some(e) => Err(Error::from_error(e)),
                             };
-                            if let Err(e) = sender.send(WebGPUResponse::RenderPipeline(res)) {
-                                warn!("Failed sending WebGPUResponse::RenderPipeline {e:?}");
+                            if let Err(e) = sender.send(res) {
+                                warn!("Failed sending WebGPURenderPipelineResponse {e:?}");
                             }
                         } else {
                             self.maybe_dispatch_wgpu_error(device_id, error);
@@ -484,7 +477,7 @@ impl WGPU {
                             wgpu_core::pipeline::ShaderModuleSource::Wgsl(Cow::Borrowed(&program));
                         let desc = ShaderModuleDescriptor {
                             label: label.map(|s| s.into()),
-                            shader_bound_checks: wgt::ShaderBoundChecks::default(),
+                            runtime_checks: wgt::ShaderRuntimeChecks::checked(),
                         };
                         let (_, error) = global.device_create_shader_module(
                             device_id,
@@ -492,12 +485,12 @@ impl WGPU {
                             source,
                             Some(program_id),
                         );
-                        if let Err(e) = sender.send(WebGPUResponse::CompilationInfo(
+                        if let Err(e) = sender.send(
                             error
                                 .as_ref()
-                                .map(|e| crate::ShaderCompilationInfo::from(e, &program)),
-                        )) {
-                            warn!("Failed to send WebGPUResponse::CompilationInfo {e:?}");
+                                .map(|e| ShaderCompilationInfo::from(e, &program)),
+                        ) {
+                            warn!("Failed to send CompilationInfo {e:?}");
                         }
                         self.maybe_dispatch_wgpu_error(device_id, error);
                     },
@@ -535,6 +528,9 @@ impl WGPU {
                             log::error!("Error occured in SwapChainPresent: {e:?}");
                         }
                     },
+                    WebGPURequest::GetImage { context_id, sender } => {
+                        sender.send(self.get_image(context_id)).unwrap()
+                    },
                     WebGPURequest::ValidateTextureDescriptor {
                         device_id,
                         texture_id,
@@ -551,21 +547,7 @@ impl WGPU {
                         {
                             warn!("Unable to send FreeTexture({:?}) ({:?})", texture_id, e);
                         };
-                        if let Some(error) = error {
-                            self.dispatch_error(device_id, Error::from_error(error));
-                            continue;
-                        }
-                        // Supported context formats
-                        // TODO: wgt::TextureFormat::Rgba16Float, when wr supports HDR
-                        if !matches!(
-                            descriptor.format,
-                            wgt::TextureFormat::Bgra8Unorm | wgt::TextureFormat::Rgba8Unorm
-                        ) {
-                            self.dispatch_error(
-                                device_id,
-                                Error::Validation("Unsupported context format".to_string()),
-                            );
-                        }
+                        self.maybe_dispatch_wgpu_error(device_id, error);
                     },
                     WebGPURequest::DestroyContext { context_id } => {
                         self.destroy_context(context_id);
@@ -682,9 +664,10 @@ impl WGPU {
                                     limits,
                                     channel: WebGPU(self.sender.clone()),
                                 }
-                            });
+                            })
+                            .map_err(|err| err.to_string());
 
-                        if let Err(e) = sender.send(WebGPUResponse::Adapter(response)) {
+                        if let Err(e) = sender.send(Some(response)) {
                             warn!(
                                 "Failed to send response to WebGPURequest::RequestAdapter ({})",
                                 e
@@ -704,6 +687,7 @@ impl WGPU {
                             required_features: descriptor.required_features,
                             required_limits: descriptor.required_limits.clone(),
                             memory_hints: MemoryHints::MemoryUsage,
+                            trace: wgpu_types::Trace::Off,
                         };
                         let global = &self.global;
                         let device = WebGPUDevice(device_id);
@@ -712,7 +696,6 @@ impl WGPU {
                             .adapter_request_device(
                                 adapter_id.0,
                                 &desc,
-                                None,
                                 Some(device_id),
                                 Some(queue_id),
                             )
@@ -725,45 +708,35 @@ impl WGPU {
                                 }
                                 let script_sender = self.script_sender.clone();
                                 let devices = Arc::clone(&self.devices);
-                                let callback =
-                                    DeviceLostClosure::from_rust(Box::from(move |reason, msg| {
-                                        let reason = match reason {
-                                            wgt::DeviceLostReason::Unknown => {
-                                                crate::DeviceLostReason::Unknown
-                                            },
-                                            wgt::DeviceLostReason::Destroyed => {
-                                                crate::DeviceLostReason::Destroyed
-                                            },
-                                            // we handle this in WebGPUMsg::FreeDevice
-                                            wgt::DeviceLostReason::Dropped => return,
-                                            wgt::DeviceLostReason::ReplacedCallback => {
-                                                panic!(
-                                                    "DeviceLost callback should only be set once"
-                                                )
-                                            },
-                                        };
-                                        // make device lost by removing error scopes stack
-                                        let _ = devices
-                                            .lock()
-                                            .unwrap()
-                                            .get_mut(&device_id)
-                                            .expect("Device should not be dropped by this point")
-                                            .error_scope_stack
-                                            .take();
-                                        if let Err(e) = script_sender.send(WebGPUMsg::DeviceLost {
-                                            device,
-                                            pipeline_id,
-                                            reason,
-                                            msg,
-                                        }) {
-                                            warn!("Failed to send WebGPUMsg::DeviceLost: {e}");
-                                        }
-                                    }));
+                                let callback = Box::from(move |reason, msg| {
+                                    let reason = match reason {
+                                        wgt::DeviceLostReason::Unknown => DeviceLostReason::Unknown,
+                                        wgt::DeviceLostReason::Destroyed => {
+                                            DeviceLostReason::Destroyed
+                                        },
+                                    };
+                                    // make device lost by removing error scopes stack
+                                    let _ = devices
+                                        .lock()
+                                        .unwrap()
+                                        .get_mut(&device_id)
+                                        .expect("Device should not be dropped by this point")
+                                        .error_scope_stack
+                                        .take();
+                                    if let Err(e) = script_sender.send(WebGPUMsg::DeviceLost {
+                                        device,
+                                        pipeline_id,
+                                        reason,
+                                        msg,
+                                    }) {
+                                        warn!("Failed to send WebGPUMsg::DeviceLost: {e}");
+                                    }
+                                });
                                 global.device_set_device_lost_closure(device_id, callback);
                                 descriptor
-                            });
-                        if let Err(e) = sender.send(WebGPUResponse::Device((device, queue, result)))
-                        {
+                            })
+                            .map_err(Into::into);
+                        if let Err(e) = sender.send((device, queue, result)) {
                             warn!(
                                 "Failed to send response to WebGPURequest::RequestDevice ({})",
                                 e
@@ -777,7 +750,7 @@ impl WGPU {
                         device_id: _device_id,
                     } => {
                         let global = &self.global;
-                        let (pass, error) = global.command_encoder_create_compute_pass(
+                        let (pass, error) = global.command_encoder_begin_compute_pass(
                             command_encoder_id,
                             &ComputePassDescriptor {
                                 label,
@@ -931,7 +904,7 @@ impl WGPU {
                             occlusion_query_set: None,
                         };
                         let (pass, error) =
-                            global.command_encoder_create_render_pass(command_encoder_id, desc);
+                            global.command_encoder_begin_render_pass(command_encoder_id, desc);
                         assert!(
                             self.render_passes
                                 .insert(render_pass_id, Pass::new(pass, error.is_none()))
@@ -1009,25 +982,21 @@ impl WGPU {
                         };
                         self.maybe_dispatch_error(device_id, result.err());
                     },
-                    WebGPURequest::UnmapBuffer {
-                        buffer_id,
-                        array_buffer,
-                        write_back,
-                        offset,
-                        size,
-                    } => {
+                    WebGPURequest::UnmapBuffer { buffer_id, mapping } => {
                         let global = &self.global;
-                        if write_back {
-                            if let Ok((slice_pointer, range_size)) =
-                                global.buffer_get_mapped_range(buffer_id, offset, Some(size))
-                            {
+                        if let Some(mapping) = mapping {
+                            if let Ok((slice_pointer, range_size)) = global.buffer_get_mapped_range(
+                                buffer_id,
+                                mapping.range.start,
+                                Some(mapping.range.end - mapping.range.start),
+                            ) {
                                 unsafe {
                                     slice::from_raw_parts_mut(
                                         slice_pointer.as_ptr(),
                                         range_size as usize,
                                     )
                                 }
-                                .copy_from_slice(&array_buffer);
+                                .copy_from_slice(&mapping.data);
                             }
                         }
                         // Ignore result because this operation always succeed from user perspective
@@ -1073,12 +1042,12 @@ impl WGPU {
                     WebGPURequest::QueueOnSubmittedWorkDone { sender, queue_id } => {
                         let global = &self.global;
                         let token = self.poller.token();
-                        let callback = SubmittedWorkDoneClosure::from_rust(Box::from(move || {
+                        let callback = Box::from(move || {
                             drop(token);
-                            if let Err(e) = sender.send(WebGPUResponse::SubmittedWorkDone) {
+                            if let Err(e) = sender.send(()) {
                                 warn!("Could not send SubmittedWorkDone Response ({})", e);
                             }
-                        }));
+                        });
                         global.queue_on_submitted_work_done(queue_id, callback);
                         self.poller.wake();
                     },
@@ -1214,25 +1183,21 @@ impl WGPU {
                             .expect("Device should not be dropped by this point");
                         if let Some(error_scope_stack) = &mut device_scope.error_scope_stack {
                             if let Some(error_scope) = error_scope_stack.pop() {
-                                if let Err(e) = sender.send(WebGPUResponse::PoppedErrorScope(Ok(
+                                if let Err(e) = sender.send(Ok(
                                     // TODO: Do actual selection instead of selecting first error
                                     error_scope.errors.first().cloned(),
-                                ))) {
+                                )) {
                                     warn!(
                                         "Unable to send {:?} to poperrorscope: {e:?}",
                                         error_scope.errors
                                     );
                                 }
-                            } else if let Err(e) =
-                                sender.send(WebGPUResponse::PoppedErrorScope(Err(PopError::Empty)))
-                            {
+                            } else if let Err(e) = sender.send(Err(PopError::Empty)) {
                                 warn!("Unable to send PopError::Empty: {e:?}");
                             }
                         } else {
                             // device lost
-                            if let Err(e) =
-                                sender.send(WebGPUResponse::PoppedErrorScope(Err(PopError::Lost)))
-                            {
+                            if let Err(e) = sender.send(Err(PopError::Lost)) {
                                 warn!("Unable to send PopError::Lost due {e:?}");
                             }
                         }
@@ -1320,7 +1285,7 @@ impl WGPU {
         encoder_id: id::CommandEncoderId,
         result: &Result<U, T>,
     ) {
-        if let Err(ref e) = result {
+        if let Err(e) = result {
             self.error_command_encoders
                 .entry(encoder_id)
                 .or_insert_with(|| format!("{:?}", e));

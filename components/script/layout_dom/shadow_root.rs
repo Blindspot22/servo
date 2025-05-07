@@ -18,7 +18,7 @@ pub struct ServoShadowRoot<'dom> {
     shadow_root: LayoutDom<'dom, ShadowRoot>,
 }
 
-impl<'dom> fmt::Debug for ServoShadowRoot<'dom> {
+impl fmt::Debug for ServoShadowRoot<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         self.as_node().fmt(f)
     }
@@ -48,6 +48,12 @@ impl<'dom> ServoShadowRoot<'dom> {
         ServoShadowRoot { shadow_root }
     }
 
+    /// Flush the stylesheets for the underlying shadow root.
+    ///
+    /// # Safety
+    ///
+    /// This modifies a DOM object, so should care should be taken that only one
+    /// thread has a reference to this object.
     pub unsafe fn flush_stylesheets(
         &self,
         stylist: &mut Stylist,

@@ -14,9 +14,10 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use servo_url::ServoUrl;
 
+use crate::StreamId;
 use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
 use crate::protocol::JsonPacketStream;
-use crate::StreamId;
+use crate::resource::{ResourceAvailable, ResourceAvailableReply};
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -30,7 +31,7 @@ pub(crate) struct WorkerActor {
     pub name: String,
     pub console: String,
     pub thread: String,
-    pub id: WorkerId,
+    pub worker_id: WorkerId,
     pub url: ServoUrl,
     pub type_: WorkerType,
     pub script_chan: IpcSender<DevtoolScriptControlMsg>,
@@ -43,13 +44,25 @@ impl WorkerActor {
             actor: self.name.clone(),
             console_actor: self.console.clone(),
             thread_actor: self.thread.clone(),
-            id: self.id.0.to_string(),
+            id: self.worker_id.0.to_string(),
             url: self.url.to_string(),
             traits: WorkerTraits {
                 is_parent_intercept_enabled: false,
+                supports_top_level_target_flag: false,
             },
             type_: self.type_ as u32,
+            target_type: "worker".to_string(),
         }
+    }
+}
+
+impl ResourceAvailable for WorkerActor {
+    fn actor_name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn get_streams(&self) -> &RefCell<HashMap<StreamId, TcpStream>> {
+        &self.streams
     }
 }
 
@@ -63,7 +76,7 @@ impl Actor for WorkerActor {
         msg_type: &str,
         _msg: &Map<String, Value>,
         stream: &mut TcpStream,
-        id: StreamId,
+        stream_id: StreamId,
     ) -> Result<ActorMessageStatus, ()> {
         Ok(match msg_type {
             "attach" => {
@@ -77,7 +90,7 @@ impl Actor for WorkerActor {
                 }
                 self.streams
                     .borrow_mut()
-                    .insert(id, stream.try_clone().unwrap());
+                    .insert(stream_id, stream.try_clone().unwrap());
                 // FIXME: fix messages to not require forging a pipeline for worker messages
                 self.script_chan
                     .send(WantsLiveNotifications(TEST_PIPELINE_ID, true))
@@ -102,7 +115,7 @@ impl Actor for WorkerActor {
                     type_: "detached".to_string(),
                 };
                 let _ = stream.write_json_packet(&msg);
-                self.cleanup(id);
+                self.cleanup(stream_id);
                 ActorMessageStatus::Processed
             },
 
@@ -110,12 +123,34 @@ impl Actor for WorkerActor {
         })
     }
 
-    fn cleanup(&self, id: StreamId) {
-        self.streams.borrow_mut().remove(&id);
+    fn cleanup(&self, stream_id: StreamId) {
+        self.streams.borrow_mut().remove(&stream_id);
         if self.streams.borrow().is_empty() {
             self.script_chan
                 .send(WantsLiveNotifications(TEST_PIPELINE_ID, false))
                 .unwrap();
+        }
+    }
+}
+
+impl WorkerActor {
+    pub(crate) fn resource_available<T: Serialize>(&self, resource: T, resource_type: String) {
+        self.resources_available(vec![resource], resource_type);
+    }
+
+    pub(crate) fn resources_available<T: Serialize>(
+        &self,
+        resources: Vec<T>,
+        resource_type: String,
+    ) {
+        let msg = ResourceAvailableReply::<T> {
+            from: self.name(),
+            type_: "resources-available-array".into(),
+            array: vec![(resource_type, resources)],
+        };
+
+        for stream in self.streams.borrow_mut().values_mut() {
+            let _ = stream.write_json_packet(&msg);
         }
     }
 }
@@ -149,6 +184,7 @@ struct ConnectReply {
 #[serde(rename_all = "camelCase")]
 struct WorkerTraits {
     is_parent_intercept_enabled: bool,
+    supports_top_level_target_flag: bool,
 }
 
 #[derive(Serialize)]
@@ -162,4 +198,6 @@ pub(crate) struct WorkerMsg {
     traits: WorkerTraits,
     #[serde(rename = "type")]
     type_: u32,
+    #[serde(rename = "targetType")]
+    target_type: String,
 }

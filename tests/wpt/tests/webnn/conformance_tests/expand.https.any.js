@@ -1,5 +1,5 @@
 // META: title=test WebNN API expand operation
-// META: global=window,dedicatedworker
+// META: global=window
 // META: variant=?cpu
 // META: variant=?gpu
 // META: variant=?npu
@@ -724,7 +724,7 @@ const expandTests = [
 if (navigator.ml) {
   expandTests.forEach((test) => {
     webnn_conformance_test(
-        buildGraphAndCompute, getExpandPrecisionTolerance, test);
+        buildAndExecuteGraph, getExpandPrecisionTolerance, test);
   });
 } else {
   test(() => assert_implements(navigator.ml, 'missing navigator.ml'));

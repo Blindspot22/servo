@@ -15,15 +15,17 @@ use style::font_metrics::FontMetrics;
 use style::media_queries::{Device, MediaType};
 use style::properties::style_structs::Font;
 use style::properties::{ComputedValues, CustomDeclaration, CustomDeclarationValue, StyleBuilder};
+use style::queries::values::PrefersColorScheme;
 use style::rule_cache::RuleCacheConditions;
 use style::rule_tree::CascadeLevel;
 use style::servo::media_queries::FontMetricsProvider;
+use style::stylesheets::UrlExtraData;
 use style::stylesheets::container_rule::ContainerSizeQuery;
 use style::stylesheets::layer_rule::LayerOrder;
-use style::stylesheets::UrlExtraData;
 use style::stylist::Stylist;
 use style::values::computed::font::GenericFontFamily;
 use style::values::computed::{Context, Length};
+use style::values::specified::font::QueryFontMetricsFlags;
 use test::{self, Bencher};
 use url::Url;
 
@@ -36,8 +38,7 @@ impl FontMetricsProvider for DummyMetricsProvider {
         _vertical: bool,
         _font: &Font,
         _base_size: Length,
-        _in_media_query: bool,
-        _retrieve_math_scales: bool,
+        _flags: QueryFontMetricsFlags,
     ) -> FontMetrics {
         Default::default()
     }
@@ -57,7 +58,7 @@ fn cascade(
             let mut input = ParserInput::new(value);
             let mut parser = Parser::new(&mut input);
             let name = Name::from(name);
-            let value = CustomDeclarationValue::Value(Arc::new(
+            let value = CustomDeclarationValue::Unparsed(Arc::new(
                 SpecifiedValue::parse(&mut parser, &dummy_url_data).unwrap(),
             ));
             CustomDeclaration { name, value }
@@ -72,6 +73,7 @@ fn cascade(
         Scale::new(1.0),
         Box::new(DummyMetricsProvider),
         initial_style,
+        PrefersColorScheme::Light,
     );
     let stylist = Stylist::new(device, QuirksMode::NoQuirks);
     let mut builder = StyleBuilder::new(stylist.device(), Some(&stylist), None, None, None, false);

@@ -3,28 +3,36 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cmp;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
+use std::ptr::NonNull;
 
 use base::id::{BrowsingContextId, PipelineId};
 use cookie::Cookie;
+use embedder_traits::{
+    WebDriverCookieError, WebDriverFrameId, WebDriverJSError, WebDriverJSResult, WebDriverJSValue,
+};
 use euclid::default::{Point2D, Rect, Size2D};
 use hyper_serde::Serde;
 use ipc_channel::ipc::{self, IpcSender};
-use js::jsapi::{HandleValueArray, JSAutoRealm, JSContext, JSType, JS_IsExceptionPending};
+use js::jsapi::{
+    self, GetPropertyKeys, HandleValueArray, JS_GetOwnPropertyDescriptorById, JS_GetPropertyById,
+    JS_IsExceptionPending, JSAutoRealm, JSContext, JSType, PropertyDescriptor,
+};
 use js::jsval::UndefinedValue;
 use js::rust::wrappers::{JS_CallFunctionName, JS_GetProperty, JS_HasOwnProperty, JS_TypeOfValue};
-use js::rust::{HandleObject, HandleValue};
-use net_traits::CookieSource::{NonHTTP, HTTP};
-use net_traits::CoreResourceMsg::{DeleteCookies, GetCookiesDataForUrl, SetCookieForUrl};
-use net_traits::IpcSend;
-use script_traits::webdriver_msg::{
-    WebDriverCookieError, WebDriverFrameId, WebDriverJSError, WebDriverJSResult, WebDriverJSValue,
+use js::rust::{HandleObject, HandleValue, IdVector, ToString};
+use net_traits::CookieSource::{HTTP, NonHTTP};
+use net_traits::CoreResourceMsg::{
+    DeleteCookie, DeleteCookies, GetCookiesDataForUrl, SetCookieForUrl,
 };
+use net_traits::IpcSend;
+use script_bindings::conversions::is_array_like;
 use servo_url::ServoUrl;
 use webdriver::common::{WebElement, WebFrame, WebWindow};
 use webdriver::error::ErrorStatus;
 
+use crate::document_collection::DocumentCollection;
 use crate::dom::bindings::codegen::Bindings::CSSStyleDeclarationBinding::CSSStyleDeclarationMethods;
 use crate::dom::bindings::codegen::Bindings::DOMRectBinding::DOMRectMethods;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::DocumentMethods;
@@ -37,14 +45,15 @@ use crate::dom::bindings::codegen::Bindings::NodeBinding::{GetRootNodeOptions, N
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::codegen::Bindings::XMLSerializerBinding::XMLSerializerMethods;
 use crate::dom::bindings::conversions::{
-    get_property, get_property_jsval, is_array_like, root_from_object, ConversionBehavior,
-    ConversionResult, FromJSValConvertible, StringificationBehavior,
+    ConversionBehavior, ConversionResult, FromJSValConvertible, StringificationBehavior,
+    get_property, get_property_jsval, jsid_to_string, jsstring_to_str, root_from_object,
 };
-use crate::dom::bindings::error::{throw_dom_exception, Error};
+use crate::dom::bindings::error::{Error, report_pending_exception, throw_dom_exception};
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::DomObject;
+use crate::dom::bindings::reflector::{DomGlobal, DomObject};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
+use crate::dom::document::Document;
 use crate::dom::element::Element;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
@@ -52,28 +61,44 @@ use crate::dom::htmldatalistelement::HTMLDataListElement;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmliframeelement::HTMLIFrameElement;
 use crate::dom::htmlinputelement::{HTMLInputElement, InputType};
+use crate::dom::htmloptgroupelement::HTMLOptGroupElement;
 use crate::dom::htmloptionelement::HTMLOptionElement;
 use crate::dom::htmlselectelement::HTMLSelectElement;
-use crate::dom::node::{window_from_node, Node, ShadowIncluding};
+use crate::dom::node::{Node, NodeTraits, ShadowIncluding};
 use crate::dom::nodelist::NodeList;
 use crate::dom::window::Window;
 use crate::dom::xmlserializer::XMLSerializer;
-use crate::realms::enter_realm;
+use crate::realms::{AlreadyInRealm, InRealm, enter_realm};
 use crate::script_module::ScriptFetchOptions;
 use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
-use crate::script_thread::{Documents, ScriptThread};
+use crate::script_thread::ScriptThread;
 
 fn find_node_by_unique_id(
-    documents: &Documents,
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     node_id: String,
 ) -> Result<DomRoot<Node>, ErrorStatus> {
-    match documents.find_document(pipeline).and_then(|document| {
-        document
-            .upcast::<Node>()
-            .traverse_preorder(ShadowIncluding::Yes)
-            .find(|node| node.unique_id() == node_id)
-    }) {
+    match documents.find_document(pipeline) {
+        Some(doc) => find_node_by_unique_id_in_document(&doc, node_id),
+        None => {
+            if ScriptThread::has_node_id(&node_id) {
+                Err(ErrorStatus::StaleElementReference)
+            } else {
+                Err(ErrorStatus::NoSuchElement)
+            }
+        },
+    }
+}
+
+pub(crate) fn find_node_by_unique_id_in_document(
+    document: &Document,
+    node_id: String,
+) -> Result<DomRoot<Node>, ErrorStatus> {
+    match document
+        .upcast::<Node>()
+        .traverse_preorder(ShadowIncluding::Yes)
+        .find(|node| node.unique_id() == node_id)
+    {
         Some(node) => Ok(node),
         None => {
             if ScriptThread::has_node_id(&node_id) {
@@ -141,13 +166,23 @@ unsafe fn object_has_to_json_property(
         rooted!(in(cx) let mut value = UndefinedValue());
         let result = JS_GetProperty(cx, object, name.as_ptr(), value.handle_mut());
         if !result {
-            throw_dom_exception(SafeJSContext::from_ptr(cx), global_scope, Error::JSFailed);
+            throw_dom_exception(
+                SafeJSContext::from_ptr(cx),
+                global_scope,
+                Error::JSFailed,
+                CanGc::note(),
+            );
             false
         } else {
             result && JS_TypeOfValue(cx, value.handle()) == JSType::JSTYPE_FUNCTION
         }
     } else if JS_IsExceptionPending(cx) {
-        throw_dom_exception(SafeJSContext::from_ptr(cx), global_scope, Error::JSFailed);
+        throw_dom_exception(
+            SafeJSContext::from_ptr(cx),
+            global_scope,
+            Error::JSFailed,
+            CanGc::note(),
+        );
         false
     } else {
         false
@@ -155,11 +190,53 @@ unsafe fn object_has_to_json_property(
 }
 
 #[allow(unsafe_code)]
-pub unsafe fn jsval_to_webdriver(
+/// <https://w3c.github.io/webdriver/#dfn-collection>
+unsafe fn is_arguments_object(cx: *mut JSContext, value: HandleValue) -> bool {
+    rooted!(in(cx) let class_name = ToString(cx, value));
+    let Some(class_name) = NonNull::new(class_name.get()) else {
+        return false;
+    };
+    jsstring_to_str(cx, class_name) == "[object Arguments]"
+}
+
+#[derive(Eq, Hash, PartialEq)]
+struct HashableJSVal(u64);
+
+impl From<HandleValue<'_>> for HashableJSVal {
+    fn from(v: HandleValue<'_>) -> HashableJSVal {
+        HashableJSVal(v.get().asBits_)
+    }
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn jsval_to_webdriver(
+    cx: SafeJSContext,
+    global_scope: &GlobalScope,
+    val: HandleValue,
+    realm: InRealm,
+    can_gc: CanGc,
+) -> WebDriverJSResult {
+    let mut seen = HashSet::new();
+    let result = unsafe { jsval_to_webdriver_inner(*cx, global_scope, val, &mut seen) };
+    if result.is_err() {
+        report_pending_exception(cx, true, realm, can_gc);
+    }
+    result
+}
+
+#[allow(unsafe_code)]
+unsafe fn jsval_to_webdriver_inner(
     cx: *mut JSContext,
     global_scope: &GlobalScope,
     val: HandleValue,
+    seen: &mut HashSet<HashableJSVal>,
 ) -> WebDriverJSResult {
+    let hashable = val.into();
+    if seen.contains(&hashable) {
+        return Err(WebDriverJSError::JSError);
+    }
+    seen.insert(hashable);
+
     let _ac = enter_realm(global_scope);
     if val.get().is_undefined() {
         Ok(WebDriverJSValue::Undefined)
@@ -167,7 +244,14 @@ pub unsafe fn jsval_to_webdriver(
         Ok(WebDriverJSValue::Null)
     } else if val.get().is_boolean() {
         Ok(WebDriverJSValue::Boolean(val.get().to_boolean()))
-    } else if val.get().is_double() || val.get().is_int32() {
+    } else if val.get().is_int32() {
+        Ok(WebDriverJSValue::Int(
+            match FromJSValConvertible::from_jsval(cx, val, ConversionBehavior::Default).unwrap() {
+                ConversionResult::Success(c) => c,
+                _ => unreachable!(),
+            },
+        ))
+    } else if val.get().is_double() {
         Ok(WebDriverJSValue::Number(
             match FromJSValConvertible::from_jsval(cx, val, ()).unwrap() {
                 ConversionResult::Success(c) => c,
@@ -191,7 +275,7 @@ pub unsafe fn jsval_to_webdriver(
         });
         let _ac = JSAutoRealm::new(cx, *object);
 
-        if is_array_like(cx, val) {
+        if is_array_like::<crate::DomTypeHolder>(cx, val) || is_arguments_object(cx, val) {
             let mut result: Vec<WebDriverJSValue> = Vec::new();
 
             let length = match get_property::<u32>(
@@ -205,7 +289,12 @@ pub unsafe fn jsval_to_webdriver(
                     _ => return Err(WebDriverJSError::UnknownType),
                 },
                 Err(error) => {
-                    throw_dom_exception(SafeJSContext::from_ptr(cx), global_scope, error);
+                    throw_dom_exception(
+                        SafeJSContext::from_ptr(cx),
+                        global_scope,
+                        error,
+                        CanGc::note(),
+                    );
                     return Err(WebDriverJSError::JSError);
                 },
             };
@@ -213,12 +302,19 @@ pub unsafe fn jsval_to_webdriver(
             for i in 0..length {
                 rooted!(in(cx) let mut item = UndefinedValue());
                 match get_property_jsval(cx, object.handle(), &i.to_string(), item.handle_mut()) {
-                    Ok(_) => match jsval_to_webdriver(cx, global_scope, item.handle()) {
-                        Ok(converted_item) => result.push(converted_item),
-                        err @ Err(_) => return err,
+                    Ok(_) => {
+                        match jsval_to_webdriver_inner(cx, global_scope, item.handle(), seen) {
+                            Ok(converted_item) => result.push(converted_item),
+                            err @ Err(_) => return err,
+                        }
                     },
                     Err(error) => {
-                        throw_dom_exception(SafeJSContext::from_ptr(cx), global_scope, error);
+                        throw_dom_exception(
+                            SafeJSContext::from_ptr(cx),
+                            global_scope,
+                            error,
+                            CanGc::note(),
+                        );
                         return Err(WebDriverJSError::JSError);
                     },
                 }
@@ -233,9 +329,7 @@ pub unsafe fn jsval_to_webdriver(
             let window_proxy = window.window_proxy();
             if window_proxy.is_browsing_context_discarded() {
                 Err(WebDriverJSError::StaleElementReference)
-            } else if window_proxy.browsing_context_id() ==
-                window_proxy.top_level_browsing_context_id()
-            {
+            } else if window_proxy.browsing_context_id() == window_proxy.webview_id() {
                 Ok(WebDriverJSValue::Window(WebWindow(
                     window.Document().upcast::<Node>().unique_id(),
                 )))
@@ -251,29 +345,67 @@ pub unsafe fn jsval_to_webdriver(
                 cx,
                 object.handle(),
                 name.as_ptr(),
-                &HandleValueArray::new(),
+                &HandleValueArray::empty(),
                 value.handle_mut(),
             ) {
-                jsval_to_webdriver(cx, global_scope, value.handle())
+                jsval_to_webdriver_inner(cx, global_scope, value.handle(), seen)
             } else {
-                throw_dom_exception(SafeJSContext::from_ptr(cx), global_scope, Error::JSFailed);
+                throw_dom_exception(
+                    SafeJSContext::from_ptr(cx),
+                    global_scope,
+                    Error::JSFailed,
+                    CanGc::note(),
+                );
                 Err(WebDriverJSError::JSError)
             }
         } else {
             let mut result = HashMap::new();
 
-            let common_properties = ["x", "y", "width", "height", "key"];
-            for property in common_properties.iter() {
-                rooted!(in(cx) let mut item = UndefinedValue());
-                if get_property_jsval(cx, object.handle(), property, item.handle_mut()).is_ok() {
-                    if !item.is_undefined() {
-                        if let Ok(value) = jsval_to_webdriver(cx, global_scope, item.handle()) {
-                            result.insert(property.to_string(), value);
-                        }
-                    }
-                } else {
-                    throw_dom_exception(SafeJSContext::from_ptr(cx), global_scope, Error::JSFailed);
+            let mut ids = IdVector::new(cx);
+            if !GetPropertyKeys(
+                cx,
+                object.handle().into(),
+                jsapi::JSITER_OWNONLY,
+                ids.handle_mut(),
+            ) {
+                return Err(WebDriverJSError::JSError);
+            }
+            for id in ids.iter() {
+                rooted!(in(cx) let id = *id);
+                rooted!(in(cx) let mut desc = PropertyDescriptor::default());
+
+                let mut is_none = false;
+                if !JS_GetOwnPropertyDescriptorById(
+                    cx,
+                    object.handle().into(),
+                    id.handle().into(),
+                    desc.handle_mut().into(),
+                    &mut is_none,
+                ) {
                     return Err(WebDriverJSError::JSError);
+                }
+
+                rooted!(in(cx) let mut property = UndefinedValue());
+                if !JS_GetPropertyById(
+                    cx,
+                    object.handle().into(),
+                    id.handle().into(),
+                    property.handle_mut().into(),
+                ) {
+                    return Err(WebDriverJSError::JSError);
+                }
+                if !property.is_undefined() {
+                    let Some(name) = jsid_to_string(cx, id.handle()) else {
+                        return Err(WebDriverJSError::JSError);
+                    };
+
+                    if let Ok(value) =
+                        jsval_to_webdriver_inner(cx, global_scope, property.handle(), seen)
+                    {
+                        result.insert(name.into(), value);
+                    } else {
+                        return Err(WebDriverJSError::JSError);
+                    }
                 }
             }
 
@@ -285,24 +417,30 @@ pub unsafe fn jsval_to_webdriver(
 }
 
 #[allow(unsafe_code)]
-pub fn handle_execute_script(
+pub(crate) fn handle_execute_script(
     window: Option<DomRoot<Window>>,
     eval: String,
     reply: IpcSender<WebDriverJSResult>,
+    can_gc: CanGc,
 ) {
     match window {
         Some(window) => {
-            let result = unsafe {
-                let cx = window.get_cx();
-                rooted!(in(*cx) let mut rval = UndefinedValue());
-                let global = window.upcast::<GlobalScope>();
-                global.evaluate_js_on_global_with_result(
-                    &eval,
-                    rval.handle_mut(),
-                    ScriptFetchOptions::default_classic_script(global),
-                    global.api_base_url(),
-                );
-                jsval_to_webdriver(*cx, window.upcast::<GlobalScope>(), rval.handle())
+            let cx = window.get_cx();
+            let realm = AlreadyInRealm::assert_for_cx(cx);
+            let realm = InRealm::already(&realm);
+
+            rooted!(in(*cx) let mut rval = UndefinedValue());
+            let global = window.as_global_scope();
+            let result = if global.evaluate_js_on_global_with_result(
+                &eval,
+                rval.handle_mut(),
+                ScriptFetchOptions::default_classic_script(global),
+                global.api_base_url(),
+                can_gc,
+            ) {
+                jsval_to_webdriver(cx, global, rval.handle(), realm, can_gc)
+            } else {
+                Err(WebDriverJSError::JSError)
             };
 
             reply.send(result).unwrap();
@@ -315,23 +453,29 @@ pub fn handle_execute_script(
     }
 }
 
-pub fn handle_execute_async_script(
+pub(crate) fn handle_execute_async_script(
     window: Option<DomRoot<Window>>,
     eval: String,
     reply: IpcSender<WebDriverJSResult>,
+    can_gc: CanGc,
 ) {
     match window {
         Some(window) => {
             let cx = window.get_cx();
+            let reply_sender = reply.clone();
             window.set_webdriver_script_chan(Some(reply));
             rooted!(in(*cx) let mut rval = UndefinedValue());
-            let global = window.upcast::<GlobalScope>();
-            global.evaluate_js_on_global_with_result(
+
+            let global_scope = window.as_global_scope();
+            if !global_scope.evaluate_js_on_global_with_result(
                 &eval,
                 rval.handle_mut(),
-                ScriptFetchOptions::default_classic_script(global),
-                global.api_base_url(),
-            );
+                ScriptFetchOptions::default_classic_script(global_scope),
+                global_scope.api_base_url(),
+                can_gc,
+            ) {
+                reply_sender.send(Err(WebDriverJSError::JSError)).unwrap();
+            }
         },
         None => {
             reply
@@ -341,8 +485,8 @@ pub fn handle_execute_async_script(
     }
 }
 
-pub fn handle_get_browsing_context_id(
-    documents: &Documents,
+pub(crate) fn handle_get_browsing_context_id(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     webdriver_frame_id: WebDriverFrameId,
     reply: IpcSender<Result<BrowsingContextId, ErrorStatus>>,
@@ -374,60 +518,58 @@ pub fn handle_get_browsing_context_id(
 }
 
 // https://w3c.github.io/webdriver/#dfn-center-point
-fn get_element_in_view_center_point(element: &Element) -> Option<Point2D<i64>> {
-    window_from_node(element.upcast::<Node>())
-        .Document()
+fn get_element_in_view_center_point(element: &Element, can_gc: CanGc) -> Option<Point2D<i64>> {
+    element
+        .owner_document()
         .GetBody()
         .map(DomRoot::upcast::<Element>)
         .and_then(|body| {
             // Step 1: Let rectangle be the first element of the DOMRect sequence
             // returned by calling getClientRects() on element.
-            element
-                .GetClientRects(CanGc::note())
-                .first()
-                .map(|rectangle| {
-                    let x = rectangle.X().round() as i64;
-                    let y = rectangle.Y().round() as i64;
-                    let width = rectangle.Width().round() as i64;
-                    let height = rectangle.Height().round() as i64;
+            element.GetClientRects(can_gc).first().map(|rectangle| {
+                let x = rectangle.X().round() as i64;
+                let y = rectangle.Y().round() as i64;
+                let width = rectangle.Width().round() as i64;
+                let height = rectangle.Height().round() as i64;
 
-                    let client_width = body.ClientWidth() as i64;
-                    let client_height = body.ClientHeight() as i64;
+                let client_width = body.ClientWidth(can_gc) as i64;
+                let client_height = body.ClientHeight(can_gc) as i64;
 
-                    // Steps 2 - 5
-                    let left = cmp::max(0, cmp::min(x, x + width));
-                    let right = cmp::min(client_width, cmp::max(x, x + width));
-                    let top = cmp::max(0, cmp::min(y, y + height));
-                    let bottom = cmp::min(client_height, cmp::max(y, y + height));
+                // Steps 2 - 5
+                let left = cmp::max(0, cmp::min(x, x + width));
+                let right = cmp::min(client_width, cmp::max(x, x + width));
+                let top = cmp::max(0, cmp::min(y, y + height));
+                let bottom = cmp::min(client_height, cmp::max(y, y + height));
 
-                    // Steps 6 - 7
-                    let x = (left + right) / 2;
-                    let y = (top + bottom) / 2;
+                // Steps 6 - 7
+                let x = (left + right) / 2;
+                let y = (top + bottom) / 2;
 
-                    // Step 8
-                    Point2D::new(x, y)
-                })
+                // Step 8
+                Point2D::new(x, y)
+            })
         })
 }
 
-pub fn handle_get_element_in_view_center_point(
-    documents: &Documents,
+pub(crate) fn handle_get_element_in_view_center_point(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
     reply: IpcSender<Result<Option<(i64, i64)>, ErrorStatus>>,
+    can_gc: CanGc,
 ) {
     reply
         .send(
             find_node_by_unique_id(documents, pipeline, element_id).map(|node| {
-                get_element_in_view_center_point(node.downcast::<Element>().unwrap())
+                get_element_in_view_center_point(node.downcast::<Element>().unwrap(), can_gc)
                     .map(|point| (point.x, point.y))
             }),
         )
         .unwrap();
 }
 
-pub fn handle_find_element_css(
-    documents: &Documents,
+pub(crate) fn handle_find_element_css(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     selector: String,
     reply: IpcSender<Result<Option<String>, ErrorStatus>>,
@@ -447,8 +589,8 @@ pub fn handle_find_element_css(
         .unwrap();
 }
 
-pub fn handle_find_element_link_text(
-    documents: &Documents,
+pub(crate) fn handle_find_element_link_text(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     selector: String,
     partial: bool,
@@ -466,11 +608,12 @@ pub fn handle_find_element_link_text(
         .unwrap();
 }
 
-pub fn handle_find_element_tag_name(
-    documents: &Documents,
+pub(crate) fn handle_find_element_tag_name(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     selector: String,
     reply: IpcSender<Result<Option<String>, ErrorStatus>>,
+    can_gc: CanGc,
 ) {
     reply
         .send(
@@ -479,7 +622,7 @@ pub fn handle_find_element_tag_name(
                 .ok_or(ErrorStatus::UnknownError)
                 .map(|document| {
                     document
-                        .GetElementsByTagName(DOMString::from(selector))
+                        .GetElementsByTagName(DOMString::from(selector), can_gc)
                         .elements_iter()
                         .next()
                 })
@@ -488,8 +631,8 @@ pub fn handle_find_element_tag_name(
         .unwrap();
 }
 
-pub fn handle_find_elements_css(
-    documents: &Documents,
+pub(crate) fn handle_find_elements_css(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     selector: String,
     reply: IpcSender<Result<Vec<String>, ErrorStatus>>,
@@ -514,8 +657,8 @@ pub fn handle_find_elements_css(
         .unwrap();
 }
 
-pub fn handle_find_elements_link_text(
-    documents: &Documents,
+pub(crate) fn handle_find_elements_link_text(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     selector: String,
     partial: bool,
@@ -533,18 +676,19 @@ pub fn handle_find_elements_link_text(
         .unwrap();
 }
 
-pub fn handle_find_elements_tag_name(
-    documents: &Documents,
+pub(crate) fn handle_find_elements_tag_name(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     selector: String,
     reply: IpcSender<Result<Vec<String>, ErrorStatus>>,
+    can_gc: CanGc,
 ) {
     reply
         .send(
             documents
                 .find_document(pipeline)
                 .ok_or(ErrorStatus::UnknownError)
-                .map(|document| document.GetElementsByTagName(DOMString::from(selector)))
+                .map(|document| document.GetElementsByTagName(DOMString::from(selector), can_gc))
                 .map(|nodes| {
                     nodes
                         .elements_iter()
@@ -555,8 +699,8 @@ pub fn handle_find_elements_tag_name(
         .unwrap();
 }
 
-pub fn handle_find_element_element_css(
-    documents: &Documents,
+pub(crate) fn handle_find_element_element_css(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
     selector: String,
@@ -573,8 +717,8 @@ pub fn handle_find_element_element_css(
         .unwrap();
 }
 
-pub fn handle_find_element_element_link_text(
-    documents: &Documents,
+pub(crate) fn handle_find_element_element_link_text(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
     selector: String,
@@ -589,12 +733,13 @@ pub fn handle_find_element_element_link_text(
         .unwrap();
 }
 
-pub fn handle_find_element_element_tag_name(
-    documents: &Documents,
+pub(crate) fn handle_find_element_element_tag_name(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
     selector: String,
     reply: IpcSender<Result<Option<String>, ErrorStatus>>,
+    can_gc: CanGc,
 ) {
     reply
         .send(
@@ -602,7 +747,7 @@ pub fn handle_find_element_element_tag_name(
                 .downcast::<Element>(
             ) {
                 Some(element) => Ok(element
-                    .GetElementsByTagName(DOMString::from(selector))
+                    .GetElementsByTagName(DOMString::from(selector), can_gc)
                     .elements_iter()
                     .next()
                     .map(|x| x.upcast::<Node>().unique_id())),
@@ -612,8 +757,8 @@ pub fn handle_find_element_element_tag_name(
         .unwrap();
 }
 
-pub fn handle_find_element_elements_css(
-    documents: &Documents,
+pub(crate) fn handle_find_element_elements_css(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
     selector: String,
@@ -635,8 +780,8 @@ pub fn handle_find_element_elements_css(
         .unwrap();
 }
 
-pub fn handle_find_element_elements_link_text(
-    documents: &Documents,
+pub(crate) fn handle_find_element_elements_link_text(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
     selector: String,
@@ -651,12 +796,13 @@ pub fn handle_find_element_elements_link_text(
         .unwrap();
 }
 
-pub fn handle_find_element_elements_tag_name(
-    documents: &Documents,
+pub(crate) fn handle_find_element_elements_tag_name(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
     selector: String,
     reply: IpcSender<Result<Vec<String>, ErrorStatus>>,
+    can_gc: CanGc,
 ) {
     reply
         .send(
@@ -664,7 +810,7 @@ pub fn handle_find_element_elements_tag_name(
                 .downcast::<Element>(
             ) {
                 Some(element) => Ok(element
-                    .GetElementsByTagName(DOMString::from(selector))
+                    .GetElementsByTagName(DOMString::from(selector), can_gc)
                     .elements_iter()
                     .map(|x| x.upcast::<Node>().unique_id())
                     .collect::<Vec<String>>()),
@@ -674,11 +820,12 @@ pub fn handle_find_element_elements_tag_name(
         .unwrap();
 }
 
-pub fn handle_focus_element(
-    documents: &Documents,
+pub(crate) fn handle_focus_element(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
     reply: IpcSender<Result<(), ErrorStatus>>,
+    can_gc: CanGc,
 ) {
     reply
         .send(
@@ -686,7 +833,7 @@ pub fn handle_focus_element(
                 match node.downcast::<HTMLElement>() {
                     Some(element) => {
                         // Need a way to find if this actually succeeded
-                        element.Focus();
+                        element.Focus(can_gc);
                         Ok(())
                     },
                     None => Err(ErrorStatus::UnknownError),
@@ -696,8 +843,8 @@ pub fn handle_focus_element(
         .unwrap();
 }
 
-pub fn handle_get_active_element(
-    documents: &Documents,
+pub(crate) fn handle_get_active_element(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     reply: IpcSender<Option<String>>,
 ) {
@@ -711,10 +858,29 @@ pub fn handle_get_active_element(
         .unwrap();
 }
 
-pub fn handle_get_page_source(
-    documents: &Documents,
+pub(crate) fn handle_get_computed_role(
+    documents: &DocumentCollection,
+    pipeline: PipelineId,
+    node_id: String,
+    reply: IpcSender<Result<Option<String>, ErrorStatus>>,
+) {
+    reply
+        .send(
+            find_node_by_unique_id(documents, pipeline, node_id).and_then(|node| {
+                match node.downcast::<Element>() {
+                    Some(element) => Ok(element.GetRole().map(String::from)),
+                    None => Err(ErrorStatus::UnknownError),
+                }
+            }),
+        )
+        .unwrap();
+}
+
+pub(crate) fn handle_get_page_source(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     reply: IpcSender<Result<String, ErrorStatus>>,
+    can_gc: CanGc,
 ) {
     reply
         .send(
@@ -722,10 +888,10 @@ pub fn handle_get_page_source(
                 .find_document(pipeline)
                 .ok_or(ErrorStatus::UnknownError)
                 .and_then(|document| match document.GetDocumentElement() {
-                    Some(element) => match element.GetOuterHTML() {
+                    Some(element) => match element.GetOuterHTML(can_gc) {
                         Ok(source) => Ok(source.to_string()),
                         Err(_) => {
-                            match XMLSerializer::new(document.window(), None, CanGc::note())
+                            match XMLSerializer::new(document.window(), None, can_gc)
                                 .SerializeToString(element.upcast::<Node>())
                             {
                                 Ok(source) => Ok(source.to_string()),
@@ -739,8 +905,8 @@ pub fn handle_get_page_source(
         .unwrap();
 }
 
-pub fn handle_get_cookies(
-    documents: &Documents,
+pub(crate) fn handle_get_cookies(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     reply: IpcSender<Vec<Serde<Cookie<'static>>>>,
 ) {
@@ -753,7 +919,7 @@ pub fn handle_get_cookies(
                     let (sender, receiver) = ipc::channel().unwrap();
                     let _ = document
                         .window()
-                        .upcast::<GlobalScope>()
+                        .as_global_scope()
                         .resource_threads()
                         .send(GetCookiesDataForUrl(url, sender, NonHTTP));
                     receiver.recv().unwrap()
@@ -765,8 +931,8 @@ pub fn handle_get_cookies(
 }
 
 // https://w3c.github.io/webdriver/webdriver-spec.html#get-cookie
-pub fn handle_get_cookie(
-    documents: &Documents,
+pub(crate) fn handle_get_cookie(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     name: String,
     reply: IpcSender<Vec<Serde<Cookie<'static>>>>,
@@ -780,7 +946,7 @@ pub fn handle_get_cookie(
                     let (sender, receiver) = ipc::channel().unwrap();
                     let _ = document
                         .window()
-                        .upcast::<GlobalScope>()
+                        .as_global_scope()
                         .resource_threads()
                         .send(GetCookiesDataForUrl(url, sender, NonHTTP));
                     let cookies = receiver.recv().unwrap();
@@ -796,8 +962,8 @@ pub fn handle_get_cookie(
 }
 
 // https://w3c.github.io/webdriver/webdriver-spec.html#add-cookie
-pub fn handle_add_cookie(
-    documents: &Documents,
+pub(crate) fn handle_add_cookie(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     cookie: Cookie<'static>,
     reply: IpcSender<Result<(), WebDriverCookieError>>,
@@ -825,7 +991,7 @@ pub fn handle_add_cookie(
             (false, Some(ref domain)) if url.host_str().map(|x| x == domain).unwrap_or(false) => {
                 let _ = document
                     .window()
-                    .upcast::<GlobalScope>()
+                    .as_global_scope()
                     .resource_threads()
                     .send(SetCookieForUrl(url, Serde(cookie), method));
                 Ok(())
@@ -833,7 +999,7 @@ pub fn handle_add_cookie(
             (false, None) => {
                 let _ = document
                     .window()
-                    .upcast::<GlobalScope>()
+                    .as_global_scope()
                     .resource_threads()
                     .send(SetCookieForUrl(url, Serde(cookie), method));
                 Ok(())
@@ -843,8 +1009,9 @@ pub fn handle_add_cookie(
         .unwrap();
 }
 
-pub fn handle_delete_cookies(
-    documents: &Documents,
+// https://w3c.github.io/webdriver/#delete-all-cookies
+pub(crate) fn handle_delete_cookies(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     reply: IpcSender<Result<(), ErrorStatus>>,
 ) {
@@ -857,14 +1024,41 @@ pub fn handle_delete_cookies(
     let url = document.url();
     document
         .window()
-        .upcast::<GlobalScope>()
+        .as_global_scope()
         .resource_threads()
         .send(DeleteCookies(url))
         .unwrap();
     reply.send(Ok(())).unwrap();
 }
 
-pub fn handle_get_title(documents: &Documents, pipeline: PipelineId, reply: IpcSender<String>) {
+// https://w3c.github.io/webdriver/#delete-cookie
+pub(crate) fn handle_delete_cookie(
+    documents: &DocumentCollection,
+    pipeline: PipelineId,
+    name: String,
+    reply: IpcSender<Result<(), ErrorStatus>>,
+) {
+    let document = match documents.find_document(pipeline) {
+        Some(document) => document,
+        None => {
+            return reply.send(Err(ErrorStatus::UnknownError)).unwrap();
+        },
+    };
+    let url = document.url();
+    document
+        .window()
+        .as_global_scope()
+        .resource_threads()
+        .send(DeleteCookie(url, name))
+        .unwrap();
+    reply.send(Ok(())).unwrap();
+}
+
+pub(crate) fn handle_get_title(
+    documents: &DocumentCollection,
+    pipeline: PipelineId,
+    reply: IpcSender<String>,
+) {
     reply
         .send(
             // TODO: Return an error if the pipeline doesn't exist
@@ -876,11 +1070,12 @@ pub fn handle_get_title(documents: &Documents, pipeline: PipelineId, reply: IpcS
         .unwrap();
 }
 
-pub fn handle_get_rect(
-    documents: &Documents,
+pub(crate) fn handle_get_rect(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
     reply: IpcSender<Result<Rect<f64>, ErrorStatus>>,
+    can_gc: CanGc,
 ) {
     reply
         .send(
@@ -892,15 +1087,15 @@ pub fn handle_get_rect(
                         let mut x = 0;
                         let mut y = 0;
 
-                        let mut offset_parent = html_element.GetOffsetParent();
+                        let mut offset_parent = html_element.GetOffsetParent(can_gc);
 
                         // Step 2
                         while let Some(element) = offset_parent {
                             offset_parent = match element.downcast::<HTMLElement>() {
                                 Some(elem) => {
-                                    x += elem.OffsetLeft();
-                                    y += elem.OffsetTop();
-                                    elem.GetOffsetParent()
+                                    x += elem.OffsetLeft(can_gc);
+                                    y += elem.OffsetTop(can_gc);
+                                    elem.GetOffsetParent(can_gc)
                                 },
                                 None => None,
                             };
@@ -909,8 +1104,8 @@ pub fn handle_get_rect(
                         Ok(Rect::new(
                             Point2D::new(x as f64, y as f64),
                             Size2D::new(
-                                html_element.OffsetWidth() as f64,
-                                html_element.OffsetHeight() as f64,
+                                html_element.OffsetWidth(can_gc) as f64,
+                                html_element.OffsetHeight(can_gc) as f64,
                             ),
                         ))
                     },
@@ -921,11 +1116,12 @@ pub fn handle_get_rect(
         .unwrap();
 }
 
-pub fn handle_get_bounding_client_rect(
-    documents: &Documents,
+pub(crate) fn handle_get_bounding_client_rect(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
     reply: IpcSender<Result<Rect<f32>, ErrorStatus>>,
+    can_gc: CanGc,
 ) {
     reply
         .send(
@@ -933,7 +1129,7 @@ pub fn handle_get_bounding_client_rect(
                 .downcast::<Element>(
             ) {
                 Some(element) => {
-                    let rect = element.GetBoundingClientRect(CanGc::note());
+                    let rect = element.GetBoundingClientRect(can_gc);
                     Ok(Rect::new(
                         Point2D::new(rect.X() as f32, rect.Y() as f32),
                         Size2D::new(rect.Width() as f32, rect.Height() as f32),
@@ -945,8 +1141,8 @@ pub fn handle_get_bounding_client_rect(
         .unwrap();
 }
 
-pub fn handle_get_text(
-    documents: &Documents,
+pub(crate) fn handle_get_text(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     node_id: String,
     reply: IpcSender<Result<String, ErrorStatus>>,
@@ -959,8 +1155,8 @@ pub fn handle_get_text(
         .unwrap();
 }
 
-pub fn handle_get_name(
-    documents: &Documents,
+pub(crate) fn handle_get_name(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     node_id: String,
     reply: IpcSender<Result<String, ErrorStatus>>,
@@ -973,8 +1169,8 @@ pub fn handle_get_name(
         .unwrap();
 }
 
-pub fn handle_get_attribute(
-    documents: &Documents,
+pub(crate) fn handle_get_attribute(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     node_id: String,
     name: String,
@@ -993,18 +1189,19 @@ pub fn handle_get_attribute(
 }
 
 #[allow(unsafe_code)]
-pub fn handle_get_property(
-    documents: &Documents,
+pub(crate) fn handle_get_property(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     node_id: String,
     name: String,
     reply: IpcSender<Result<WebDriverJSValue, ErrorStatus>>,
+    can_gc: CanGc,
 ) {
     reply
         .send(
             find_node_by_unique_id(documents, pipeline, node_id).map(|node| {
                 let document = documents.find_document(pipeline).unwrap();
-                let _ac = enter_realm(&*document);
+                let realm = enter_realm(&*document);
                 let cx = document.window().get_cx();
 
                 rooted!(in(*cx) let mut property = UndefinedValue());
@@ -1016,14 +1213,20 @@ pub fn handle_get_property(
                         property.handle_mut(),
                     )
                 } {
-                    Ok(_) => match unsafe {
-                        jsval_to_webdriver(*cx, &node.reflector().global(), property.handle())
-                    } {
-                        Ok(property) => property,
-                        Err(_) => WebDriverJSValue::Undefined,
+                    Ok(_) => {
+                        match jsval_to_webdriver(
+                            cx,
+                            &node.global(),
+                            property.handle(),
+                            InRealm::entered(&realm),
+                            can_gc,
+                        ) {
+                            Ok(property) => property,
+                            Err(_) => WebDriverJSValue::Undefined,
+                        }
                     },
                     Err(error) => {
-                        throw_dom_exception(cx, &node.reflector().global(), error);
+                        throw_dom_exception(cx, &node.global(), error, can_gc);
                         WebDriverJSValue::Undefined
                     },
                 }
@@ -1032,29 +1235,35 @@ pub fn handle_get_property(
         .unwrap();
 }
 
-pub fn handle_get_css(
-    documents: &Documents,
+pub(crate) fn handle_get_css(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     node_id: String,
     name: String,
     reply: IpcSender<Result<String, ErrorStatus>>,
+    can_gc: CanGc,
 ) {
     reply
         .send(
             find_node_by_unique_id(documents, pipeline, node_id).map(|node| {
-                let window = window_from_node(&*node);
+                let window = node.owner_window();
                 let element = node.downcast::<Element>().unwrap();
                 String::from(
                     window
                         .GetComputedStyle(element, None)
-                        .GetPropertyValue(DOMString::from(name)),
+                        .GetPropertyValue(DOMString::from(name), can_gc),
                 )
             }),
         )
         .unwrap();
 }
 
-pub fn handle_get_url(documents: &Documents, pipeline: PipelineId, reply: IpcSender<ServoUrl>) {
+pub(crate) fn handle_get_url(
+    documents: &DocumentCollection,
+    pipeline: PipelineId,
+    reply: IpcSender<ServoUrl>,
+    _can_gc: CanGc,
+) {
     reply
         .send(
             // TODO: Return an error if the pipeline doesn't exist.
@@ -1066,12 +1275,42 @@ pub fn handle_get_url(documents: &Documents, pipeline: PipelineId, reply: IpcSen
         .unwrap();
 }
 
+fn get_option_parent(node: &Node) -> Option<DomRoot<Node>> {
+    // Get parent for `<option>` or `<optiongrp>` based on container spec:
+    // > 1. Let datalist parent be the first datalist element reached by traversing the tree
+    // >    in reverse order from element, or undefined if the root of the tree is reached.
+    // > 2. Let select parent be the first select element reached by traversing the tree in
+    // >    reverse order from element, or undefined if the root of the tree is reached.
+    // > 3. If datalist parent is undefined, the element context is select parent.
+    // >    Otherwise, the element context is datalist parent.
+    let root_node = node.GetRootNode(&GetRootNodeOptions::empty());
+    node.preceding_nodes(&root_node)
+        .find(|preceding| preceding.is::<HTMLDataListElement>())
+        .or_else(|| {
+            node.preceding_nodes(&root_node)
+                .find(|preceding| preceding.is::<HTMLSelectElement>())
+        })
+}
+
+// https://w3c.github.io/webdriver/#dfn-container
+fn get_container(node: &Node) -> Option<DomRoot<Node>> {
+    if node.is::<HTMLOptionElement>() {
+        return get_option_parent(node);
+    }
+    if node.is::<HTMLOptGroupElement>() {
+        let option_parent = get_option_parent(node);
+        return option_parent.or_else(|| Some(DomRoot::from_ref(node)));
+    }
+    Some(DomRoot::from_ref(node))
+}
+
 // https://w3c.github.io/webdriver/#element-click
-pub fn handle_element_click(
-    documents: &Documents,
+pub(crate) fn handle_element_click(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
     reply: IpcSender<Result<Option<String>, ErrorStatus>>,
+    can_gc: CanGc,
 ) {
     reply
         .send(
@@ -1083,6 +1322,10 @@ pub fn handle_element_click(
                         return Err(ErrorStatus::InvalidArgument);
                     }
                 }
+
+                let Some(container) = get_container(&node) else {
+                    return Err(ErrorStatus::UnknownError);
+                };
 
                 // Step 5
                 // TODO: scroll into view
@@ -1096,46 +1339,28 @@ pub fn handle_element_click(
                 // Step 8
                 match node.downcast::<HTMLOptionElement>() {
                     Some(option_element) => {
-                        // https://w3c.github.io/webdriver/#dfn-container
-                        let root_node = node.GetRootNode(&GetRootNodeOptions::empty());
-                        let datalist_parent = node
-                            .preceding_nodes(&root_node)
-                            .find(|preceding| preceding.is::<HTMLDataListElement>());
-                        let select_parent = node
-                            .preceding_nodes(&root_node)
-                            .find(|preceding| preceding.is::<HTMLSelectElement>());
-
-                        // Step 8.1
-                        let parent_node = match datalist_parent {
-                            Some(datalist_parent) => datalist_parent,
-                            None => match select_parent {
-                                Some(select_parent) => select_parent,
-                                None => return Err(ErrorStatus::UnknownError),
-                            },
-                        };
-
                         // Steps 8.2 - 8.4
-                        let event_target = parent_node.upcast::<EventTarget>();
-                        event_target.fire_event(atom!("mouseover"));
-                        event_target.fire_event(atom!("mousemove"));
-                        event_target.fire_event(atom!("mousedown"));
+                        let event_target = container.upcast::<EventTarget>();
+                        event_target.fire_event(atom!("mouseover"), can_gc);
+                        event_target.fire_event(atom!("mousemove"), can_gc);
+                        event_target.fire_event(atom!("mousedown"), can_gc);
 
                         // Step 8.5
-                        match parent_node.downcast::<HTMLElement>() {
-                            Some(html_element) => html_element.Focus(),
+                        match container.downcast::<HTMLElement>() {
+                            Some(html_element) => html_element.Focus(can_gc),
                             None => return Err(ErrorStatus::UnknownError),
                         }
 
                         // Step 8.6
                         if !option_element.Disabled() {
                             // Step 8.6.1
-                            event_target.fire_event(atom!("input"));
+                            event_target.fire_event(atom!("input"), can_gc);
 
                             // Steps 8.6.2
                             let previous_selectedness = option_element.Selected();
 
                             // Step 8.6.3
-                            match parent_node.downcast::<HTMLSelectElement>() {
+                            match container.downcast::<HTMLSelectElement>() {
                                 Some(select_element) => {
                                     if select_element.Multiple() {
                                         option_element.SetSelected(!option_element.Selected());
@@ -1146,13 +1371,13 @@ pub fn handle_element_click(
 
                             // Step 8.6.4
                             if !previous_selectedness {
-                                event_target.fire_event(atom!("change"));
+                                event_target.fire_event(atom!("change"), can_gc);
                             }
                         }
 
                         // Steps 8.7 - 8.8
-                        event_target.fire_event(atom!("mouseup"));
-                        event_target.fire_event(atom!("click"));
+                        event_target.fire_event(atom!("mouseup"), can_gc);
+                        event_target.fire_event(atom!("click"), can_gc);
 
                         Ok(None)
                     },
@@ -1163,8 +1388,8 @@ pub fn handle_element_click(
         .unwrap();
 }
 
-pub fn handle_is_enabled(
-    documents: &Documents,
+pub(crate) fn handle_is_enabled(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
     reply: IpcSender<Result<bool, ErrorStatus>>,
@@ -1181,8 +1406,8 @@ pub fn handle_is_enabled(
         .unwrap();
 }
 
-pub fn handle_is_selected(
-    documents: &Documents,
+pub(crate) fn handle_is_selected(
+    documents: &DocumentCollection,
     pipeline: PipelineId,
     element_id: String,
     reply: IpcSender<Result<bool, ErrorStatus>>,

@@ -8,8 +8,8 @@ use std::rc::Rc;
 use dom_struct::dom_struct;
 use js::jsapi::{Heap, JSObject};
 use js::jsval::JSVal;
-use js::rust::{HandleObject, HandleValue};
-use servo_atoms::Atom;
+use js::rust::{HandleObject, HandleValue, MutableHandleValue};
+use stylo_atoms::Atom;
 
 use crate::dom::bindings::codegen::Bindings::EventBinding::EventMethods;
 use crate::dom::bindings::codegen::Bindings::PromiseRejectionEventBinding;
@@ -26,7 +26,7 @@ use crate::dom::promise::Promise;
 use crate::script_runtime::{CanGc, JSContext};
 
 #[dom_struct]
-pub struct PromiseRejectionEvent {
+pub(crate) struct PromiseRejectionEvent {
     event: Event,
     #[ignore_malloc_size_of = "Defined in mozjs"]
     promise: Heap<*mut JSObject>,
@@ -35,7 +35,7 @@ pub struct PromiseRejectionEvent {
 }
 
 impl PromiseRejectionEvent {
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn new_inherited() -> Self {
         PromiseRejectionEvent {
             event: Event::new_inherited(),
@@ -44,13 +44,14 @@ impl PromiseRejectionEvent {
         }
     }
 
-    pub fn new(
+    pub(crate) fn new(
         global: &GlobalScope,
         type_: Atom,
         bubbles: EventBubbles,
         cancelable: EventCancelable,
         promise: Rc<Promise>,
         reason: HandleValue,
+        can_gc: CanGc,
     ) -> DomRoot<Self> {
         Self::new_with_proto(
             global,
@@ -60,11 +61,11 @@ impl PromiseRejectionEvent {
             cancelable,
             promise.promise_obj(),
             reason,
-            CanGc::note(),
+            can_gc,
         )
     }
 
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     #[allow(clippy::too_many_arguments)]
     fn new_with_proto(
         global: &GlobalScope,
@@ -94,7 +95,7 @@ impl PromiseRejectionEvent {
     }
 }
 
-impl PromiseRejectionEventMethods for PromiseRejectionEvent {
+impl PromiseRejectionEventMethods<crate::DomTypeHolder> for PromiseRejectionEvent {
     // https://html.spec.whatwg.org/multipage/#promiserejectionevent
     fn Constructor(
         global: &GlobalScope,
@@ -126,8 +127,8 @@ impl PromiseRejectionEventMethods for PromiseRejectionEvent {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-promiserejectionevent-reason
-    fn Reason(&self, _cx: JSContext) -> JSVal {
-        self.reason.get()
+    fn Reason(&self, _cx: JSContext, mut retval: MutableHandleValue) {
+        retval.set(self.reason.get())
     }
 
     // https://dom.spec.whatwg.org/#dom-event-istrusted

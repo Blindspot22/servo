@@ -11,9 +11,10 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::document::Document;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::node::Node;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct HTMLTableCaptionElement {
+pub(crate) struct HTMLTableCaptionElement {
     htmlelement: HTMLElement,
 }
 
@@ -28,12 +29,13 @@ impl HTMLTableCaptionElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLTableCaptionElement> {
         let n = Node::reflect_node_with_proto(
             Box::new(HTMLTableCaptionElement::new_inherited(
@@ -41,6 +43,7 @@ impl HTMLTableCaptionElement {
             )),
             document,
             proto,
+            can_gc,
         );
 
         n.upcast::<Node>().set_weird_parser_insertion_mode();

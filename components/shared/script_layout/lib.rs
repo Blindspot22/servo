@@ -11,51 +11,51 @@
 pub mod wrapper_traits;
 
 use std::any::Any;
-use std::borrow::Cow;
-use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
 
 use app_units::Au;
 use atomic_refcell::AtomicRefCell;
-use base::cross_process_instant::CrossProcessInstant;
-use base::id::{BrowsingContextId, PipelineId};
 use base::Epoch;
-use canvas_traits::canvas::{CanvasId, CanvasMsg};
-use crossbeam_channel::Sender;
+use base::id::{BrowsingContextId, PipelineId, WebViewId};
+use compositing_traits::CrossProcessCompositorApi;
+use constellation_traits::{LoadData, ScrollState};
+use embedder_traits::{UntrustedNodeAddress, ViewportDetails};
 use euclid::default::{Point2D, Rect};
-use euclid::Size2D;
-use fonts::SystemFontServiceProxy;
+use fnv::FnvHashMap;
+use fonts::{FontContext, SystemFontServiceProxy};
+use fxhash::FxHashMap;
 use ipc_channel::ipc::IpcSender;
 use libc::c_void;
+use malloc_size_of::{MallocSizeOf as MallocSizeOfTrait, MallocSizeOfOps};
 use malloc_size_of_derive::MallocSizeOf;
-use metrics::PaintTimeMetrics;
 use net_traits::image_cache::{ImageCache, PendingImageId};
-use net_traits::ResourceThreads;
+use pixels::Image;
 use profile_traits::mem::Report;
 use profile_traits::time;
-use script_traits::{
-    ConstellationControlMsg, InitialScriptState, LayoutMsg, LoadData, Painter, ScrollState,
-    UntrustedNodeAddress, WindowSizeData,
-};
+use script_traits::{InitialScriptState, Painter, ScriptThreadMessage};
 use serde::{Deserialize, Serialize};
 use servo_arc::Arc as ServoArc;
 use servo_url::{ImmutableOrigin, ServoUrl};
+use style::Atom;
 use style::animation::DocumentAnimationSet;
 use style::context::QuirksMode;
 use style::data::ElementData;
 use style::dom::OpaqueNode;
 use style::invalidation::element::restyle_hints::RestyleHint;
 use style::media_queries::Device;
-use style::properties::style_structs::Font;
 use style::properties::PropertyId;
+use style::properties::style_structs::Font;
+use style::queries::values::PrefersColorScheme;
 use style::selector_parser::{PseudoElement, RestyleDamage, Snapshot};
 use style::stylesheets::Stylesheet;
-use style::Atom;
-use style_traits::CSSPixel;
 use webrender_api::ImageKey;
-use webrender_traits::CrossProcessCompositorApi;
 
-pub type GenericLayoutData = dyn Any + Send + Sync;
+pub trait GenericLayoutDataTrait: Any + MallocSizeOfTrait {
+    fn as_any(&self) -> &dyn Any;
+}
+
+pub type GenericLayoutData = dyn GenericLayoutDataTrait + Send + Sync;
 
 #[derive(MallocSizeOf)]
 pub struct StyleData {
@@ -63,7 +63,6 @@ pub struct StyleData {
     /// style system is being used standalone, this is all that hangs
     /// off the node. This must be first to permit the various
     /// transmutations between ElementData and PersistentLayoutData.
-    #[ignore_malloc_size_of = "This probably should not be ignored"]
     pub element_data: AtomicRefCell<ElementData>,
 
     /// Information needed during parallel traversals.
@@ -118,19 +117,10 @@ pub enum LayoutElementType {
     SVGSVGElement,
 }
 
-pub enum HTMLCanvasDataSource {
-    WebGL(ImageKey),
-    Image(IpcSender<CanvasMsg>),
-    WebGPU(ImageKey),
-    /// transparent black
-    Empty,
-}
-
 pub struct HTMLCanvasData {
-    pub source: HTMLCanvasDataSource,
+    pub source: Option<ImageKey>,
     pub width: u32,
     pub height: u32,
-    pub canvas_id: CanvasId,
 }
 
 pub struct SVGSVGData {
@@ -163,23 +153,34 @@ pub struct PendingImage {
     pub origin: ImmutableOrigin,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct MediaFrame {
+    pub image_key: webrender_api::ImageKey,
+    pub width: i32,
+    pub height: i32,
+}
+
+pub struct MediaMetadata {
+    pub width: u32,
+    pub height: u32,
+}
+
 pub struct HTMLMediaData {
-    pub current_frame: Option<(ImageKey, i32, i32)>,
+    pub current_frame: Option<MediaFrame>,
+    pub metadata: Option<MediaMetadata>,
 }
 
 pub struct LayoutConfig {
     pub id: PipelineId,
+    pub webview_id: WebViewId,
     pub url: ServoUrl,
     pub is_iframe: bool,
-    pub constellation_chan: IpcSender<LayoutMsg>,
-    pub script_chan: IpcSender<ConstellationControlMsg>,
+    pub script_chan: IpcSender<ScriptThreadMessage>,
     pub image_cache: Arc<dyn ImageCache>,
-    pub resource_threads: ResourceThreads,
-    pub system_font_service: Arc<SystemFontServiceProxy>,
+    pub font_context: Arc<FontContext>,
     pub time_profiler_chan: time::ProfilerChan,
     pub compositor_api: CrossProcessCompositorApi,
-    pub paint_time_metrics: PaintTimeMetrics,
-    pub window_size: WindowSizeData,
+    pub viewport_details: ViewportDetails,
 }
 
 pub trait LayoutFactory: Send + Sync {
@@ -190,9 +191,6 @@ pub trait Layout {
     /// Get a reference to this Layout's Stylo `Device` used to handle media queries and
     /// resolve font metrics.
     fn device(&self) -> &Device;
-
-    /// Whether or not this layout is waiting for fonts from loaded stylesheets to finish loading.
-    fn waiting_for_web_fonts_to_load(&self) -> bool;
 
     /// The currently laid out Epoch that this Layout has finished.
     fn current_epoch(&self) -> Epoch;
@@ -215,7 +213,7 @@ pub trait Layout {
 
     /// Requests that layout measure its memory usage. The resulting reports are sent back
     /// via the supplied channel.
-    fn collect_reports(&self, reports: &mut Vec<Report>);
+    fn collect_reports(&self, reports: &mut Vec<Report>, ops: &mut MallocSizeOfOps);
 
     /// Sets quirks mode for the document, causing the quirks mode stylesheet to be used.
     fn set_quirks_mode(&mut self, quirks_mode: QuirksMode);
@@ -224,7 +222,7 @@ pub trait Layout {
     fn remove_stylesheet(&mut self, stylesheet: ServoArc<Stylesheet>);
 
     /// Requests a reflow.
-    fn reflow(&mut self, script_reflow: ScriptReflow);
+    fn reflow(&mut self, reflow_request: ReflowRequest) -> Option<ReflowResult>;
 
     /// Tells layout that script has added some paint worklet modules.
     fn register_paint_worklet_modules(
@@ -235,25 +233,18 @@ pub trait Layout {
     );
 
     /// Set the scroll states of this layout after a compositor scroll.
-    fn set_scroll_states(&mut self, scroll_states: &[ScrollState]);
+    fn set_scroll_offsets(&mut self, scroll_states: &[ScrollState]);
 
-    /// Set the paint time for a specific epoch.
-    fn set_epoch_paint_time(&mut self, epoch: Epoch, paint_time: CrossProcessInstant);
-
-    fn query_content_box(&self, node: OpaqueNode) -> Option<Rect<Au>>;
-    fn query_content_boxes(&self, node: OpaqueNode) -> Vec<Rect<Au>>;
-    fn query_client_rect(&self, node: OpaqueNode) -> Rect<i32>;
+    fn query_content_box(&self, node: TrustedNodeAddress) -> Option<Rect<Au>>;
+    fn query_content_boxes(&self, node: TrustedNodeAddress) -> Vec<Rect<Au>>;
+    fn query_client_rect(&self, node: TrustedNodeAddress) -> Rect<i32>;
     fn query_element_inner_outer_text(&self, node: TrustedNodeAddress) -> String;
-    fn query_inner_window_dimension(
-        &self,
-        context: BrowsingContextId,
-    ) -> Option<Size2D<f32, CSSPixel>>;
     fn query_nodes_from_point(
         &self,
         point: Point2D<f32>,
         query_type: NodesFromPointQueryType,
     ) -> Vec<UntrustedNodeAddress>;
-    fn query_offset_parent(&self, node: OpaqueNode) -> OffsetParentResponse;
+    fn query_offset_parent(&self, node: TrustedNodeAddress) -> OffsetParentResponse;
     fn query_resolved_style(
         &self,
         node: TrustedNodeAddress,
@@ -269,7 +260,7 @@ pub trait Layout {
         animations: DocumentAnimationSet,
         animation_timeline_value: f64,
     ) -> Option<ServoArc<Font>>;
-    fn query_scrolling_area(&self, node: Option<OpaqueNode>) -> Rect<i32>;
+    fn query_scrolling_area(&self, node: Option<TrustedNodeAddress>) -> Rect<i32>;
     fn query_text_indext(&self, node: OpaqueNode, point: Point2D<f32>) -> Option<usize>;
 }
 
@@ -283,7 +274,6 @@ pub trait ScriptThreadFactory {
         layout_factory: Arc<dyn LayoutFactory>,
         system_font_service: Arc<SystemFontServiceProxy>,
         load_data: LoadData,
-        user_agent: Cow<'static, str>,
     );
 }
 #[derive(Clone, Default)]
@@ -314,11 +304,19 @@ pub enum QueryMsg {
     InnerWindowDimensionsQuery,
 }
 
-/// Any query to perform with this reflow.
+/// The goal of a reflow request.
+///
+/// Please do not add any other types of reflows. In general, all reflow should
+/// go through the *update the rendering* step of the HTML specification. Exceptions
+/// should have careful review.
 #[derive(Debug, PartialEq)]
 pub enum ReflowGoal {
-    Full,
-    TickAnimations,
+    /// A reflow has been requesting by the *update the rendering* step of the HTML
+    /// event loop. This nominally driven by the display's VSync.
+    UpdateTheRendering,
+
+    /// Script has done a layout query and this reflow ensurs that layout is up-to-date
+    /// with the latest changes to the DOM.
     LayoutQuery(QueryMsg),
 
     /// Tells layout about a single new scrolling offset from the script. The rest will
@@ -331,7 +329,7 @@ impl ReflowGoal {
     /// be present or false if it only needs stacking-relative positions.
     pub fn needs_display_list(&self) -> bool {
         match *self {
-            ReflowGoal::Full | ReflowGoal::TickAnimations | ReflowGoal::UpdateScrollNode(_) => true,
+            ReflowGoal::UpdateTheRendering | ReflowGoal::UpdateScrollNode(_) => true,
             ReflowGoal::LayoutQuery(ref querymsg) => match *querymsg {
                 QueryMsg::ElementInnerOuterTextQuery |
                 QueryMsg::InnerWindowDimensionsQuery |
@@ -353,7 +351,7 @@ impl ReflowGoal {
     /// false if a layout_thread display list is sufficient.
     pub fn needs_display(&self) -> bool {
         match *self {
-            ReflowGoal::Full | ReflowGoal::TickAnimations | ReflowGoal::UpdateScrollNode(_) => true,
+            ReflowGoal::UpdateTheRendering | ReflowGoal::UpdateScrollNode(_) => true,
             ReflowGoal::LayoutQuery(ref querymsg) => match *querymsg {
                 QueryMsg::NodesFromPointQuery |
                 QueryMsg::TextIndexQuery |
@@ -379,16 +377,31 @@ pub struct Reflow {
     pub page_clip_rect: Rect<Au>,
 }
 
+#[derive(Clone, Debug, MallocSizeOf)]
+pub struct IFrameSize {
+    pub browsing_context_id: BrowsingContextId,
+    pub pipeline_id: PipelineId,
+    pub viewport_details: ViewportDetails,
+}
+
+pub type IFrameSizes = FnvHashMap<BrowsingContextId, IFrameSize>;
+
 /// Information derived from a layout pass that needs to be returned to the script thread.
 #[derive(Debug, Default)]
-pub struct ReflowComplete {
+pub struct ReflowResult {
     /// The list of images that were encountered that are in progress.
     pub pending_images: Vec<PendingImage>,
+    /// The list of iframes in this layout and their sizes, used in order
+    /// to communicate them with the Constellation and also the `Window`
+    /// element of their content pages.
+    pub iframe_sizes: IFrameSizes,
+    /// The mapping of node to animated image, need to be returned to ImageAnimationManager
+    pub node_to_image_animation_map: FxHashMap<OpaqueNode, ImageAnimationState>,
 }
 
 /// Information needed for a script-initiated reflow.
 #[derive(Debug)]
-pub struct ScriptReflow {
+pub struct ReflowRequest {
     /// General reflow data.
     pub reflow_info: Reflow,
     /// The document node.
@@ -397,10 +410,8 @@ pub struct ScriptReflow {
     pub dirty_root: Option<TrustedNodeAddress>,
     /// Whether the document's stylesheets have changed since the last script reflow.
     pub stylesheets_changed: bool,
-    /// The current window size.
-    pub window_size: WindowSizeData,
-    /// The channel that we send a notification to.
-    pub script_join_chan: Sender<ReflowComplete>,
+    /// The current [`ViewportDetails`] to use for this reflow.
+    pub viewport_details: ViewportDetails,
     /// The goal of this reflow.
     pub reflow_goal: ReflowGoal,
     /// The number of objects in the dom #10110
@@ -413,6 +424,12 @@ pub struct ScriptReflow {
     pub animation_timeline_value: f64,
     /// The set of animations for this document.
     pub animations: DocumentAnimationSet,
+    /// The set of image animations.
+    pub node_to_image_animation_map: FxHashMap<OpaqueNode, ImageAnimationState>,
+    /// The theme for the window
+    pub theme: PrefersColorScheme,
+    /// The node highlighted by the devtools, if any
+    pub highlighted_dom_node: Option<OpaqueNode>,
 }
 
 /// A pending restyle.
@@ -442,6 +459,16 @@ pub enum FragmentType {
     BeforePseudoContent,
     /// A StackingContext created to contain ::after pseudo-element content.
     AfterPseudoContent,
+}
+
+impl From<Option<PseudoElement>> for FragmentType {
+    fn from(value: Option<PseudoElement>) -> Self {
+        match value {
+            Some(PseudoElement::After) => FragmentType::AfterPseudoContent,
+            Some(PseudoElement::Before) => FragmentType::BeforePseudoContent,
+            _ => FragmentType::FragmentBody,
+        }
+    }
 }
 
 /// The next ID that will be used for a special scroll root id.
@@ -474,4 +501,26 @@ pub fn node_id_from_scroll_id(id: usize) -> Option<usize> {
         return Some(id & !3);
     }
     None
+}
+
+#[derive(Clone, Debug, MallocSizeOf)]
+pub struct ImageAnimationState {
+    #[ignore_malloc_size_of = "Arc is hard"]
+    image: Arc<Image>,
+    active_frame: usize,
+    last_update_time: f64,
+}
+
+impl ImageAnimationState {
+    pub fn new(image: Arc<Image>) -> Self {
+        Self {
+            image,
+            active_frame: 0,
+            last_update_time: 0.,
+        }
+    }
+
+    pub fn image_key(&self) -> Option<ImageKey> {
+        self.image.id
+    }
 }

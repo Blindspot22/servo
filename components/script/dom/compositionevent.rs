@@ -18,24 +18,25 @@ use crate::dom::window::Window;
 use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct CompositionEvent {
+pub(crate) struct CompositionEvent {
     uievent: UIEvent,
     data: DOMString,
 }
 
 impl CompositionEvent {
-    pub fn new_inherited() -> CompositionEvent {
+    pub(crate) fn new_inherited() -> CompositionEvent {
         CompositionEvent {
             uievent: UIEvent::new_inherited(),
             data: DOMString::new(),
         }
     }
 
-    pub fn new_uninitialized(window: &Window) -> DomRoot<CompositionEvent> {
-        reflect_dom_object(Box::new(CompositionEvent::new_inherited()), window)
+    pub(crate) fn new_uninitialized(window: &Window, can_gc: CanGc) -> DomRoot<CompositionEvent> {
+        reflect_dom_object(Box::new(CompositionEvent::new_inherited()), window, can_gc)
     }
 
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         window: &Window,
         type_: DOMString,
         can_bubble: bool,
@@ -43,17 +44,10 @@ impl CompositionEvent {
         view: Option<&Window>,
         detail: i32,
         data: DOMString,
+        can_gc: CanGc,
     ) -> DomRoot<CompositionEvent> {
         Self::new_with_proto(
-            window,
-            None,
-            type_,
-            can_bubble,
-            cancelable,
-            view,
-            detail,
-            data,
-            CanGc::note(),
+            window, None, type_, can_bubble, cancelable, view, detail, data, can_gc,
         )
     }
 
@@ -83,12 +77,12 @@ impl CompositionEvent {
         ev
     }
 
-    pub fn data(&self) -> &str {
+    pub(crate) fn data(&self) -> &str {
         &self.data
     }
 }
 
-impl CompositionEventMethods for CompositionEvent {
+impl CompositionEventMethods<crate::DomTypeHolder> for CompositionEvent {
     // https://w3c.github.io/uievents/#dom-compositionevent-compositionevent
     fn Constructor(
         window: &Window,

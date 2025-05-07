@@ -3,51 +3,51 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use crossbeam_channel::{unbounded, Sender};
-use devtools_traits::{DevtoolsPageInfo, ScriptToDevtoolsControlMsg, WorkerId};
+use constellation_traits::{StructuredSerializedData, WorkerScriptLoadOrigin};
+use crossbeam_channel::{Sender, unbounded};
+use devtools_traits::{DevtoolsPageInfo, ScriptToDevtoolsControlMsg, SourceInfo, WorkerId};
 use dom_struct::dom_struct;
 use ipc_channel::ipc;
 use js::jsapi::{Heap, JSObject};
 use js::jsval::UndefinedValue;
 use js::rust::{CustomAutoRooter, CustomAutoRooterGuard, HandleObject, HandleValue};
-use script_traits::{StructuredSerializedData, WorkerScriptLoadOrigin};
+use net_traits::request::Referrer;
 use uuid::Uuid;
 
 use crate::dom::abstractworker::{SimpleWorkerErrorHandler, WorkerScriptMsg};
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::MessagePortBinding::StructuredSerializeOptions;
 use crate::dom::bindings::codegen::Bindings::WorkerBinding::{WorkerMethods, WorkerOptions};
+use crate::dom::bindings::codegen::UnionTypes::TrustedScriptURLOrUSVString;
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
-use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomObject};
+use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object_with_proto};
 use crate::dom::bindings::root::DomRoot;
-use crate::dom::bindings::str::USVString;
 use crate::dom::bindings::structuredclone;
-use crate::dom::bindings::trace::RootedTraceableBox;
+use crate::dom::bindings::trace::{CustomTraceable, RootedTraceableBox};
 use crate::dom::dedicatedworkerglobalscope::{
     DedicatedWorkerGlobalScope, DedicatedWorkerScriptMsg,
 };
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::messageevent::MessageEvent;
+use crate::dom::trustedscripturl::TrustedScriptURL;
 use crate::dom::window::Window;
 use crate::dom::workerglobalscope::prepare_workerscope_init;
 use crate::realms::enter_realm;
 use crate::script_runtime::{CanGc, JSContext, ThreadSafeJSContext};
 use crate::task::TaskOnce;
 
-pub type TrustedWorkerAddress = Trusted<Worker>;
+pub(crate) type TrustedWorkerAddress = Trusted<Worker>;
 
 // https://html.spec.whatwg.org/multipage/#worker
 #[dom_struct]
-pub struct Worker {
+pub(crate) struct Worker {
     eventtarget: EventTarget,
-    #[ignore_malloc_size_of = "Defined in std"]
-    #[no_trace]
     /// Sender to the Receiver associated with the DedicatedWorkerGlobalScope
     /// this Worker created.
     sender: Sender<DedicatedWorkerScriptMsg>,
@@ -85,11 +85,11 @@ impl Worker {
         )
     }
 
-    pub fn is_terminated(&self) -> bool {
+    pub(crate) fn is_terminated(&self) -> bool {
         self.terminated.get()
     }
 
-    pub fn set_context_for_interrupt(&self, cx: ThreadSafeJSContext) {
+    pub(crate) fn set_context_for_interrupt(&self, cx: ThreadSafeJSContext) {
         assert!(
             self.context_for_interrupt.borrow().is_none(),
             "Context for interrupt must be set only once"
@@ -97,7 +97,11 @@ impl Worker {
         *self.context_for_interrupt.borrow_mut() = Some(cx);
     }
 
-    pub fn handle_message(address: TrustedWorkerAddress, data: StructuredSerializedData) {
+    pub(crate) fn handle_message(
+        address: TrustedWorkerAddress,
+        data: StructuredSerializedData,
+        can_gc: CanGc,
+    ) {
         let worker = address.root();
 
         if worker.is_terminated() {
@@ -109,16 +113,24 @@ impl Worker {
         let _ac = enter_realm(target);
         rooted!(in(*GlobalScope::get_cx()) let mut message = UndefinedValue());
         if let Ok(ports) = structuredclone::read(&global, data, message.handle_mut()) {
-            MessageEvent::dispatch_jsval(target, &global, message.handle(), None, None, ports);
+            MessageEvent::dispatch_jsval(
+                target,
+                &global,
+                message.handle(),
+                None,
+                None,
+                ports,
+                can_gc,
+            );
         } else {
             // Step 4 of the "port post message steps" of the implicit messageport, fire messageerror.
-            MessageEvent::dispatch_error(target, &global);
+            MessageEvent::dispatch_error(target, &global, can_gc);
         }
     }
 
-    pub fn dispatch_simple_error(address: TrustedWorkerAddress) {
+    pub(crate) fn dispatch_simple_error(address: TrustedWorkerAddress, can_gc: CanGc) {
         let worker = address.root();
-        worker.upcast().fire_event(atom!("error"));
+        worker.upcast().fire_event(atom!("error"), can_gc);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-dedicatedworkerglobalscope-postmessage>
@@ -137,25 +149,35 @@ impl Worker {
             address,
             WorkerScriptMsg::DOMMessage {
                 origin: self.global().origin().immutable().clone(),
-                data,
+                data: Box::new(data),
             },
         ));
         Ok(())
     }
 }
 
-impl WorkerMethods for Worker {
+impl WorkerMethods<crate::DomTypeHolder> for Worker {
     // https://html.spec.whatwg.org/multipage/#dom-worker
     #[allow(unsafe_code)]
     fn Constructor(
         global: &GlobalScope,
         proto: Option<HandleObject>,
         can_gc: CanGc,
-        script_url: USVString,
+        script_url: TrustedScriptURLOrUSVString,
         worker_options: &WorkerOptions,
     ) -> Fallible<DomRoot<Worker>> {
+        // Step 1: Let compliantScriptURL be the result of invoking the
+        // Get Trusted Type compliant string algorithm with TrustedScriptURL,
+        // this's relevant global object, scriptURL, "Worker constructor", and "script".
+        let compliant_script_url = TrustedScriptURL::get_trusted_script_url_compliant_string(
+            global,
+            script_url,
+            "Worker",
+            "constructor",
+            can_gc,
+        )?;
         // Step 2-4.
-        let worker_url = match global.api_base_url().join(&script_url) {
+        let worker_url = match global.api_base_url().join(&compliant_script_url) {
             Ok(url) => url,
             Err(_) => return Err(Error::Syntax),
         };
@@ -166,10 +188,16 @@ impl WorkerMethods for Worker {
         let worker_ref = Trusted::new(&*worker);
 
         let worker_load_origin = WorkerScriptLoadOrigin {
-            referrer_url: None,
-            referrer_policy: None,
+            referrer_url: match global.get_referrer() {
+                Referrer::Client(url) => Some(url),
+                Referrer::ReferrerUrl(url) => Some(url),
+                _ => None,
+            },
+            referrer_policy: global.get_referrer_policy(),
             pipeline_id: global.pipeline_id(),
         };
+
+        let webview_id = global.webview_id().expect("global must have a webview id");
 
         let browsing_context = global
             .downcast::<Window>()
@@ -189,11 +217,22 @@ impl WorkerMethods for Worker {
                 let page_info = DevtoolsPageInfo {
                     title,
                     url: worker_url.clone(),
+                    is_top_level_global: false,
                 };
                 let _ = chan.send(ScriptToDevtoolsControlMsg::NewGlobal(
-                    (browsing_context, pipeline_id, Some(worker_id)),
+                    (browsing_context, pipeline_id, Some(worker_id), webview_id),
                     devtools_sender.clone(),
                     page_info,
+                ));
+
+                let source_info = SourceInfo {
+                    url: worker_url.clone(),
+                    external: true, // Worker scripts are always external.
+                    worker_id: Some(worker_id),
+                };
+                let _ = chan.send(ScriptToDevtoolsControlMsg::ScriptSourceLoaded(
+                    pipeline_id,
+                    source_info,
                 ));
             }
         }
@@ -203,12 +242,15 @@ impl WorkerMethods for Worker {
         let (control_sender, control_receiver) = unbounded();
         let (context_sender, context_receiver) = unbounded();
 
+        let event_loop_sender = global
+            .event_loop_sender()
+            .expect("Tried to create a worker in a worker while not handling a message?");
         let join_handle = DedicatedWorkerGlobalScope::run_worker_scope(
             init,
             worker_url,
             devtools_receiver,
             worker_ref,
-            global.script_chan(),
+            event_loop_sender,
             sender,
             receiver,
             worker_load_origin,
@@ -217,10 +259,12 @@ impl WorkerMethods for Worker {
             closing.clone(),
             global.image_cache(),
             browsing_context,
+            #[cfg(feature = "webgpu")]
             global.wgpu_id_hub(),
             control_receiver,
             context_sender,
-            can_gc,
+            global.insecure_requests_policy(),
+            global.policy_container(),
         );
 
         let context = context_receiver
@@ -288,8 +332,8 @@ impl WorkerMethods for Worker {
 }
 
 impl TaskOnce for SimpleWorkerErrorHandler<Worker> {
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn run_once(self) {
-        Worker::dispatch_simple_error(self.addr);
+        Worker::dispatch_simple_error(self.addr, CanGc::note());
     }
 }

@@ -12,6 +12,7 @@
 /python/_venv*
 /python/tidy/servo_tidy.egg-info
 /tests/wpt/sync
+/tests/wpt/**/**/.cache/
 /tests/dromaeo/dromaeo
 *.pkl
 *.pyc
@@ -57,6 +58,7 @@ Session.vim
 Sessionx.vim
 
 /unminified-js
+/unminified-css
 
 # Layout debugger trace files
 layout_trace*

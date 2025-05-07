@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
-use html5ever::{local_name, namespace_url, ns, LocalName, Prefix};
+use html5ever::{LocalName, Prefix, local_name, ns};
 use js::rust::HandleObject;
 use style::attr::{AttrValue, LengthOrPercentageOrAuto};
 use style::color::AbsoluteColor;
@@ -22,12 +22,13 @@ use crate::dom::htmltablerowelement::HTMLTableRowElement;
 use crate::dom::htmltablesectionelement::HTMLTableSectionElement;
 use crate::dom::node::{LayoutNodeHelpers, Node};
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
 
 const DEFAULT_COLSPAN: u32 = 1;
 const DEFAULT_ROWSPAN: u32 = 1;
 
 #[dom_struct]
-pub struct HTMLTableCellElement {
+pub(crate) struct HTMLTableCellElement {
     htmlelement: HTMLElement,
 }
 
@@ -42,12 +43,13 @@ impl HTMLTableCellElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLTableCellElement> {
         let n = Node::reflect_node_with_proto(
             Box::new(HTMLTableCellElement::new_inherited(
@@ -55,6 +57,7 @@ impl HTMLTableCellElement {
             )),
             document,
             proto,
+            can_gc,
         );
 
         n.upcast::<Node>().set_weird_parser_insertion_mode();
@@ -62,18 +65,22 @@ impl HTMLTableCellElement {
     }
 }
 
-impl HTMLTableCellElementMethods for HTMLTableCellElement {
+impl HTMLTableCellElementMethods<crate::DomTypeHolder> for HTMLTableCellElement {
     // https://html.spec.whatwg.org/multipage/#dom-tdth-colspan
     make_uint_getter!(ColSpan, "colspan", DEFAULT_COLSPAN);
 
     // https://html.spec.whatwg.org/multipage/#dom-tdth-colspan
-    make_uint_setter!(SetColSpan, "colspan", DEFAULT_COLSPAN);
+    // > The colSpan IDL attribute must reflect the colspan content attribute. It is clamped to
+    // > the range [1, 1000], and its default value is 1.
+    make_clamped_uint_setter!(SetColSpan, "colspan", 1, 1000, 1);
 
     // https://html.spec.whatwg.org/multipage/#dom-tdth-rowspan
     make_uint_getter!(RowSpan, "rowspan", DEFAULT_ROWSPAN);
 
     // https://html.spec.whatwg.org/multipage/#dom-tdth-rowspan
-    make_uint_setter!(SetRowSpan, "rowspan", DEFAULT_ROWSPAN);
+    // > The rowSpan IDL attribute must reflect the rowspan content attribute. It is clamped to
+    // > the range [0, 65534], and its default value is 1.
+    make_clamped_uint_setter!(SetRowSpan, "rowspan", 0, 65534, 1);
 
     // https://html.spec.whatwg.org/multipage/#dom-tdth-bgcolor
     make_getter!(BgColor, "bgcolor");
@@ -105,7 +112,7 @@ impl HTMLTableCellElementMethods for HTMLTableCellElement {
     }
 }
 
-pub trait HTMLTableCellElementLayoutHelpers<'dom> {
+pub(crate) trait HTMLTableCellElementLayoutHelpers<'dom> {
     fn get_background_color(self) -> Option<AbsoluteColor>;
     fn get_colspan(self) -> Option<u32>;
     fn get_rowspan(self) -> Option<u32>;
@@ -171,23 +178,26 @@ impl VirtualMethods for HTMLTableCellElement {
         match *local_name {
             local_name!("colspan") => {
                 let mut attr = AttrValue::from_u32(value.into(), DEFAULT_COLSPAN);
-                if let AttrValue::UInt(_, ref mut val) = attr {
-                    if *val == 0 {
-                        *val = 1;
-                    }
+                if let AttrValue::UInt(_, ref mut value) = attr {
+                    // From <https://html.spec.whatwg.org/multipage/#dom-tdth-colspan>:
+                    // > The colSpan IDL attribute must reflect the colspan content attribute. It is clamped to
+                    // > the range [1, 1000], and its default value is 1.
+                    *value = (*value).clamp(1, 1000);
                 }
                 attr
             },
             local_name!("rowspan") => {
                 let mut attr = AttrValue::from_u32(value.into(), DEFAULT_ROWSPAN);
-                if let AttrValue::UInt(_, ref mut val) = attr {
-                    if *val == 0 {
-                        let node = self.upcast::<Node>();
-                        let doc = node.owner_doc();
-                        // rowspan = 0 is not supported in quirks mode
-                        if doc.quirks_mode() != QuirksMode::NoQuirks {
-                            *val = 1;
-                        }
+                if let AttrValue::UInt(_, ref mut value) = attr {
+                    // From <https://html.spec.whatwg.org/multipage/#dom-tdth-rowspan>:
+                    // > The rowSpan IDL attribute must reflect the rowspan content attribute. It is clamped to
+                    // > the range [0, 65534], and its default value is 1.
+                    // Note that rowspan = 0 is not supported in quirks mode.
+                    let document = self.upcast::<Node>().owner_doc();
+                    if document.quirks_mode() != QuirksMode::NoQuirks {
+                        *value = (*value).clamp(1, 65534);
+                    } else {
+                        *value = (*value).clamp(0, 65534);
                     }
                 }
                 attr

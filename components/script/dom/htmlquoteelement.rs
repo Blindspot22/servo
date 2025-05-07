@@ -12,9 +12,10 @@ use crate::dom::bindings::str::USVString;
 use crate::dom::document::Document;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::node::Node;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct HTMLQuoteElement {
+pub(crate) struct HTMLQuoteElement {
     htmlelement: HTMLElement,
 }
 
@@ -29,12 +30,13 @@ impl HTMLQuoteElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLQuoteElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLQuoteElement::new_inherited(
@@ -42,11 +44,12 @@ impl HTMLQuoteElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 }
 
-impl HTMLQuoteElementMethods for HTMLQuoteElement {
+impl HTMLQuoteElementMethods<crate::DomTypeHolder> for HTMLQuoteElement {
     // https://html.spec.whatwg.org/multipage/#dom-quote-cite
     make_url_getter!(Cite, "cite");
 

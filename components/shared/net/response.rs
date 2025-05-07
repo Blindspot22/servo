@@ -4,8 +4,8 @@
 
 //! The [Response](https://fetch.spec.whatwg.org/#responses) object
 //! resulting from a [fetch operation](https://fetch.spec.whatwg.org/#concept-fetch)
-use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 
 use headers::{ContentType, HeaderMapExt};
 use http::HeaderMap;
@@ -104,7 +104,7 @@ pub struct Response {
     pub cache_state: CacheState,
     pub https_state: HttpsState,
     pub referrer: Option<ServoUrl>,
-    pub referrer_policy: Option<ReferrerPolicy>,
+    pub referrer_policy: ReferrerPolicy,
     /// [CORS-exposed header-name list](https://fetch.spec.whatwg.org/#concept-response-cors-exposed-header-name-list)
     pub cors_exposed_header_name_list: Vec<String>,
     /// [Location URL](https://fetch.spec.whatwg.org/#concept-response-location-url)
@@ -120,6 +120,9 @@ pub struct Response {
     /// track network metrics
     #[ignore_malloc_size_of = "Mutex heap size undefined"]
     pub resource_timing: Arc<Mutex<ResourceFetchTiming>>,
+
+    /// <https://fetch.spec.whatwg.org/#concept-response-range-requested-flag>
+    pub range_requested: bool,
 }
 
 impl Response {
@@ -135,13 +138,14 @@ impl Response {
             cache_state: CacheState::None,
             https_state: HttpsState::None,
             referrer: None,
-            referrer_policy: None,
+            referrer_policy: ReferrerPolicy::EmptyString,
             cors_exposed_header_name_list: vec![],
             location_url: None,
             internal_response: None,
             return_internal: true,
             aborted: Arc::new(AtomicBool::new(false)),
             resource_timing: Arc::new(Mutex::new(resource_timing)),
+            range_requested: false,
         }
     }
 
@@ -166,7 +170,7 @@ impl Response {
             cache_state: CacheState::None,
             https_state: HttpsState::None,
             referrer: None,
-            referrer_policy: None,
+            referrer_policy: ReferrerPolicy::EmptyString,
             cors_exposed_header_name_list: vec![],
             location_url: None,
             internal_response: None,
@@ -175,6 +179,7 @@ impl Response {
             resource_timing: Arc::new(Mutex::new(ResourceFetchTiming::new(
                 ResourceTimingType::Error,
             ))),
+            range_requested: false,
         }
     }
 

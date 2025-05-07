@@ -3,11 +3,11 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use base::id::PipelineId;
+use constellation_traits::{ScriptToConstellationMessage, StructuredSerializedData};
 use dom_struct::dom_struct;
 use js::jsapi::{Heap, JSObject};
-use js::jsval::{JSVal, UndefinedValue};
-use js::rust::{CustomAutoRooter, CustomAutoRooterGuard, HandleValue};
-use script_traits::{ScriptMsg, StructuredSerializedData};
+use js::jsval::UndefinedValue;
+use js::rust::{CustomAutoRooter, CustomAutoRooterGuard, HandleValue, MutableHandleValue};
 use servo_url::ServoUrl;
 
 use crate::dom::bindings::codegen::Bindings::DissimilarOriginWindowBinding;
@@ -21,7 +21,7 @@ use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::dissimilaroriginlocation::DissimilarOriginLocation;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::windowproxy::WindowProxy;
-use crate::script_runtime::JSContext;
+use crate::script_runtime::{CanGc, JSContext};
 
 /// Represents a dissimilar-origin `Window` that exists in another script thread.
 ///
@@ -33,7 +33,7 @@ use crate::script_runtime::JSContext;
 /// that throws security exceptions for most accessors. This is not a replacement
 /// for XOWs, but provides belt-and-braces security.
 #[dom_struct]
-pub struct DissimilarOriginWindow {
+pub(crate) struct DissimilarOriginWindow {
     /// The global for this window.
     globalscope: GlobalScope,
 
@@ -46,7 +46,10 @@ pub struct DissimilarOriginWindow {
 
 impl DissimilarOriginWindow {
     #[allow(unsafe_code)]
-    pub fn new(global_to_clone_from: &GlobalScope, window_proxy: &WindowProxy) -> DomRoot<Self> {
+    pub(crate) fn new(
+        global_to_clone_from: &GlobalScope,
+        window_proxy: &WindowProxy,
+    ) -> DomRoot<Self> {
         let cx = GlobalScope::get_cx();
         let win = Box::new(Self {
             globalscope: GlobalScope::new_inherited(
@@ -55,30 +58,29 @@ impl DissimilarOriginWindow {
                 global_to_clone_from.mem_profiler_chan().clone(),
                 global_to_clone_from.time_profiler_chan().clone(),
                 global_to_clone_from.script_to_constellation_chan().clone(),
-                global_to_clone_from.scheduler_chan().clone(),
                 global_to_clone_from.resource_threads().clone(),
                 global_to_clone_from.origin().clone(),
                 global_to_clone_from.creation_url().clone(),
                 // FIXME(nox): The microtask queue is probably not important
                 // here, but this whole DOM interface is a hack anyway.
                 global_to_clone_from.microtask_queue().clone(),
-                global_to_clone_from.is_headless(),
-                global_to_clone_from.get_user_agent(),
+                #[cfg(feature = "webgpu")]
                 global_to_clone_from.wgpu_id_hub(),
                 Some(global_to_clone_from.is_secure_context()),
+                false,
             ),
             window_proxy: Dom::from_ref(window_proxy),
             location: Default::default(),
         });
-        unsafe { DissimilarOriginWindowBinding::Wrap(cx, win) }
+        unsafe { DissimilarOriginWindowBinding::Wrap::<crate::DomTypeHolder>(cx, win) }
     }
 
-    pub fn window_proxy(&self) -> DomRoot<WindowProxy> {
+    pub(crate) fn window_proxy(&self) -> DomRoot<WindowProxy> {
         DomRoot::from_ref(&*self.window_proxy)
     }
 }
 
-impl DissimilarOriginWindowMethods for DissimilarOriginWindow {
+impl DissimilarOriginWindowMethods<crate::DomTypeHolder> for DissimilarOriginWindow {
     // https://html.spec.whatwg.org/multipage/#dom-window
     fn Window(&self) -> DomRoot<WindowProxy> {
         self.window_proxy()
@@ -167,9 +169,9 @@ impl DissimilarOriginWindowMethods for DissimilarOriginWindow {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-opener
-    fn Opener(&self, _: JSContext) -> JSVal {
+    fn Opener(&self, _: JSContext, mut retval: MutableHandleValue) {
         // TODO: Implement x-origin opener
-        UndefinedValue()
+        retval.set(UndefinedValue());
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-opener
@@ -179,18 +181,19 @@ impl DissimilarOriginWindowMethods for DissimilarOriginWindow {
 
     // https://html.spec.whatwg.org/multipage/#dom-window-blur
     fn Blur(&self) {
-        // TODO: Implement x-origin blur
+        // > User agents are encouraged to ignore calls to this `blur()` method
+        // > entirely.
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-focus
+    // https://html.spec.whatwg.org/multipage/#dom-window-focus
     fn Focus(&self) {
-        // TODO: Implement x-origin focus
+        self.window_proxy().focus();
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-location
-    fn Location(&self) -> DomRoot<DissimilarOriginLocation> {
+    fn Location(&self, can_gc: CanGc) -> DomRoot<DissimilarOriginLocation> {
         self.location
-            .or_init(|| DissimilarOriginLocation::new(self))
+            .or_init(|| DissimilarOriginLocation::new(self, can_gc))
     }
 }
 
@@ -210,7 +213,7 @@ impl DissimilarOriginWindow {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#window-post-message-steps>
-    pub fn post_message(
+    pub(crate) fn post_message(
         &self,
         target_origin: &USVString,
         data: StructuredSerializedData,
@@ -234,7 +237,7 @@ impl DissimilarOriginWindow {
                 Err(_) => return Err(Error::Syntax),
             },
         };
-        let msg = ScriptMsg::PostMessage {
+        let msg = ScriptToConstellationMessage::PostMessage {
             target,
             source: incumbent.pipeline_id(),
             source_origin,

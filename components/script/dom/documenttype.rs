@@ -12,11 +12,12 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
 use crate::dom::node::Node;
+use crate::script_runtime::CanGc;
 
 // https://dom.spec.whatwg.org/#documenttype
 /// The `DOCTYPE` tag.
 #[dom_struct]
-pub struct DocumentType {
+pub(crate) struct DocumentType {
     node: Node,
     name: DOMString,
     public_id: DOMString,
@@ -37,38 +38,40 @@ impl DocumentType {
             system_id: system_id.unwrap_or_default(),
         }
     }
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         name: DOMString,
         public_id: Option<DOMString>,
         system_id: Option<DOMString>,
         document: &Document,
+        can_gc: CanGc,
     ) -> DomRoot<DocumentType> {
         Node::reflect_node(
             Box::new(DocumentType::new_inherited(
                 name, public_id, system_id, document,
             )),
             document,
+            can_gc,
         )
     }
 
     #[inline]
-    pub fn name(&self) -> &DOMString {
+    pub(crate) fn name(&self) -> &DOMString {
         &self.name
     }
 
     #[inline]
-    pub fn public_id(&self) -> &DOMString {
+    pub(crate) fn public_id(&self) -> &DOMString {
         &self.public_id
     }
 
     #[inline]
-    pub fn system_id(&self) -> &DOMString {
+    pub(crate) fn system_id(&self) -> &DOMString {
         &self.system_id
     }
 }
 
-impl DocumentTypeMethods for DocumentType {
+impl DocumentTypeMethods<crate::DomTypeHolder> for DocumentType {
     // https://dom.spec.whatwg.org/#dom-documenttype-name
     fn Name(&self) -> DOMString {
         self.name.clone()
@@ -85,22 +88,22 @@ impl DocumentTypeMethods for DocumentType {
     }
 
     // https://dom.spec.whatwg.org/#dom-childnode-before
-    fn Before(&self, nodes: Vec<NodeOrString>) -> ErrorResult {
-        self.upcast::<Node>().before(nodes)
+    fn Before(&self, nodes: Vec<NodeOrString>, can_gc: CanGc) -> ErrorResult {
+        self.upcast::<Node>().before(nodes, can_gc)
     }
 
     // https://dom.spec.whatwg.org/#dom-childnode-after
-    fn After(&self, nodes: Vec<NodeOrString>) -> ErrorResult {
-        self.upcast::<Node>().after(nodes)
+    fn After(&self, nodes: Vec<NodeOrString>, can_gc: CanGc) -> ErrorResult {
+        self.upcast::<Node>().after(nodes, can_gc)
     }
 
     // https://dom.spec.whatwg.org/#dom-childnode-replacewith
-    fn ReplaceWith(&self, nodes: Vec<NodeOrString>) -> ErrorResult {
-        self.upcast::<Node>().replace_with(nodes)
+    fn ReplaceWith(&self, nodes: Vec<NodeOrString>, can_gc: CanGc) -> ErrorResult {
+        self.upcast::<Node>().replace_with(nodes, can_gc)
     }
 
     // https://dom.spec.whatwg.org/#dom-childnode-remove
-    fn Remove(&self) {
-        self.upcast::<Node>().remove_self();
+    fn Remove(&self, can_gc: CanGc) {
+        self.upcast::<Node>().remove_self(can_gc);
     }
 }

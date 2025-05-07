@@ -7,8 +7,8 @@ use std::cell::Cell;
 use dom_struct::dom_struct;
 use js::jsapi::Heap;
 use js::jsval::JSVal;
-use js::rust::{HandleObject, HandleValue};
-use servo_atoms::Atom;
+use js::rust::{HandleObject, HandleValue, MutableHandleValue};
+use stylo_atoms::Atom;
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::ErrorEventBinding;
@@ -25,7 +25,7 @@ use crate::dom::globalscope::GlobalScope;
 use crate::script_runtime::{CanGc, JSContext};
 
 #[dom_struct]
-pub struct ErrorEvent {
+pub(crate) struct ErrorEvent {
     event: Event,
     message: DomRefCell<DOMString>,
     filename: DomRefCell<DOMString>,
@@ -56,7 +56,7 @@ impl ErrorEvent {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         global: &GlobalScope,
         type_: Atom,
         bubbles: EventBubbles,
@@ -66,19 +66,11 @@ impl ErrorEvent {
         lineno: u32,
         colno: u32,
         error: HandleValue,
+        can_gc: CanGc,
     ) -> DomRoot<ErrorEvent> {
         Self::new_with_proto(
-            global,
-            None,
-            type_,
-            bubbles,
-            cancelable,
-            message,
-            filename,
-            lineno,
-            colno,
-            error,
-            CanGc::note(),
+            global, None, type_, bubbles, cancelable, message, filename, lineno, colno, error,
+            can_gc,
         )
     }
 
@@ -110,7 +102,7 @@ impl ErrorEvent {
     }
 }
 
-impl ErrorEventMethods for ErrorEvent {
+impl ErrorEventMethods<crate::DomTypeHolder> for ErrorEvent {
     // https://html.spec.whatwg.org/multipage/#errorevent
     fn Constructor(
         global: &GlobalScope,
@@ -150,6 +142,7 @@ impl ErrorEventMethods for ErrorEvent {
             init.error.handle(),
             can_gc,
         );
+        event.upcast::<Event>().set_composed(init.parent.composed);
         Ok(event)
     }
 
@@ -174,8 +167,8 @@ impl ErrorEventMethods for ErrorEvent {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-errorevent-error
-    fn Error(&self, _cx: JSContext) -> JSVal {
-        self.error.get()
+    fn Error(&self, _cx: JSContext, mut retval: MutableHandleValue) {
+        retval.set(self.error.get());
     }
 
     // https://dom.spec.whatwg.org/#dom-event-istrusted

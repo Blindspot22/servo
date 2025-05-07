@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use js::jsapi::JSObject;
+use servo_config::pref;
 
 use crate::dom::bindings::codegen::RegisterBindings;
 use crate::dom::bindings::conversions::is_dom_proxy;
@@ -61,11 +62,15 @@ unsafe extern "C" fn is_dom_object(obj: *mut JSObject) -> bool {
 #[allow(unsafe_code)]
 pub fn init() -> JSEngineSetup {
     unsafe {
+        if pref!(js_disable_jit) {
+            js::jsapi::DisableJitBackend();
+        }
         proxyhandler::init();
 
         // Create the global vtables used by the (generated) DOM
         // bindings to implement JS proxies.
-        RegisterBindings::RegisterProxyHandlers();
+        RegisterBindings::RegisterProxyHandlers::<crate::DomTypeHolder>();
+        RegisterBindings::InitAllStatics::<crate::DomTypeHolder>();
 
         js::glue::InitializeMemoryReporter(Some(is_dom_object));
     }

@@ -5,18 +5,34 @@
 //! Trait representing the concept of [transferable objects]
 //! (<https://html.spec.whatwg.org/multipage/#transferable-objects>).
 
-use js::jsapi::MutableHandleObject;
+use std::collections::HashMap;
+use std::hash::Hash;
+
+use base::id::NamespaceIndex;
 
 use crate::dom::bindings::reflector::DomObject;
-use crate::dom::bindings::structuredclone::StructuredDataHolder;
+use crate::dom::bindings::root::DomRoot;
+use crate::dom::bindings::structuredclone::StructuredData;
 use crate::dom::globalscope::GlobalScope;
+pub(crate) trait Transferable: DomObject
+where
+    Self: Sized,
+{
+    type Index: Copy + Eq + Hash;
+    type Data;
 
-pub trait Transferable: DomObject {
-    fn transfer(&self, sc_holder: &mut StructuredDataHolder) -> Result<u64, ()>;
+    fn can_transfer(&self) -> bool {
+        true
+    }
+
+    fn transfer(&self) -> Result<(NamespaceIndex<Self::Index>, Self::Data), ()>;
     fn transfer_receive(
         owner: &GlobalScope,
-        sc_holder: &mut StructuredDataHolder,
-        extra_data: u64,
-        return_object: MutableHandleObject,
-    ) -> Result<(), ()>;
+        id: NamespaceIndex<Self::Index>,
+        serialized: Self::Data,
+    ) -> Result<DomRoot<Self>, ()>;
+
+    fn serialized_storage<'a>(
+        data: StructuredData<'a, '_>,
+    ) -> &'a mut Option<HashMap<NamespaceIndex<Self::Index>, Self::Data>>;
 }

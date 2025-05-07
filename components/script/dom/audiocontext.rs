@@ -9,6 +9,7 @@ use dom_struct::dom_struct;
 use js::rust::HandleObject;
 use servo_media::audio::context::{LatencyCategory, ProcessingState, RealTimeAudioContextOptions};
 
+use crate::conversions::Convert;
 use crate::dom::baseaudiocontext::{BaseAudioContext, BaseAudioContextOptions};
 use crate::dom::bindings::codegen::Bindings::AudioContextBinding::{
     AudioContextLatencyCategory, AudioContextMethods, AudioContextOptions, AudioTimestamp,
@@ -21,7 +22,7 @@ use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::refcounted::{Trusted, TrustedPromise};
-use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomObject};
+use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object_with_proto};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::htmlmediaelement::HTMLMediaElement;
 use crate::dom::mediaelementaudiosourcenode::MediaElementAudioSourceNode;
@@ -34,10 +35,9 @@ use crate::dom::promise::Promise;
 use crate::dom::window::Window;
 use crate::realms::InRealm;
 use crate::script_runtime::CanGc;
-use crate::task_source::TaskSource;
 
 #[dom_struct]
-pub struct AudioContext {
+pub(crate) struct AudioContext {
     context: BaseAudioContext,
     latency_hint: AudioContextLatencyCategory,
     /// <https://webaudio.github.io/web-audio-api/#dom-audiocontext-baselatency>
@@ -47,7 +47,7 @@ pub struct AudioContext {
 }
 
 impl AudioContext {
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     // https://webaudio.github.io/web-audio-api/#AudioContext-constructors
     fn new_inherited(
         options: &AudioContextOptions,
@@ -55,7 +55,7 @@ impl AudioContext {
     ) -> Fallible<AudioContext> {
         // Steps 1-3.
         let context = BaseAudioContext::new_inherited(
-            BaseAudioContextOptions::AudioContext(options.into()),
+            BaseAudioContextOptions::AudioContext(options.convert()),
             pipeline_id,
         )?;
 
@@ -82,7 +82,7 @@ impl AudioContext {
         })
     }
 
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn new(
         window: &Window,
         proto: Option<HandleObject>,
@@ -104,12 +104,12 @@ impl AudioContext {
         }
     }
 
-    pub fn base(&self) -> DomRoot<BaseAudioContext> {
+    pub(crate) fn base(&self) -> DomRoot<BaseAudioContext> {
         DomRoot::from_ref(&self.context)
     }
 }
 
-impl AudioContextMethods for AudioContext {
+impl AudioContextMethods<crate::DomTypeHolder> for AudioContext {
     // https://webaudio.github.io/web-audio-api/#AudioContext-constructors
     fn Constructor(
         window: &Window,
@@ -140,59 +140,54 @@ impl AudioContextMethods for AudioContext {
     }
 
     // https://webaudio.github.io/web-audio-api/#dom-audiocontext-suspend
-    fn Suspend(&self, comp: InRealm) -> Rc<Promise> {
+    fn Suspend(&self, comp: InRealm, can_gc: CanGc) -> Rc<Promise> {
         // Step 1.
-        let promise = Promise::new_in_current_realm(comp);
+        let promise = Promise::new_in_current_realm(comp, can_gc);
 
         // Step 2.
         if self.context.control_thread_state() == ProcessingState::Closed {
-            promise.reject_error(Error::InvalidState);
+            promise.reject_error(Error::InvalidState, can_gc);
             return promise;
         }
 
         // Step 3.
         if self.context.State() == AudioContextState::Suspended {
-            promise.resolve_native(&());
+            promise.resolve_native(&(), can_gc);
             return promise;
         }
 
         // Steps 4 and 5.
-        let window = DomRoot::downcast::<Window>(self.global()).unwrap();
-        let task_source = window.task_manager().dom_manipulation_task_source();
         let trusted_promise = TrustedPromise::new(promise.clone());
         match self.context.audio_context_impl().lock().unwrap().suspend() {
             Ok(_) => {
                 let base_context = Trusted::new(&self.context);
                 let context = Trusted::new(self);
-                let _ = task_source.queue(
+                self.global().task_manager().dom_manipulation_task_source().queue(
                     task!(suspend_ok: move || {
                         let base_context = base_context.root();
                         let context = context.root();
                         let promise = trusted_promise.root();
-                        promise.resolve_native(&());
+                        promise.resolve_native(&(), CanGc::note());
                         if base_context.State() != AudioContextState::Suspended {
                             base_context.set_state_attribute(AudioContextState::Suspended);
-                            let window = DomRoot::downcast::<Window>(context.global()).unwrap();
-                            window.task_manager().dom_manipulation_task_source().queue_simple_event(
+                            context.global().task_manager().dom_manipulation_task_source().queue_simple_event(
                                 context.upcast(),
                                 atom!("statechange"),
-                                &window
-                                );
+                            );
                         }
-                    }),
-                    window.upcast(),
+                    })
                 );
             },
             Err(_) => {
                 // The spec does not define the error case and `suspend` should
                 // never fail, but we handle the case here for completion.
-                let _ = task_source.queue(
-                    task!(suspend_error: move || {
+                self.global()
+                    .task_manager()
+                    .dom_manipulation_task_source()
+                    .queue(task!(suspend_error: move || {
                         let promise = trusted_promise.root();
-                        promise.reject_error(Error::Type("Something went wrong".to_owned()));
-                    }),
-                    window.upcast(),
-                );
+                        promise.reject_error(Error::Type("Something went wrong".to_owned()), CanGc::note());
+                    }));
             },
         };
 
@@ -201,59 +196,54 @@ impl AudioContextMethods for AudioContext {
     }
 
     // https://webaudio.github.io/web-audio-api/#dom-audiocontext-close
-    fn Close(&self, comp: InRealm) -> Rc<Promise> {
+    fn Close(&self, comp: InRealm, can_gc: CanGc) -> Rc<Promise> {
         // Step 1.
-        let promise = Promise::new_in_current_realm(comp);
+        let promise = Promise::new_in_current_realm(comp, can_gc);
 
         // Step 2.
         if self.context.control_thread_state() == ProcessingState::Closed {
-            promise.reject_error(Error::InvalidState);
+            promise.reject_error(Error::InvalidState, can_gc);
             return promise;
         }
 
         // Step 3.
         if self.context.State() == AudioContextState::Closed {
-            promise.resolve_native(&());
+            promise.resolve_native(&(), can_gc);
             return promise;
         }
 
         // Steps 4 and 5.
-        let window = DomRoot::downcast::<Window>(self.global()).unwrap();
-        let task_source = window.task_manager().dom_manipulation_task_source();
         let trusted_promise = TrustedPromise::new(promise.clone());
         match self.context.audio_context_impl().lock().unwrap().close() {
             Ok(_) => {
                 let base_context = Trusted::new(&self.context);
                 let context = Trusted::new(self);
-                let _ = task_source.queue(
+                self.global().task_manager().dom_manipulation_task_source().queue(
                     task!(suspend_ok: move || {
                         let base_context = base_context.root();
                         let context = context.root();
                         let promise = trusted_promise.root();
-                        promise.resolve_native(&());
+                        promise.resolve_native(&(), CanGc::note());
                         if base_context.State() != AudioContextState::Closed {
                             base_context.set_state_attribute(AudioContextState::Closed);
-                            let window = DomRoot::downcast::<Window>(context.global()).unwrap();
-                            window.task_manager().dom_manipulation_task_source().queue_simple_event(
+                            context.global().task_manager().dom_manipulation_task_source().queue_simple_event(
                                 context.upcast(),
                                 atom!("statechange"),
-                                &window
-                                );
+                            );
                         }
-                    }),
-                    window.upcast(),
+                    })
                 );
             },
             Err(_) => {
                 // The spec does not define the error case and `suspend` should
                 // never fail, but we handle the case here for completion.
-                let _ = task_source.queue(
-                    task!(suspend_error: move || {
+                self.global()
+                    .task_manager()
+                    .dom_manipulation_task_source()
+                    .queue(task!(suspend_error: move || {
                         let promise = trusted_promise.root();
-                        promise.reject_error(Error::Type("Something went wrong".to_owned()));
-                    }),
-                    window.upcast(),
-                );
+                        promise.reject_error(Error::Type("Something went wrong".to_owned()), CanGc::note());
+                    }));
             },
         };
 
@@ -265,30 +255,33 @@ impl AudioContextMethods for AudioContext {
     fn CreateMediaElementSource(
         &self,
         media_element: &HTMLMediaElement,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<MediaElementAudioSourceNode>> {
         let global = self.global();
         let window = global.as_window();
-        MediaElementAudioSourceNode::new(window, self, media_element)
+        MediaElementAudioSourceNode::new(window, self, media_element, can_gc)
     }
 
     /// <https://webaudio.github.io/web-audio-api/#dom-audiocontext-createmediastreamsource>
     fn CreateMediaStreamSource(
         &self,
         stream: &MediaStream,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<MediaStreamAudioSourceNode>> {
         let global = self.global();
         let window = global.as_window();
-        MediaStreamAudioSourceNode::new(window, self, stream)
+        MediaStreamAudioSourceNode::new(window, self, stream, can_gc)
     }
 
     /// <https://webaudio.github.io/web-audio-api/#dom-audiocontext-createmediastreamtracksource>
     fn CreateMediaStreamTrackSource(
         &self,
         track: &MediaStreamTrack,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<MediaStreamTrackAudioSourceNode>> {
         let global = self.global();
         let window = global.as_window();
-        MediaStreamTrackAudioSourceNode::new(window, self, track)
+        MediaStreamTrackAudioSourceNode::new(window, self, track, can_gc)
     }
 
     /// <https://webaudio.github.io/web-audio-api/#dom-audiocontext-createmediastreamdestination>
@@ -302,9 +295,9 @@ impl AudioContextMethods for AudioContext {
     }
 }
 
-impl From<AudioContextLatencyCategory> for LatencyCategory {
-    fn from(category: AudioContextLatencyCategory) -> Self {
-        match category {
+impl Convert<LatencyCategory> for AudioContextLatencyCategory {
+    fn convert(self) -> LatencyCategory {
+        match self {
             AudioContextLatencyCategory::Balanced => LatencyCategory::Balanced,
             AudioContextLatencyCategory::Interactive => LatencyCategory::Interactive,
             AudioContextLatencyCategory::Playback => LatencyCategory::Playback,
@@ -312,13 +305,13 @@ impl From<AudioContextLatencyCategory> for LatencyCategory {
     }
 }
 
-impl<'a> From<&'a AudioContextOptions> for RealTimeAudioContextOptions {
-    fn from(options: &AudioContextOptions) -> Self {
-        Self {
-            sample_rate: *options.sampleRate.unwrap_or(Finite::wrap(44100.)),
-            latency_hint: match options.latencyHint {
+impl Convert<RealTimeAudioContextOptions> for &AudioContextOptions {
+    fn convert(self) -> RealTimeAudioContextOptions {
+        RealTimeAudioContextOptions {
+            sample_rate: *self.sampleRate.unwrap_or(Finite::wrap(44100.)),
+            latency_hint: match self.latencyHint {
                 AudioContextLatencyCategoryOrDouble::AudioContextLatencyCategory(category) => {
-                    category.into()
+                    category.convert()
                 },
                 AudioContextLatencyCategoryOrDouble::Double(_) => LatencyCategory::Interactive, // TODO
             },

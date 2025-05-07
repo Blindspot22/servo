@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
-use html5ever::{local_name, LocalName, Prefix};
+use html5ever::{LocalName, Prefix, local_name};
 use js::rust::HandleObject;
 
 use crate::dom::attr::Attr;
@@ -16,14 +16,15 @@ use crate::dom::document::Document;
 use crate::dom::element::{AttributeMutation, Element};
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmlformelement::{FormControl, HTMLFormElement};
-use crate::dom::node::{window_from_node, Node};
+use crate::dom::node::{Node, NodeTraits};
 use crate::dom::nodelist::NodeList;
 use crate::dom::validation::Validatable;
 use crate::dom::validitystate::ValidityState;
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct HTMLOutputElement {
+pub(crate) struct HTMLOutputElement {
     htmlelement: HTMLElement,
     form_owner: MutNullableDom<HTMLFormElement>,
     labels_node_list: MutNullableDom<NodeList>,
@@ -46,12 +47,13 @@ impl HTMLOutputElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLOutputElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLOutputElement::new_inherited(
@@ -59,16 +61,17 @@ impl HTMLOutputElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 
-    pub fn reset(&self) {
-        Node::string_replace_all(self.DefaultValue(), self.upcast::<Node>());
+    pub(crate) fn reset(&self, can_gc: CanGc) {
+        Node::string_replace_all(self.DefaultValue(), self.upcast::<Node>(), can_gc);
         *self.default_value_override.borrow_mut() = None;
     }
 }
 
-impl HTMLOutputElementMethods for HTMLOutputElement {
+impl HTMLOutputElementMethods<crate::DomTypeHolder> for HTMLOutputElement {
     // https://html.spec.whatwg.org/multipage/#dom-fae-form
     fn GetForm(&self) -> Option<DomRoot<HTMLFormElement>> {
         self.form_owner()
@@ -88,10 +91,10 @@ impl HTMLOutputElementMethods for HTMLOutputElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-output-defaultvalue
-    fn SetDefaultValue(&self, value: DOMString) {
+    fn SetDefaultValue(&self, value: DOMString, can_gc: CanGc) {
         if self.default_value_override.borrow().is_none() {
             // Step 1 ("and return")
-            Node::string_replace_all(value.clone(), self.upcast::<Node>());
+            Node::string_replace_all(value.clone(), self.upcast::<Node>(), can_gc);
         } else {
             // Step 2, if not returned from step 1
             *self.default_value_override.borrow_mut() = Some(value);
@@ -104,9 +107,9 @@ impl HTMLOutputElementMethods for HTMLOutputElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-output-value
-    fn SetValue(&self, value: DOMString) {
+    fn SetValue(&self, value: DOMString, can_gc: CanGc) {
         *self.default_value_override.borrow_mut() = Some(self.DefaultValue());
-        Node::string_replace_all(value, self.upcast::<Node>());
+        Node::string_replace_all(value, self.upcast::<Node>(), can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-output-type
@@ -131,13 +134,13 @@ impl HTMLOutputElementMethods for HTMLOutputElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-checkvalidity
-    fn CheckValidity(&self) -> bool {
-        self.check_validity()
+    fn CheckValidity(&self, can_gc: CanGc) -> bool {
+        self.check_validity(can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-reportvalidity
-    fn ReportValidity(&self) -> bool {
-        self.report_validity()
+    fn ReportValidity(&self, can_gc: CanGc) -> bool {
+        self.report_validity(can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-validationmessage
@@ -156,10 +159,12 @@ impl VirtualMethods for HTMLOutputElement {
         Some(self.upcast::<HTMLElement>() as &dyn VirtualMethods)
     }
 
-    fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation) {
-        self.super_type().unwrap().attribute_mutated(attr, mutation);
+    fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation, can_gc: CanGc) {
+        self.super_type()
+            .unwrap()
+            .attribute_mutated(attr, mutation, can_gc);
         if attr.local_name() == &local_name!("form") {
-            self.form_attribute_mutated(mutation);
+            self.form_attribute_mutated(mutation, can_gc);
         }
     }
 }
@@ -185,7 +190,7 @@ impl Validatable for HTMLOutputElement {
 
     fn validity_state(&self) -> DomRoot<ValidityState> {
         self.validity_state
-            .or_init(|| ValidityState::new(&window_from_node(self), self.upcast()))
+            .or_init(|| ValidityState::new(&self.owner_window(), self.upcast(), CanGc::note()))
     }
 
     fn is_instance_validatable(&self) -> bool {

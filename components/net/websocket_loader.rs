@@ -11,36 +11,40 @@
 //! over events from the network and events from the DOM, using async/await to avoid
 //! the need for a dedicated thread per websocket.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::mem;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use async_tungstenite::tokio::{client_async_tls_with_connector_and_config, ConnectStream};
 use async_tungstenite::WebSocketStream;
+use async_tungstenite::tokio::{ConnectStream, client_async_tls_with_connector_and_config};
 use base64::Engine;
+use content_security_policy as csp;
 use futures::future::TryFutureExt;
-use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 use http::header::{self, HeaderName, HeaderValue};
 use ipc_channel::ipc::{IpcReceiver, IpcSender};
 use ipc_channel::router::ROUTER;
 use log::{debug, trace, warn};
-use net_traits::request::{RequestBuilder, RequestMode};
+use net_traits::policy_container::{PolicyContainer, RequestPolicyContainer};
+use net_traits::request::{Origin, RequestBuilder, RequestMode};
 use net_traits::{CookieSource, MessageData, WebSocketDomAction, WebSocketNetworkEvent};
 use servo_url::ServoUrl;
 use tokio::net::TcpStream;
 use tokio::select;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio_rustls::TlsConnector;
+use tungstenite::Message;
 use tungstenite::error::{Error, ProtocolError, Result as WebSocketResult, UrlError};
 use tungstenite::handshake::client::{Request, Response};
 use tungstenite::protocol::CloseFrame;
-use tungstenite::Message;
 use url::Url;
 
 use crate::async_runtime::HANDLE;
-use crate::connector::{create_tls_config, CACertificates, TlsConfig};
+use crate::connector::{CACertificates, TlsConfig, create_tls_config};
 use crate::cookie::ServoCookie;
-use crate::fetch::methods::should_be_blocked_due_to_bad_port;
+use crate::fetch::methods::{
+    should_request_be_blocked_by_csp, should_request_be_blocked_due_to_a_bad_port,
+};
 use crate::hosts::replace_host;
 use crate::http_loader::HttpState;
 /// Create a tungstenite Request object for the initial HTTP request.
@@ -157,10 +161,10 @@ fn setup_dom_listener(
 ) -> UnboundedReceiver<DomMsg> {
     let (sender, receiver) = unbounded_channel();
 
-    ROUTER.add_route(
-        dom_action_receiver.to_opaque(),
+    ROUTER.add_typed_route(
+        dom_action_receiver,
         Box::new(move |message| {
-            let dom_action = message.to().expect("Ws dom_action message to deserialize");
+            let dom_action = message.expect("Ws dom_action message to deserialize");
             trace!("handling WS DOM action: {:?}", dom_action);
             match dom_action {
                 WebSocketDomAction::SendMessage(MessageData::Text(data)) => {
@@ -354,12 +358,12 @@ fn connect(
     ignore_certificate_errors: bool,
 ) -> Result<(), String> {
     let protocols = match req_builder.mode {
-        RequestMode::WebSocket { protocols } => protocols,
+        RequestMode::WebSocket { ref mut protocols } => mem::take(protocols),
         _ => {
             return Err(
                 "Received a RequestBuilder with a non-websocket mode in websocket_loader"
                     .to_string(),
-            )
+            );
         },
     };
 
@@ -369,16 +373,36 @@ fn connect(
         .read()
         .unwrap()
         .apply_hsts_rules(&mut req_builder.url);
+    let request = req_builder.build();
 
-    let req_url = req_builder.url.clone();
+    let req_url = request.url();
+    let req_origin = match request.origin {
+        Origin::Client => unreachable!(),
+        Origin::Origin(ref origin) => origin,
+    };
 
-    if should_be_blocked_due_to_bad_port(&req_url) {
+    if should_request_be_blocked_due_to_a_bad_port(&req_url) {
         return Err("Port blocked".to_string());
+    }
+
+    let policy_container = match &request.policy_container {
+        RequestPolicyContainer::Client => PolicyContainer::default(),
+        RequestPolicyContainer::PolicyContainer(container) => container.to_owned(),
+    };
+
+    let (check_result, violations) = should_request_be_blocked_by_csp(&request, &policy_container);
+
+    if !violations.is_empty() {
+        let _ = resource_event_sender.send(WebSocketNetworkEvent::ReportCSPViolations(violations));
+    }
+
+    if check_result == csp::CheckResult::Blocked {
+        return Err("Blocked by Content-Security-Policy".to_string());
     }
 
     let client = match create_request(
         &req_url,
-        &req_builder.origin.ascii_serialization(),
+        &req_origin.ascii_serialization(),
         &protocols,
         &http_state,
     ) {
@@ -391,27 +415,24 @@ fn connect(
         ignore_certificate_errors,
         http_state.override_manager.clone(),
     );
-    tls_config.alpn_protocols = vec!["h2".to_string().into(), "http/1.1".to_string().into()];
+    tls_config.alpn_protocols = vec!["http/1.1".to_string().into()];
 
     let resource_event_sender2 = resource_event_sender.clone();
-    match HANDLE.lock().unwrap().as_mut() {
-        Some(handle) => handle.spawn(
-            start_websocket(
-                http_state,
-                req_builder.url.clone(),
-                resource_event_sender,
-                protocols,
-                client,
-                tls_config,
-                dom_action_receiver,
-            )
-            .map_err(move |e| {
-                warn!("Failed to establish a WebSocket connection: {:?}", e);
-                let _ = resource_event_sender2.send(WebSocketNetworkEvent::Fail);
-            }),
-        ),
-        None => return Err("No runtime available".to_string()),
-    };
+    HANDLE.spawn(
+        start_websocket(
+            http_state,
+            req_url.clone(),
+            resource_event_sender,
+            protocols,
+            client,
+            tls_config,
+            dom_action_receiver,
+        )
+        .map_err(move |e| {
+            warn!("Failed to establish a WebSocket connection: {:?}", e);
+            let _ = resource_event_sender2.send(WebSocketNetworkEvent::Fail);
+        }),
+    );
     Ok(())
 }
 

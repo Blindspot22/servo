@@ -8,17 +8,18 @@ use dom_struct::dom_struct;
 use uuid::Uuid;
 
 use crate::dom::bindings::codegen::Bindings::DynamicModuleOwnerBinding::DynamicModuleOwnerMethods;
-use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
+use crate::dom::bindings::reflector::{Reflector, reflect_dom_object};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
+use crate::script_runtime::CanGc;
 
 /// An unique id for dynamic module
 #[derive(Clone, Copy, Debug, Eq, Hash, JSTraceable, PartialEq)]
-pub struct DynamicModuleId(#[no_trace] pub Uuid);
+pub(crate) struct DynamicModuleId(#[no_trace] pub(crate) Uuid);
 
 #[dom_struct]
-pub struct DynamicModuleOwner {
+pub(crate) struct DynamicModuleOwner {
     reflector_: Reflector,
 
     #[ignore_malloc_size_of = "Rc"]
@@ -30,7 +31,7 @@ pub struct DynamicModuleOwner {
 }
 
 impl DynamicModuleOwner {
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn new_inherited(promise: Rc<Promise>, id: DynamicModuleId) -> Self {
         DynamicModuleOwner {
             reflector_: Reflector::new(),
@@ -39,16 +40,22 @@ impl DynamicModuleOwner {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(global: &GlobalScope, promise: Rc<Promise>, id: DynamicModuleId) -> DomRoot<Self> {
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
+        global: &GlobalScope,
+        promise: Rc<Promise>,
+        id: DynamicModuleId,
+        can_gc: CanGc,
+    ) -> DomRoot<Self> {
         reflect_dom_object(
             Box::new(DynamicModuleOwner::new_inherited(promise, id)),
             global,
+            can_gc,
         )
     }
 }
 
-impl DynamicModuleOwnerMethods for DynamicModuleOwner {
+impl DynamicModuleOwnerMethods<crate::DomTypeHolder> for DynamicModuleOwner {
     // https://html.spec.whatwg.org/multipage/#integration-with-the-javascript-module-system:import()
     fn Promise(&self) -> Rc<Promise> {
         self.promise.clone()

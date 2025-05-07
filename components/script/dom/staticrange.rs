@@ -6,7 +6,9 @@ use dom_struct::dom_struct;
 use js::rust::HandleObject;
 
 use crate::dom::abstractrange::AbstractRange;
-use crate::dom::bindings::codegen::Bindings::StaticRangeBinding::StaticRangeInit;
+use crate::dom::bindings::codegen::Bindings::StaticRangeBinding::{
+    StaticRangeInit, StaticRangeMethods,
+};
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::inheritance::NodeTypeId;
@@ -18,7 +20,7 @@ use crate::dom::window::Window;
 use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct StaticRange {
+pub(crate) struct StaticRange {
     abstract_range: AbstractRange,
 }
 
@@ -38,7 +40,7 @@ impl StaticRange {
             ),
         }
     }
-    pub fn new_with_doc(
+    pub(crate) fn new_with_doc(
         document: &Document,
         proto: Option<HandleObject>,
         init: &StaticRangeInit,
@@ -47,7 +49,7 @@ impl StaticRange {
         StaticRange::new_with_proto(document, proto, init, can_gc)
     }
 
-    pub fn new_with_proto(
+    pub(crate) fn new_with_proto(
         document: &Document,
         proto: Option<HandleObject>,
         init: &StaticRangeInit,
@@ -66,10 +68,12 @@ impl StaticRange {
         );
         staticrange
     }
+}
 
+impl StaticRangeMethods<crate::DomTypeHolder> for StaticRange {
     /// <https://dom.spec.whatwg.org/#dom-staticrange-staticrange>
     #[allow(non_snake_case)]
-    pub fn Constructor(
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
         can_gc: CanGc,

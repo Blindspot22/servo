@@ -4,11 +4,14 @@
 
 use std::rc::Rc;
 
+use constellation_traits::ScriptToConstellationMessage;
 use dom_struct::dom_struct;
-use embedder_traits::{MediaMetadata as EmbedderMediaMetadata, MediaSessionEvent};
-use script_traits::{MediaSessionActionType, ScriptMsg};
+use embedder_traits::{
+    MediaMetadata as EmbedderMediaMetadata, MediaSessionActionType, MediaSessionEvent,
+};
 
 use super::bindings::trace::HashMapTracedValues;
+use crate::conversions::Convert;
 use crate::dom::bindings::callback::ExceptionHandling;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::HTMLMediaElementBinding::HTMLMediaElementMethods;
@@ -21,17 +24,17 @@ use crate::dom::bindings::codegen::Bindings::MediaSessionBinding::{
 };
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::num::Finite;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
+use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object};
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::htmlmediaelement::HTMLMediaElement;
 use crate::dom::mediametadata::MediaMetadata;
 use crate::dom::window::Window;
-use crate::realms::{enter_realm, InRealm};
+use crate::realms::{InRealm, enter_realm};
 use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct MediaSession {
+pub(crate) struct MediaSession {
     reflector_: Reflector,
     /// <https://w3c.github.io/mediasession/#dom-mediasession-metadata>
     #[ignore_malloc_size_of = "defined in embedder_traits"]
@@ -49,7 +52,7 @@ pub struct MediaSession {
 }
 
 impl MediaSession {
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn new_inherited() -> MediaSession {
         MediaSession {
             reflector_: Reflector::new(),
@@ -60,19 +63,19 @@ impl MediaSession {
         }
     }
 
-    pub fn new(window: &Window) -> DomRoot<MediaSession> {
-        reflect_dom_object(Box::new(MediaSession::new_inherited()), window)
+    pub(crate) fn new(window: &Window, can_gc: CanGc) -> DomRoot<MediaSession> {
+        reflect_dom_object(Box::new(MediaSession::new_inherited()), window, can_gc)
     }
 
-    pub fn register_media_instance(&self, media_instance: &HTMLMediaElement) {
+    pub(crate) fn register_media_instance(&self, media_instance: &HTMLMediaElement) {
         self.media_instance.set(Some(media_instance));
     }
 
-    pub fn handle_action(&self, action: MediaSessionActionType, can_gc: CanGc) {
+    pub(crate) fn handle_action(&self, action: MediaSessionActionType, can_gc: CanGc) {
         debug!("Handle media session action {:?}", action);
 
         if let Some(handler) = self.action_handlers.borrow().get(&action) {
-            if handler.Call__(ExceptionHandling::Report).is_err() {
+            if handler.Call__(ExceptionHandling::Report, can_gc).is_err() {
                 warn!("Error calling MediaSessionActionHandler callback");
             }
             return;
@@ -99,14 +102,17 @@ impl MediaSession {
         }
     }
 
-    pub fn send_event(&self, event: MediaSessionEvent) {
+    pub(crate) fn send_event(&self, event: MediaSessionEvent) {
         let global = self.global();
         let window = global.as_window();
         let pipeline_id = window.pipeline_id();
-        window.send_to_constellation(ScriptMsg::MediaSessionEvent(pipeline_id, event));
+        window.send_to_constellation(ScriptToConstellationMessage::MediaSessionEvent(
+            pipeline_id,
+            event,
+        ));
     }
 
-    pub fn update_title(&self, title: String) {
+    pub(crate) fn update_title(&self, title: String) {
         let mut metadata = self.metadata.borrow_mut();
         if let Some(ref mut metadata) = *metadata {
             // We only update the title with the data provided by the media
@@ -124,16 +130,16 @@ impl MediaSession {
     }
 }
 
-impl MediaSessionMethods for MediaSession {
+impl MediaSessionMethods<crate::DomTypeHolder> for MediaSession {
     /// <https://w3c.github.io/mediasession/#dom-mediasession-metadata>
-    fn GetMetadata(&self) -> Option<DomRoot<MediaMetadata>> {
+    fn GetMetadata(&self, can_gc: CanGc) -> Option<DomRoot<MediaMetadata>> {
         if let Some(ref metadata) = *self.metadata.borrow() {
             let mut init = MediaMetadataInit::empty();
             init.title = DOMString::from_string(metadata.title.clone());
             init.artist = DOMString::from_string(metadata.artist.clone());
             init.album = DOMString::from_string(metadata.album.clone());
             let global = self.global();
-            Some(MediaMetadata::new(global.as_window(), &init))
+            Some(MediaMetadata::new(global.as_window(), &init, can_gc))
         } else {
             None
         }
@@ -188,8 +194,8 @@ impl MediaSessionMethods for MediaSession {
             Some(handler) => self
                 .action_handlers
                 .borrow_mut()
-                .insert(action.into(), handler.clone()),
-            None => self.action_handlers.borrow_mut().remove(&action.into()),
+                .insert(action.convert(), handler.clone()),
+            None => self.action_handlers.borrow_mut().remove(&action.convert()),
         };
     }
 
@@ -249,9 +255,9 @@ impl MediaSessionMethods for MediaSession {
     }
 }
 
-impl From<MediaSessionAction> for MediaSessionActionType {
-    fn from(action: MediaSessionAction) -> MediaSessionActionType {
-        match action {
+impl Convert<MediaSessionActionType> for MediaSessionAction {
+    fn convert(self) -> MediaSessionActionType {
+        match self {
             MediaSessionAction::Play => MediaSessionActionType::Play,
             MediaSessionAction::Pause => MediaSessionActionType::Pause,
             MediaSessionAction::Seekbackward => MediaSessionActionType::SeekBackward,

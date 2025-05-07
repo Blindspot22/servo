@@ -4,7 +4,7 @@
 
 use dom_struct::dom_struct;
 use js::rust::HandleObject;
-use servo_atoms::Atom;
+use stylo_atoms::Atom;
 
 use super::bindings::trace::HashMapTracedValues;
 use crate::dom::bindings::cell::DomRefCell;
@@ -18,14 +18,15 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
 use crate::dom::element::Element;
 use crate::dom::htmlcollection::HTMLCollection;
-use crate::dom::node::{window_from_node, Node};
+use crate::dom::node::{Node, NodeTraits};
 use crate::dom::nodelist::NodeList;
+use crate::dom::virtualmethods::VirtualMethods;
 use crate::dom::window::Window;
 use crate::script_runtime::CanGc;
 
 // https://dom.spec.whatwg.org/#documentfragment
 #[dom_struct]
-pub struct DocumentFragment {
+pub(crate) struct DocumentFragment {
     node: Node,
     /// Caches for the getElement methods
     id_map: DomRefCell<HashMapTracedValues<Atom, Vec<Dom<Element>>>>,
@@ -33,49 +34,51 @@ pub struct DocumentFragment {
 
 impl DocumentFragment {
     /// Creates a new DocumentFragment.
-    pub fn new_inherited(document: &Document) -> DocumentFragment {
+    pub(crate) fn new_inherited(document: &Document) -> DocumentFragment {
         DocumentFragment {
             node: Node::new_inherited(document),
             id_map: DomRefCell::new(HashMapTracedValues::new()),
         }
     }
 
-    pub fn new(document: &Document) -> DomRoot<DocumentFragment> {
-        Self::new_with_proto(document, None)
+    pub(crate) fn new(document: &Document, can_gc: CanGc) -> DomRoot<DocumentFragment> {
+        Self::new_with_proto(document, None, can_gc)
     }
 
     fn new_with_proto(
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<DocumentFragment> {
         Node::reflect_node_with_proto(
             Box::new(DocumentFragment::new_inherited(document)),
             document,
             proto,
+            can_gc,
         )
     }
 
-    pub fn id_map(&self) -> &DomRefCell<HashMapTracedValues<Atom, Vec<Dom<Element>>>> {
+    pub(crate) fn id_map(&self) -> &DomRefCell<HashMapTracedValues<Atom, Vec<Dom<Element>>>> {
         &self.id_map
     }
 }
 
-impl DocumentFragmentMethods for DocumentFragment {
+impl DocumentFragmentMethods<crate::DomTypeHolder> for DocumentFragment {
     // https://dom.spec.whatwg.org/#dom-documentfragment-documentfragment
     fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
-        _can_gc: CanGc,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<DocumentFragment>> {
         let document = window.Document();
 
-        Ok(DocumentFragment::new_with_proto(&document, proto))
+        Ok(DocumentFragment::new_with_proto(&document, proto, can_gc))
     }
 
     // https://dom.spec.whatwg.org/#dom-parentnode-children
-    fn Children(&self) -> DomRoot<HTMLCollection> {
-        let window = window_from_node(self);
-        HTMLCollection::children(&window, self.upcast())
+    fn Children(&self, can_gc: CanGc) -> DomRoot<HTMLCollection> {
+        let window = self.owner_window();
+        HTMLCollection::children(&window, self.upcast(), can_gc)
     }
 
     // https://dom.spec.whatwg.org/#dom-nonelementparentnode-getelementbyid
@@ -106,18 +109,18 @@ impl DocumentFragmentMethods for DocumentFragment {
     }
 
     // https://dom.spec.whatwg.org/#dom-parentnode-prepend
-    fn Prepend(&self, nodes: Vec<NodeOrString>) -> ErrorResult {
-        self.upcast::<Node>().prepend(nodes)
+    fn Prepend(&self, nodes: Vec<NodeOrString>, can_gc: CanGc) -> ErrorResult {
+        self.upcast::<Node>().prepend(nodes, can_gc)
     }
 
     // https://dom.spec.whatwg.org/#dom-parentnode-append
-    fn Append(&self, nodes: Vec<NodeOrString>) -> ErrorResult {
-        self.upcast::<Node>().append(nodes)
+    fn Append(&self, nodes: Vec<NodeOrString>, can_gc: CanGc) -> ErrorResult {
+        self.upcast::<Node>().append(nodes, can_gc)
     }
 
     // https://dom.spec.whatwg.org/#dom-parentnode-replacechildren
-    fn ReplaceChildren(&self, nodes: Vec<NodeOrString>) -> ErrorResult {
-        self.upcast::<Node>().replace_children(nodes)
+    fn ReplaceChildren(&self, nodes: Vec<NodeOrString>, can_gc: CanGc) -> ErrorResult {
+        self.upcast::<Node>().replace_children(nodes, can_gc)
     }
 
     // https://dom.spec.whatwg.org/#dom-parentnode-queryselector
@@ -128,5 +131,11 @@ impl DocumentFragmentMethods for DocumentFragment {
     // https://dom.spec.whatwg.org/#dom-parentnode-queryselectorall
     fn QuerySelectorAll(&self, selectors: DOMString) -> Fallible<DomRoot<NodeList>> {
         self.upcast::<Node>().query_selector_all(selectors)
+    }
+}
+
+impl VirtualMethods for DocumentFragment {
+    fn super_type(&self) -> Option<&dyn VirtualMethods> {
+        Some(self.upcast::<Node>() as &dyn VirtualMethods)
     }
 }

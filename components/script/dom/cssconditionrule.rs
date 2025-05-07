@@ -16,30 +16,38 @@ use crate::dom::cssstylesheet::CSSStyleSheet;
 use crate::dom::csssupportsrule::CSSSupportsRule;
 
 #[dom_struct]
-pub struct CSSConditionRule {
+pub(crate) struct CSSConditionRule {
     cssgroupingrule: CSSGroupingRule,
+    #[ignore_malloc_size_of = "Arc"]
+    #[no_trace]
+    rules: Arc<Locked<StyleCssRules>>,
 }
 
 impl CSSConditionRule {
-    pub fn new_inherited(
+    pub(crate) fn new_inherited(
         parent_stylesheet: &CSSStyleSheet,
         rules: Arc<Locked<StyleCssRules>>,
     ) -> CSSConditionRule {
         CSSConditionRule {
-            cssgroupingrule: CSSGroupingRule::new_inherited(parent_stylesheet, rules),
+            cssgroupingrule: CSSGroupingRule::new_inherited(parent_stylesheet),
+            rules,
         }
     }
 
-    pub fn parent_stylesheet(&self) -> &CSSStyleSheet {
+    pub(crate) fn parent_stylesheet(&self) -> &CSSStyleSheet {
         self.cssgroupingrule.parent_stylesheet()
     }
 
-    pub fn shared_lock(&self) -> &SharedRwLock {
+    pub(crate) fn shared_lock(&self) -> &SharedRwLock {
         self.cssgroupingrule.shared_lock()
+    }
+
+    pub(crate) fn clone_rules(&self) -> Arc<Locked<StyleCssRules>> {
+        self.rules.clone()
     }
 }
 
-impl CSSConditionRuleMethods for CSSConditionRule {
+impl CSSConditionRuleMethods<crate::DomTypeHolder> for CSSConditionRule {
     /// <https://drafts.csswg.org/css-conditional-3/#dom-cssconditionrule-conditiontext>
     fn ConditionText(&self) -> DOMString {
         if let Some(rule) = self.downcast::<CSSMediaRule>() {

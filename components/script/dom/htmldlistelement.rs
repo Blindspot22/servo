@@ -10,9 +10,10 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::document::Document;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::node::Node;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct HTMLDListElement {
+pub(crate) struct HTMLDListElement {
     htmlelement: HTMLElement,
 }
 
@@ -27,12 +28,13 @@ impl HTMLDListElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLDListElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLDListElement::new_inherited(
@@ -40,6 +42,7 @@ impl HTMLDListElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 }

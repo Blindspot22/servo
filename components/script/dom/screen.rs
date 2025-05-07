@@ -2,21 +2,22 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use compositing_traits::CompositorMsg;
 use dom_struct::dom_struct;
 use euclid::Size2D;
 use profile_traits::ipc;
+use servo_geometry::DeviceIndependentIntSize;
 use style_traits::CSSPixel;
-use webrender_api::units::DeviceIntSize;
-use webrender_traits::CrossProcessCompositorMessage;
 
 use crate::dom::bindings::codegen::Bindings::ScreenBinding::ScreenMethods;
 use crate::dom::bindings::num::Finite;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
+use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct Screen {
+pub(crate) struct Screen {
     reflector_: Reflector,
     window: Dom<Window>,
 }
@@ -29,38 +30,44 @@ impl Screen {
         }
     }
 
-    pub fn new(window: &Window) -> DomRoot<Screen> {
-        reflect_dom_object(Box::new(Screen::new_inherited(window)), window)
+    pub(crate) fn new(window: &Window, can_gc: CanGc) -> DomRoot<Screen> {
+        reflect_dom_object(Box::new(Screen::new_inherited(window)), window, can_gc)
     }
 
     fn screen_size(&self) -> Size2D<u32, CSSPixel> {
-        let (send, recv) =
-            ipc::channel::<DeviceIntSize>(self.global().time_profiler_chan().clone()).unwrap();
+        let (sender, receiver) =
+            ipc::channel::<DeviceIndependentIntSize>(self.global().time_profiler_chan().clone())
+                .unwrap();
         self.window
             .compositor_api()
             .sender()
-            .send(CrossProcessCompositorMessage::GetScreenSize(send))
+            .send(CompositorMsg::GetScreenSize(
+                self.window.webview_id(),
+                sender,
+            ))
             .unwrap();
-        let dpr = self.window.device_pixel_ratio();
-        let screen = recv.recv().unwrap_or(Size2D::zero());
-        (screen.to_f32() / dpr).to_u32()
+        let size = receiver.recv().unwrap_or(Size2D::zero()).to_u32();
+        Size2D::new(size.width, size.height)
     }
 
     fn screen_avail_size(&self) -> Size2D<u32, CSSPixel> {
-        let (send, recv) =
-            ipc::channel::<DeviceIntSize>(self.global().time_profiler_chan().clone()).unwrap();
+        let (sender, receiver) =
+            ipc::channel::<DeviceIndependentIntSize>(self.global().time_profiler_chan().clone())
+                .unwrap();
         self.window
             .compositor_api()
             .sender()
-            .send(CrossProcessCompositorMessage::GetAvailableScreenSize(send))
+            .send(CompositorMsg::GetAvailableScreenSize(
+                self.window.webview_id(),
+                sender,
+            ))
             .unwrap();
-        let dpr = self.window.device_pixel_ratio();
-        let screen = recv.recv().unwrap_or(Size2D::zero());
-        (screen.to_f32() / dpr).to_u32()
+        let size = receiver.recv().unwrap_or(Size2D::zero()).to_u32();
+        Size2D::new(size.width, size.height)
     }
 }
 
-impl ScreenMethods for Screen {
+impl ScreenMethods<crate::DomTypeHolder> for Screen {
     // https://drafts.csswg.org/cssom-view/#dom-screen-availwidth
     fn AvailWidth(&self) -> Finite<f64> {
         Finite::wrap(self.screen_avail_size().width as f64)

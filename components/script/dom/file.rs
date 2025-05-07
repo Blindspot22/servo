@@ -4,11 +4,11 @@
 
 use std::time::SystemTime;
 
+use constellation_traits::BlobImpl;
 use dom_struct::dom_struct;
 use js::rust::HandleObject;
 use net_traits::filemanager_thread::SelectedFile;
-use script_traits::serializable::BlobImpl;
-use time_03::{Duration, OffsetDateTime};
+use time::{Duration, OffsetDateTime};
 
 use crate::dom::bindings::codegen::Bindings::FileBinding;
 use crate::dom::bindings::codegen::Bindings::FileBinding::FileMethods;
@@ -18,20 +18,20 @@ use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::reflect_dom_object_with_proto;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
-use crate::dom::blob::{blob_parts_to_bytes, normalize_type_string, Blob};
+use crate::dom::blob::{Blob, blob_parts_to_bytes, normalize_type_string};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::window::Window;
 use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct File {
+pub(crate) struct File {
     blob: Blob,
     name: DOMString,
     modified: SystemTime,
 }
 
 impl File {
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn new_inherited(blob_impl: &BlobImpl, name: DOMString, modified: Option<SystemTime>) -> File {
         File {
             blob: Blob::new_inherited(blob_impl),
@@ -41,16 +41,17 @@ impl File {
         }
     }
 
-    pub fn new(
+    pub(crate) fn new(
         global: &GlobalScope,
         blob_impl: BlobImpl,
         name: DOMString,
         modified: Option<SystemTime>,
+        can_gc: CanGc,
     ) -> DomRoot<File> {
-        Self::new_with_proto(global, None, blob_impl, name, modified, CanGc::note())
+        Self::new_with_proto(global, None, blob_impl, name, modified, can_gc)
     }
 
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn new_with_proto(
         global: &GlobalScope,
         proto: Option<HandleObject>,
@@ -70,7 +71,11 @@ impl File {
     }
 
     // Construct from selected file message from file manager thread
-    pub fn new_from_selected(window: &Window, selected: SelectedFile) -> DomRoot<File> {
+    pub(crate) fn new_from_selected(
+        window: &Window,
+        selected: SelectedFile,
+        can_gc: CanGc,
+    ) -> DomRoot<File> {
         let name = DOMString::from(
             selected
                 .filename
@@ -88,15 +93,28 @@ impl File {
             ),
             name,
             Some(selected.modified),
+            can_gc,
         )
     }
 
-    pub fn name(&self) -> &DOMString {
+    pub(crate) fn file_bytes(&self) -> Result<Vec<u8>, ()> {
+        self.blob.get_bytes()
+    }
+
+    pub(crate) fn name(&self) -> &DOMString {
         &self.name
+    }
+
+    pub(crate) fn file_type(&self) -> String {
+        self.blob.type_string()
+    }
+
+    pub(crate) fn get_modified(&self) -> SystemTime {
+        self.modified
     }
 }
 
-impl FileMethods for File {
+impl FileMethods<crate::DomTypeHolder> for File {
     // https://w3c.github.io/FileAPI/#file-constructor
     #[allow(non_snake_case)]
     fn Constructor(
@@ -118,15 +136,12 @@ impl FileMethods for File {
             .map(|modified| OffsetDateTime::UNIX_EPOCH + Duration::milliseconds(modified))
             .map(Into::into);
 
-        // NOTE: Following behaviour might be removed in future,
-        // see https://github.com/w3c/FileAPI/issues/41
-        let replaced_filename = DOMString::from_string(filename.replace('/', ":"));
         let type_string = normalize_type_string(blobPropertyBag.type_.as_ref());
         Ok(File::new_with_proto(
             global,
             proto,
             BlobImpl::new_from_bytes(bytes, type_string),
-            replaced_filename,
+            filename,
             modified,
             can_gc,
         ))

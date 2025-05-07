@@ -2,22 +2,21 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::io::{Read, Seek, Write};
 use std::sync::atomic::AtomicBool;
-use std::sync::Mutex;
 
-use base::id::PipelineId;
+use content_security_policy as csp;
 use cssparser::SourceLocation;
 use encoding_rs::UTF_8;
-use ipc_channel::ipc;
-use ipc_channel::router::ROUTER;
 use mime::{self, Mime};
-use net_traits::request::{CorsSettings, Destination, Referrer, RequestBuilder};
+use net_traits::request::{CorsSettings, Destination, RequestId};
 use net_traits::{
     FetchMetadata, FetchResponseListener, FilteredMetadata, Metadata, NetworkError, ReferrerPolicy,
     ResourceFetchTiming, ResourceTimingType,
 };
 use servo_arc::Arc;
-use servo_url::{ImmutableOrigin, ServoUrl};
+use servo_url::ServoUrl;
+use style::context::QuirksMode;
 use style::media_queries::MediaList;
 use style::parser::ParserContext;
 use style::shared_lock::{Locked, SharedRwLock};
@@ -31,7 +30,7 @@ use style::values::CssUrl;
 use crate::document_loader::LoadType;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
-use crate::dom::bindings::reflector::DomObject;
+use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::document::Document;
 use crate::dom::element::Element;
@@ -39,21 +38,23 @@ use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmllinkelement::{HTMLLinkElement, RequestGenerationId};
-use crate::dom::node::{containing_shadow_root, document_from_node, window_from_node};
+use crate::dom::node::NodeTraits;
 use crate::dom::performanceresourcetiming::InitiatorType;
 use crate::dom::shadowroot::ShadowRoot;
 use crate::fetch::create_a_potential_cors_request;
-use crate::network_listener::{self, NetworkListener, PreInvoke, ResourceTimingListener};
+use crate::network_listener::{self, PreInvoke, ResourceTimingListener};
 use crate::script_runtime::CanGc;
+use crate::unminify::{
+    BeautifyFileType, create_output_file, create_temp_files, execute_js_beautify,
+};
 
-pub trait StylesheetOwner {
+pub(crate) trait StylesheetOwner {
     /// Returns whether this element was inserted by the parser (i.e., it should
     /// trigger a document-load-blocking load).
     fn parser_inserted(&self) -> bool;
 
-    /// Which referrer policy should loads triggered by this owner follow, or
-    /// `None` for the default.
-    fn referrer_policy(&self) -> Option<ReferrerPolicy>;
+    /// Which referrer policy should loads triggered by this owner follow
+    fn referrer_policy(&self) -> ReferrerPolicy;
 
     /// Notes that a new load is pending to finish.
     fn increment_pending_loads_count(&self);
@@ -66,14 +67,14 @@ pub trait StylesheetOwner {
     fn set_origin_clean(&self, origin_clean: bool);
 }
 
-pub enum StylesheetContextSource {
+pub(crate) enum StylesheetContextSource {
     // NB: `media` is just an option so we avoid cloning it.
     LinkElement { media: Option<MediaList> },
     Import(Arc<Stylesheet>),
 }
 
 /// The context required for asynchronously loading an external stylesheet.
-pub struct StylesheetContext {
+pub(crate) struct StylesheetContext {
     /// The element that initiated the request.
     elem: Trusted<HTMLElement>,
     source: StylesheetContextSource,
@@ -91,14 +92,45 @@ pub struct StylesheetContext {
     resource_timing: ResourceFetchTiming,
 }
 
+impl StylesheetContext {
+    fn unminify_css(&self, data: Vec<u8>, file_url: ServoUrl) -> Vec<u8> {
+        let Some(unminified_dir) = self.document.root().window().unminified_css_dir() else {
+            return data;
+        };
+
+        let mut style_content = data;
+
+        if let Some((input, mut output)) = create_temp_files() {
+            if execute_js_beautify(
+                input.path(),
+                output.try_clone().unwrap(),
+                BeautifyFileType::Css,
+            ) {
+                output.seek(std::io::SeekFrom::Start(0)).unwrap();
+                output.read_to_end(&mut style_content).unwrap();
+            }
+        }
+        match create_output_file(unminified_dir, &file_url, None) {
+            Ok(mut file) => {
+                file.write_all(&style_content).unwrap();
+            },
+            Err(why) => {
+                log::warn!("Could not store script {:?}", why);
+            },
+        }
+
+        style_content
+    }
+}
+
 impl PreInvoke for StylesheetContext {}
 
 impl FetchResponseListener for StylesheetContext {
-    fn process_request_body(&mut self) {}
+    fn process_request_body(&mut self, _: RequestId) {}
 
-    fn process_request_eof(&mut self) {}
+    fn process_request_eof(&mut self, _: RequestId) {}
 
-    fn process_response(&mut self, metadata: Result<FetchMetadata, NetworkError>) {
+    fn process_response(&mut self, _: RequestId, metadata: Result<FetchMetadata, NetworkError>) {
         if let Ok(FetchMetadata::Filtered {
             filtered: FilteredMetadata::Opaque | FilteredMetadata::OpaqueRedirect(_),
             ..
@@ -113,11 +145,15 @@ impl FetchResponseListener for StylesheetContext {
         });
     }
 
-    fn process_response_chunk(&mut self, mut payload: Vec<u8>) {
+    fn process_response_chunk(&mut self, _: RequestId, mut payload: Vec<u8>) {
         self.data.append(&mut payload);
     }
 
-    fn process_response_eof(&mut self, status: Result<ResourceFetchTiming, NetworkError>) {
+    fn process_response_eof(
+        &mut self,
+        _: RequestId,
+        status: Result<ResourceFetchTiming, NetworkError>,
+    ) {
         let elem = self.elem.root();
         let document = self.document.root();
         let mut successful = false;
@@ -130,10 +166,20 @@ impl FetchResponseListener for StylesheetContext {
             let is_css = metadata.content_type.is_some_and(|ct| {
                 let mime: Mime = ct.into_inner().into();
                 mime.type_() == mime::TEXT && mime.subtype() == mime::CSS
-            });
+            }) || (
+                // Quirk: If the document has been set to quirks mode,
+                // has the same origin as the URL of the external resource,
+                // and the Content-Type metadata of the external resource
+                // is not a supported style sheet type, the user agent must
+                // instead assume it to be text/css.
+                // <https://html.spec.whatwg.org/multipage/#link-type-stylesheet>
+                document.quirks_mode() == QuirksMode::Quirks &&
+                    document.origin().immutable().clone() == metadata.final_url.origin()
+            );
 
             let data = if is_css {
-                std::mem::take(&mut self.data)
+                let data = std::mem::take(&mut self.data);
+                self.unminify_css(data, metadata.final_url.clone())
             } else {
                 vec![]
             };
@@ -143,7 +189,7 @@ impl FetchResponseListener for StylesheetContext {
             let protocol_encoding_label = metadata.charset.as_deref();
             let final_url = metadata.final_url;
 
-            let win = window_from_node(&*elem);
+            let win = elem.owner_window();
 
             let loader = StylesheetLoader::for_element(&elem);
             match self.source {
@@ -153,7 +199,7 @@ impl FetchResponseListener for StylesheetContext {
                     // else we risk applying the wrong stylesheet when responses come out-of-order.
                     let is_stylesheet_load_applicable = self
                         .request_generation_id
-                        .map_or(true, |gen| gen == link.get_request_generation_id());
+                        .is_none_or(|generation| generation == link.get_request_generation_id());
                     if is_stylesheet_load_applicable {
                         let shared_lock = document.style_shared_lock().clone();
                         let sheet = Arc::new(Stylesheet::from_bytes(
@@ -169,7 +215,7 @@ impl FetchResponseListener for StylesheetContext {
                             document.quirks_mode(),
                         ));
 
-                        if link.is_alternate() {
+                        if link.is_effectively_disabled() {
                             sheet.set_disabled(true);
                         }
 
@@ -221,7 +267,8 @@ impl FetchResponseListener for StylesheetContext {
             } else {
                 atom!("load")
             };
-            elem.upcast::<EventTarget>().fire_event(event);
+            elem.upcast::<EventTarget>()
+                .fire_event(event, CanGc::note());
         }
     }
 
@@ -234,7 +281,12 @@ impl FetchResponseListener for StylesheetContext {
     }
 
     fn submit_resource_timing(&mut self) {
-        network_listener::submit_timing(self)
+        network_listener::submit_timing(self, CanGc::note())
+    }
+
+    fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<csp::Violation>) {
+        let global = &self.resource_timing_global();
+        global.report_csp_violations(violations);
     }
 }
 
@@ -251,35 +303,38 @@ impl ResourceTimingListener for StylesheetContext {
     }
 
     fn resource_timing_global(&self) -> DomRoot<GlobalScope> {
-        document_from_node(&*self.elem.root()).global()
+        self.elem.root().owner_document().global()
     }
 }
 
-pub struct StylesheetLoader<'a> {
+pub(crate) struct StylesheetLoader<'a> {
     elem: &'a HTMLElement,
 }
 
 impl<'a> StylesheetLoader<'a> {
-    pub fn for_element(element: &'a HTMLElement) -> Self {
+    pub(crate) fn for_element(element: &'a HTMLElement) -> Self {
         StylesheetLoader { elem: element }
     }
 }
 
-impl<'a> StylesheetLoader<'a> {
-    pub fn load(
+impl StylesheetLoader<'_> {
+    pub(crate) fn load(
         &self,
         source: StylesheetContextSource,
         url: ServoUrl,
         cors_setting: Option<CorsSettings>,
         integrity_metadata: String,
     ) {
-        let document = document_from_node(self.elem);
-        let shadow_root = containing_shadow_root(self.elem).map(|sr| Trusted::new(&*sr));
-        let gen = self
+        let document = self.elem.owner_document();
+        let shadow_root = self
+            .elem
+            .containing_shadow_root()
+            .map(|sr| Trusted::new(&*sr));
+        let generation = self
             .elem
             .downcast::<HTMLLinkElement>()
             .map(HTMLLinkElement::get_request_generation_id);
-        let context = ::std::sync::Arc::new(Mutex::new(StylesheetContext {
+        let context = StylesheetContext {
             elem: Trusted::new(self.elem),
             source,
             url: url.clone(),
@@ -288,73 +343,44 @@ impl<'a> StylesheetLoader<'a> {
             document: Trusted::new(&*document),
             shadow_root,
             origin_clean: true,
-            request_generation_id: gen,
+            request_generation_id: generation,
             resource_timing: ResourceFetchTiming::new(ResourceTimingType::Resource),
-        }));
-
-        let (action_sender, action_receiver) = ipc::channel().unwrap();
-        let (task_source, canceller) = document
-            .window()
-            .task_manager()
-            .networking_task_source_with_canceller();
-        let listener = NetworkListener {
-            context,
-            task_source,
-            canceller: Some(canceller),
         };
-        ROUTER.add_route(
-            action_receiver.to_opaque(),
-            Box::new(move |message| {
-                listener.notify_fetch(message.to().unwrap());
-            }),
-        );
 
         let owner = self
             .elem
             .upcast::<Element>()
             .as_stylesheet_owner()
             .expect("Stylesheet not loaded by <style> or <link> element!");
-        let referrer_policy = owner
-            .referrer_policy()
-            .or_else(|| document.get_referrer_policy());
+        let referrer_policy = owner.referrer_policy();
         owner.increment_pending_loads_count();
         if owner.parser_inserted() {
             document.increment_script_blocking_stylesheet_count();
         }
 
-        let request = stylesheet_fetch_request(
+        // https://html.spec.whatwg.org/multipage/#default-fetch-and-process-the-linked-resource
+        let global = self.elem.global();
+        let request = create_a_potential_cors_request(
+            Some(document.webview_id()),
             url.clone(),
+            Destination::Style,
             cors_setting,
-            document.origin().immutable().clone(),
-            self.elem.global().pipeline_id(),
-            self.elem.global().get_referrer(),
-            referrer_policy,
-            integrity_metadata,
-        );
+            None,
+            global.get_referrer(),
+            document.insecure_requests_policy(),
+            document.has_trustworthy_ancestor_or_current_origin(),
+            global.policy_container(),
+        )
+        .origin(document.origin().immutable().clone())
+        .pipeline_id(Some(self.elem.global().pipeline_id()))
+        .referrer_policy(referrer_policy)
+        .integrity_metadata(integrity_metadata);
 
-        document.fetch_async(LoadType::Stylesheet(url), request, action_sender);
+        document.fetch(LoadType::Stylesheet(url), request, context);
     }
 }
 
-// This function is also used to prefetch a stylesheet in `script::dom::servoparser::prefetch`.
-// https://html.spec.whatwg.org/multipage/#default-fetch-and-process-the-linked-resource
-pub(crate) fn stylesheet_fetch_request(
-    url: ServoUrl,
-    cors_setting: Option<CorsSettings>,
-    origin: ImmutableOrigin,
-    pipeline_id: PipelineId,
-    referrer: Referrer,
-    referrer_policy: Option<ReferrerPolicy>,
-    integrity_metadata: String,
-) -> RequestBuilder {
-    create_a_potential_cors_request(url, Destination::Style, cors_setting, None, referrer)
-        .origin(origin)
-        .pipeline_id(Some(pipeline_id))
-        .referrer_policy(referrer_policy)
-        .integrity_metadata(integrity_metadata)
-}
-
-impl<'a> StyleStylesheetLoader for StylesheetLoader<'a> {
+impl StyleStylesheetLoader for StylesheetLoader<'_> {
     /// Request a stylesheet after parsing a given `@import` rule, and return
     /// the constructed `@import` rule.
     fn request_stylesheet(
@@ -368,7 +394,7 @@ impl<'a> StyleStylesheetLoader for StylesheetLoader<'a> {
         layer: ImportLayer,
     ) -> Arc<Locked<ImportRule>> {
         // Ensure the supports conditions for this @import are true, if not, refuse to load
-        if !supports.as_ref().map_or(true, |s| s.enabled) {
+        if !supports.as_ref().is_none_or(|s| s.enabled) {
             return Arc::new(lock.wrap(ImportRule {
                 url,
                 stylesheet: ImportSheet::new_refused(),

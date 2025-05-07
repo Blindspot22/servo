@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::fmt::{Debug, Error, Formatter};
-use std::ops::RangeInclusive;
+use std::ops::{Deref, RangeInclusive};
 use std::sync::Arc;
 
 use atomic_refcell::AtomicRefCell;
@@ -20,7 +20,21 @@ use crate::system_font_service::{
 };
 
 /// A reference to a [`FontTemplate`] with shared ownership and mutability.
-pub type FontTemplateRef = Arc<AtomicRefCell<FontTemplate>>;
+#[derive(Clone, Debug, MallocSizeOf)]
+pub struct FontTemplateRef(#[conditional_malloc_size_of] Arc<AtomicRefCell<FontTemplate>>);
+
+impl FontTemplateRef {
+    pub fn new(template: FontTemplate) -> Self {
+        Self(Arc::new(AtomicRefCell::new(template)))
+    }
+}
+
+impl Deref for FontTemplateRef {
+    type Target = Arc<AtomicRefCell<FontTemplate>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 /// Describes how to select a font from a given family. This is very basic at the moment and needs
 /// to be expanded or refactored when we support more of the font styling parameters.
@@ -115,7 +129,6 @@ impl FontTemplateDescriptor {
         }
         self.style = match css_font_template_descriptors.style {
             Some(ComputedFontStyleDescriptor::Italic) => (FontStyle::ITALIC, FontStyle::ITALIC),
-            Some(ComputedFontStyleDescriptor::Normal) => (FontStyle::NORMAL, FontStyle::NORMAL),
             Some(ComputedFontStyleDescriptor::Oblique(angle_1, angle_2)) => (
                 FontStyle::oblique(angle_1.to_float()),
                 FontStyle::oblique(angle_2.to_float()),
@@ -177,13 +190,13 @@ impl FontTemplate {
     pub fn new_for_local_web_font(
         local_template: FontTemplateRef,
         css_font_template_descriptors: &CSSFontFaceDescriptors,
-        stylesheet: DocumentStyleSheet,
+        stylesheet: Option<DocumentStyleSheet>,
     ) -> Result<FontTemplate, &'static str> {
         let mut alias_template = local_template.borrow().clone();
         alias_template
             .descriptor
             .override_values_with_css_font_template_descriptors(css_font_template_descriptors);
-        alias_template.stylesheet = Some(stylesheet);
+        alias_template.stylesheet = stylesheet;
         Ok(alias_template)
     }
 
@@ -230,9 +243,7 @@ impl FontTemplateRefMethods for FontTemplateRef {
             .descriptor
             .unicode_range
             .as_ref()
-            .map_or(true, |ranges| {
-                ranges.iter().any(|range| range.contains(&character))
-            })
+            .is_none_or(|ranges| ranges.iter().any(|range| range.contains(&character)))
     }
 }
 

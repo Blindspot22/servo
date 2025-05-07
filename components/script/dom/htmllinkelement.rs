@@ -5,62 +5,61 @@
 use std::borrow::{Borrow, ToOwned};
 use std::cell::Cell;
 use std::default::Default;
-use std::sync;
 
-use cssparser::{Parser as CssParser, ParserInput};
+use base::id::WebViewId;
+use content_security_policy as csp;
 use dom_struct::dom_struct;
 use embedder_traits::EmbedderMsg;
-use html5ever::{local_name, namespace_url, ns, LocalName, Prefix};
-use ipc_channel::ipc;
-use ipc_channel::router::ROUTER;
+use html5ever::{LocalName, Prefix, local_name, ns};
 use js::rust::HandleObject;
-use net_traits::request::{CorsSettings, Destination, Initiator, Referrer, RequestBuilder};
+use net_traits::policy_container::PolicyContainer;
+use net_traits::request::{
+    CorsSettings, Destination, Initiator, InsecureRequestsPolicy, Referrer, RequestBuilder,
+    RequestId,
+};
 use net_traits::{
-    CoreResourceMsg, FetchChannels, FetchMetadata, FetchResponseListener, IpcSend, NetworkError,
-    ReferrerPolicy, ResourceFetchTiming, ResourceTimingType,
+    FetchMetadata, FetchResponseListener, NetworkError, ReferrerPolicy, ResourceFetchTiming,
+    ResourceTimingType,
 };
 use servo_arc::Arc;
-use servo_atoms::Atom;
 use servo_url::ServoUrl;
 use style::attr::AttrValue;
-use style::media_queries::MediaList;
-use style::parser::ParserContext as CssParserContext;
-use style::stylesheets::{CssRuleType, Origin, Stylesheet, UrlExtraData};
-use style_traits::ParsingMode;
+use style::stylesheets::Stylesheet;
+use stylo_atoms::Atom;
 
-use super::types::{EventTarget, GlobalScope};
 use crate::dom::attr::Attr;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::DOMTokenListBinding::DOMTokenList_Binding::DOMTokenListMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLLinkElementBinding::HTMLLinkElementMethods;
+use crate::dom::bindings::codegen::GenericBindings::HTMLElementBinding::HTMLElement_Binding::HTMLElementMethods;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
-use crate::dom::bindings::reflector::DomObject;
+use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::cssstylesheet::CSSStyleSheet;
 use crate::dom::document::Document;
 use crate::dom::domtokenlist::DOMTokenList;
 use crate::dom::element::{
-    cors_setting_for_element, referrer_policy_for_element, reflect_cross_origin_attribute,
-    reflect_referrer_policy_attribute, set_cross_origin_attribute, AttributeMutation, Element,
-    ElementCreator,
+    AttributeMutation, Element, ElementCreator, cors_setting_for_element,
+    referrer_policy_for_element, reflect_cross_origin_attribute, reflect_referrer_policy_attribute,
+    set_cross_origin_attribute,
 };
 use crate::dom::htmlelement::HTMLElement;
-use crate::dom::node::{
-    document_from_node, stylesheets_owner_from_node, window_from_node, BindContext, Node,
-    UnbindContext,
-};
+use crate::dom::medialist::MediaList;
+use crate::dom::node::{BindContext, Node, NodeTraits, UnbindContext};
 use crate::dom::performanceresourcetiming::InitiatorType;
 use crate::dom::stylesheet::StyleSheet as DOMStyleSheet;
+use crate::dom::types::{EventTarget, GlobalScope};
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::fetch::create_a_potential_cors_request;
 use crate::links::LinkRelations;
-use crate::network_listener::{submit_timing, NetworkListener, PreInvoke, ResourceTimingListener};
+use crate::network_listener::{PreInvoke, ResourceTimingListener, submit_timing};
+use crate::script_runtime::CanGc;
 use crate::stylesheet_loader::{StylesheetContextSource, StylesheetLoader, StylesheetOwner};
 
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf, PartialEq)]
-pub struct RequestGenerationId(u32);
+pub(crate) struct RequestGenerationId(u32);
 
 impl RequestGenerationId {
     fn increment(self) -> RequestGenerationId {
@@ -74,15 +73,19 @@ struct LinkProcessingOptions {
     destination: Option<Destination>,
     integrity: String,
     link_type: String,
+    cryptographic_nonce_metadata: String,
     cross_origin: Option<CorsSettings>,
-    referrer_policy: Option<ReferrerPolicy>,
+    referrer_policy: ReferrerPolicy,
+    policy_container: PolicyContainer,
     source_set: Option<()>,
     base_url: ServoUrl,
+    insecure_requests_policy: InsecureRequestsPolicy,
+    has_trustworthy_ancestor_origin: bool,
     // Some fields that we don't need yet are missing
 }
 
 #[dom_struct]
-pub struct HTMLLinkElement {
+pub(crate) struct HTMLLinkElement {
     htmlelement: HTMLElement,
     /// The relations as specified by the "rel" attribute
     rel_list: MutNullableDom<DOMTokenList>,
@@ -95,7 +98,7 @@ pub struct HTMLLinkElement {
     #[no_trace]
     relations: Cell<LinkRelations>,
 
-    #[ignore_malloc_size_of = "Arc"]
+    #[conditional_malloc_size_of]
     #[no_trace]
     stylesheet: DomRefCell<Option<Arc<Stylesheet>>>,
     cssom_stylesheet: MutNullableDom<CSSStyleSheet>,
@@ -109,6 +112,8 @@ pub struct HTMLLinkElement {
     any_failed_load: Cell<bool>,
     /// A monotonically increasing counter that keeps track of which stylesheet to apply.
     request_generation_id: Cell<RequestGenerationId>,
+    /// <https://html.spec.whatwg.org/multipage/#explicitly-enabled>
+    is_explicitly_enabled: Cell<bool>,
 }
 
 impl HTMLLinkElement {
@@ -128,16 +133,18 @@ impl HTMLLinkElement {
             pending_loads: Cell::new(0),
             any_failed_load: Cell::new(false),
             request_generation_id: Cell::new(RequestGenerationId(0)),
+            is_explicitly_enabled: Cell::new(false),
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
         creator: ElementCreator,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLLinkElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLLinkElement::new_inherited(
@@ -145,18 +152,19 @@ impl HTMLLinkElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 
-    pub fn get_request_generation_id(&self) -> RequestGenerationId {
+    pub(crate) fn get_request_generation_id(&self) -> RequestGenerationId {
         self.request_generation_id.get()
     }
 
     // FIXME(emilio): These methods are duplicated with
     // HTMLStyleElement::set_stylesheet.
-    #[allow(crown::unrooted_must_root)]
-    pub fn set_stylesheet(&self, s: Arc<Stylesheet>) {
-        let stylesheets_owner = stylesheets_owner_from_node(self);
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn set_stylesheet(&self, s: Arc<Stylesheet>) {
+        let stylesheets_owner = self.stylesheet_list_owner();
         if let Some(ref s) = *self.stylesheet.borrow() {
             stylesheets_owner.remove_stylesheet(self.upcast(), s)
         }
@@ -165,27 +173,35 @@ impl HTMLLinkElement {
         stylesheets_owner.add_stylesheet(self.upcast(), s);
     }
 
-    pub fn get_stylesheet(&self) -> Option<Arc<Stylesheet>> {
+    pub(crate) fn get_stylesheet(&self) -> Option<Arc<Stylesheet>> {
         self.stylesheet.borrow().clone()
     }
 
-    pub fn get_cssom_stylesheet(&self) -> Option<DomRoot<CSSStyleSheet>> {
+    pub(crate) fn get_cssom_stylesheet(&self, can_gc: CanGc) -> Option<DomRoot<CSSStyleSheet>> {
         self.get_stylesheet().map(|sheet| {
             self.cssom_stylesheet.or_init(|| {
                 CSSStyleSheet::new(
-                    &window_from_node(self),
-                    self.upcast::<Element>(),
+                    &self.owner_window(),
+                    Some(self.upcast::<Element>()),
                     "text/css".into(),
                     None, // todo handle location
                     None, // todo handle title
                     sheet,
+                    false, // is_constructed
+                    can_gc,
                 )
             })
         })
     }
 
-    pub fn is_alternate(&self) -> bool {
+    pub(crate) fn is_alternate(&self) -> bool {
         self.relations.get().contains(LinkRelations::ALTERNATE)
+    }
+
+    pub(crate) fn is_effectively_disabled(&self) -> bool {
+        (self.is_alternate() && !self.is_explicitly_enabled.get()) ||
+            self.upcast::<Element>()
+                .has_attribute(&local_name!("disabled"))
     }
 
     fn clean_stylesheet_ownership(&self) {
@@ -209,13 +225,22 @@ impl VirtualMethods for HTMLLinkElement {
         Some(self.upcast::<HTMLElement>() as &dyn VirtualMethods)
     }
 
-    fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation) {
-        self.super_type().unwrap().attribute_mutated(attr, mutation);
-        if !self.upcast::<Node>().is_connected() || mutation.is_removal() {
+    fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation, can_gc: CanGc) {
+        self.super_type()
+            .unwrap()
+            .attribute_mutated(attr, mutation, can_gc);
+
+        let local_name = attr.local_name();
+        let is_removal = mutation.is_removal();
+        if *local_name == local_name!("disabled") {
+            self.handle_disabled_attribute_change(!is_removal);
             return;
         }
 
-        match *attr.local_name() {
+        if !self.upcast::<Node>().is_connected() || is_removal {
+            return;
+        }
+        match *local_name {
             local_name!("rel") | local_name!("rev") => {
                 self.relations
                     .set(LinkRelations::for_element(self.upcast()));
@@ -258,9 +283,9 @@ impl VirtualMethods for HTMLLinkElement {
         }
     }
 
-    fn bind_to_tree(&self, context: &BindContext) {
+    fn bind_to_tree(&self, context: &BindContext, can_gc: CanGc) {
         if let Some(s) = self.super_type() {
-            s.bind_to_tree(context);
+            s.bind_to_tree(context, can_gc);
         }
 
         self.relations
@@ -287,14 +312,15 @@ impl VirtualMethods for HTMLLinkElement {
         }
     }
 
-    fn unbind_from_tree(&self, context: &UnbindContext) {
+    fn unbind_from_tree(&self, context: &UnbindContext, can_gc: CanGc) {
         if let Some(s) = self.super_type() {
-            s.unbind_from_tree(context);
+            s.unbind_from_tree(context, can_gc);
         }
 
         if let Some(s) = self.stylesheet.borrow_mut().take() {
             self.clean_stylesheet_ownership();
-            stylesheets_owner_from_node(self).remove_stylesheet(self.upcast(), &s);
+            self.stylesheet_list_owner()
+                .remove_stylesheet(self.upcast(), &s);
         }
     }
 }
@@ -318,10 +344,14 @@ impl HTMLLinkElement {
             destination: Some(destination),
             integrity: String::new(),
             link_type: String::new(),
+            cryptographic_nonce_metadata: self.upcast::<HTMLElement>().Nonce().into(),
             cross_origin: cors_setting_for_element(element),
             referrer_policy: referrer_policy_for_element(element),
+            policy_container: document.policy_container().to_owned(),
             source_set: None, // FIXME
             base_url: document.borrow().base_url(),
+            insecure_requests_policy: document.insecure_requests_policy(),
+            has_trustworthy_ancestor_origin: document.has_trustworthy_ancestor_or_current_origin(),
         };
 
         // Step 3. If el has an href attribute, then set options's href to the value of el's href attribute.
@@ -363,7 +393,7 @@ impl HTMLLinkElement {
 
         // Step 4. Let request be the result of creating a link request given options.
         let url = options.base_url.clone();
-        let Some(request) = options.create_link_request() else {
+        let Some(request) = options.create_link_request(self.owner_window().webview_id()) else {
             // Step 5. If request is null, then return.
             return;
         };
@@ -374,47 +404,19 @@ impl HTMLLinkElement {
         // (Step 7, firing load/error events is handled in the FetchResponseListener impl for PrefetchContext)
 
         // Step 8. The user agent should fetch request, with processResponseConsumeBody set to processPrefetchResponse.
-        let (action_sender, action_receiver) = ipc::channel().unwrap();
         let document = self.upcast::<Node>().owner_doc();
-        let window = document.window();
-
-        let (task_source, canceller) = window
-            .task_manager()
-            .networking_task_source_with_canceller();
-
-        let fetch_context = sync::Arc::new(sync::Mutex::new(PrefetchContext {
+        let fetch_context = PrefetchContext {
             url,
             link: Trusted::new(self),
             resource_timing: ResourceFetchTiming::new(ResourceTimingType::Resource),
-        }));
-
-        let listener = NetworkListener {
-            context: fetch_context,
-            task_source,
-            canceller: Some(canceller),
         };
 
-        ROUTER.add_route(
-            action_receiver.to_opaque(),
-            Box::new(move |message| {
-                listener.notify_fetch(message.to().unwrap());
-            }),
-        );
-
-        window
-            .upcast::<GlobalScope>()
-            .resource_threads()
-            .sender()
-            .send(CoreResourceMsg::Fetch(
-                request,
-                FetchChannels::ResponseMsg(action_sender, None),
-            ))
-            .unwrap();
+        document.fetch_background(request, fetch_context);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#concept-link-obtain>
     fn handle_stylesheet_url(&self, href: &str) {
-        let document = document_from_node(self);
+        let document = self.owner_document();
         if document.browsing_context().is_none() {
             return;
         }
@@ -445,24 +447,7 @@ impl HTMLLinkElement {
             None => "",
         };
 
-        let mut input = ParserInput::new(mq_str);
-        let mut css_parser = CssParser::new(&mut input);
-        let document_url_data = &UrlExtraData(document.url().get_arc());
-        let window = document.window();
-        // FIXME(emilio): This looks somewhat fishy, since we use the context
-        // only to parse the media query list, CssRuleType::Media doesn't make
-        // much sense.
-        let context = CssParserContext::new(
-            Origin::Author,
-            document_url_data,
-            Some(CssRuleType::Media),
-            ParsingMode::DEFAULT,
-            document.quirks_mode(),
-            /* namespaces = */ Default::default(),
-            window.css_error_reporter(),
-            None,
-        );
-        let media = MediaList::parse(&context, &mut css_parser);
+        let media = MediaList::parse_media_list(mq_str, document.window());
 
         let im_attribute = element.get_attribute(&ns!(), &local_name!("integrity"));
         let integrity_val = im_attribute.as_ref().map(|a| a.value());
@@ -485,13 +470,25 @@ impl HTMLLinkElement {
         );
     }
 
+    /// <https://html.spec.whatwg.org/multipage/#attr-link-disabled>
+    fn handle_disabled_attribute_change(&self, disabled: bool) {
+        if !disabled {
+            self.is_explicitly_enabled.set(true);
+        }
+        if let Some(stylesheet) = self.get_stylesheet() {
+            if stylesheet.set_disabled(disabled) {
+                self.stylesheet_list_owner().invalidate_stylesheets();
+            }
+        }
+    }
+
     fn handle_favicon_url(&self, href: &str, _sizes: &Option<String>) {
-        let document = document_from_node(self);
+        let document = self.owner_document();
         match document.base_url().join(href) {
             Ok(url) => {
                 let window = document.window();
                 if window.is_top_level() {
-                    let msg = EmbedderMsg::NewFavicon(url.clone());
+                    let msg = EmbedderMsg::NewFavicon(document.webview_id(), url.clone());
                     window.send_to_embedder(msg);
                 }
             },
@@ -525,22 +522,22 @@ impl StylesheetOwner for HTMLLinkElement {
         self.parser_inserted.get()
     }
 
-    fn referrer_policy(&self) -> Option<ReferrerPolicy> {
-        if self.RelList().Contains("noreferrer".into()) {
-            return Some(ReferrerPolicy::NoReferrer);
+    fn referrer_policy(&self) -> ReferrerPolicy {
+        if self.RelList(CanGc::note()).Contains("noreferrer".into()) {
+            return ReferrerPolicy::NoReferrer;
         }
 
-        None
+        ReferrerPolicy::EmptyString
     }
 
     fn set_origin_clean(&self, origin_clean: bool) {
-        if let Some(stylesheet) = self.get_cssom_stylesheet() {
+        if let Some(stylesheet) = self.get_cssom_stylesheet(CanGc::note()) {
             stylesheet.set_origin_clean(origin_clean);
         }
     }
 }
 
-impl HTMLLinkElementMethods for HTMLLinkElement {
+impl HTMLLinkElementMethods<crate::DomTypeHolder> for HTMLLinkElement {
     // https://html.spec.whatwg.org/multipage/#dom-link-href
     make_url_getter!(Href, "href");
 
@@ -551,9 +548,9 @@ impl HTMLLinkElementMethods for HTMLLinkElement {
     make_getter!(Rel, "rel");
 
     // https://html.spec.whatwg.org/multipage/#dom-link-rel
-    fn SetRel(&self, rel: DOMString) {
+    fn SetRel(&self, rel: DOMString, can_gc: CanGc) {
         self.upcast::<Element>()
-            .set_tokenlist_attribute(&local_name!("rel"), rel);
+            .set_tokenlist_attribute(&local_name!("rel"), rel, can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-link-media
@@ -580,8 +577,14 @@ impl HTMLLinkElementMethods for HTMLLinkElement {
     // https://html.spec.whatwg.org/multipage/#dom-link-type
     make_setter!(SetType, "type");
 
+    // https://html.spec.whatwg.org/multipage/#dom-link-disabled
+    make_bool_getter!(Disabled, "disabled");
+
+    // https://html.spec.whatwg.org/multipage/#dom-link-disabled
+    make_bool_setter!(SetDisabled, "disabled");
+
     // https://html.spec.whatwg.org/multipage/#dom-link-rellist
-    fn RelList(&self) -> DomRoot<DOMTokenList> {
+    fn RelList(&self, can_gc: CanGc) -> DomRoot<DOMTokenList> {
         self.rel_list.or_init(|| {
             DOMTokenList::new(
                 self.upcast(),
@@ -603,6 +606,7 @@ impl HTMLLinkElementMethods for HTMLLinkElement {
                     Atom::from("prerender"),
                     Atom::from("stylesheet"),
                 ]),
+                can_gc,
             )
         })
     }
@@ -631,8 +635,8 @@ impl HTMLLinkElementMethods for HTMLLinkElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-link-crossorigin
-    fn SetCrossOrigin(&self, value: Option<DOMString>) {
-        set_cross_origin_attribute(self.upcast::<Element>(), value);
+    fn SetCrossOrigin(&self, value: Option<DOMString>, can_gc: CanGc) {
+        set_cross_origin_attribute(self.upcast::<Element>(), value, can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-link-referrerpolicy
@@ -644,14 +648,14 @@ impl HTMLLinkElementMethods for HTMLLinkElement {
     make_setter!(SetReferrerPolicy, "referrerpolicy");
 
     // https://drafts.csswg.org/cssom/#dom-linkstyle-sheet
-    fn GetSheet(&self) -> Option<DomRoot<DOMStyleSheet>> {
-        self.get_cssom_stylesheet().map(DomRoot::upcast)
+    fn GetSheet(&self, can_gc: CanGc) -> Option<DomRoot<DOMStyleSheet>> {
+        self.get_cssom_stylesheet(can_gc).map(DomRoot::upcast)
     }
 }
 
 impl LinkProcessingOptions {
     /// <https://html.spec.whatwg.org/multipage/#create-a-link-request>
-    fn create_link_request(self) -> Option<RequestBuilder> {
+    fn create_link_request(self, webview_id: WebViewId) -> Option<RequestBuilder> {
         // Step 1. Assert: options's href is not the empty string.
         assert!(!self.href.is_empty());
 
@@ -668,21 +672,26 @@ impl LinkProcessingOptions {
 
         // Step 5. Let request be the result of creating a potential-CORS request given
         //         url, options's destination, and options's crossorigin.
-        // FIXME: Step 6. Set request's policy container to options's policy container.
+        // Step 6. Set request's policy container to options's policy container.
         // Step 7. Set request's integrity metadata to options's integrity.
-        // FIXME: Step 8. Set request's cryptographic nonce metadata to options's cryptographic nonce metadata.
+        // Step 8. Set request's cryptographic nonce metadata to options's cryptographic nonce metadata.
         // Step 9. Set request's referrer policy to options's referrer policy.
         // FIXME: Step 10. Set request's client to options's environment.
         // FIXME: Step 11. Set request's priority to options's fetch priority.
         // FIXME: Use correct referrer
         let builder = create_a_potential_cors_request(
+            Some(webview_id),
             url,
             destination,
             self.cross_origin,
             None,
             Referrer::NoReferrer,
+            self.insecure_requests_policy,
+            self.has_trustworthy_ancestor_origin,
+            self.policy_container,
         )
         .integrity_metadata(self.integrity)
+        .cryptographic_nonce_metadata(self.cryptographic_nonce_metadata)
         .referrer_policy(self.referrer_policy);
 
         // Step 12. Return request.
@@ -713,32 +722,40 @@ struct PrefetchContext {
 }
 
 impl FetchResponseListener for PrefetchContext {
-    fn process_request_body(&mut self) {}
+    fn process_request_body(&mut self, _: RequestId) {}
 
-    fn process_request_eof(&mut self) {}
+    fn process_request_eof(&mut self, _: RequestId) {}
 
-    fn process_response(&mut self, fetch_metadata: Result<FetchMetadata, NetworkError>) {
+    fn process_response(
+        &mut self,
+        _: RequestId,
+        fetch_metadata: Result<FetchMetadata, NetworkError>,
+    ) {
         _ = fetch_metadata;
     }
 
-    fn process_response_chunk(&mut self, chunk: Vec<u8>) {
+    fn process_response_chunk(&mut self, _: RequestId, chunk: Vec<u8>) {
         _ = chunk;
     }
 
     // Step 7 of `fetch and process the linked resource` in https://html.spec.whatwg.org/multipage/#link-type-prefetch
-    fn process_response_eof(&mut self, response: Result<ResourceFetchTiming, NetworkError>) {
+    fn process_response_eof(
+        &mut self,
+        _: RequestId,
+        response: Result<ResourceFetchTiming, NetworkError>,
+    ) {
         if response.is_err() {
             // Step 1. If response is a network error, fire an event named error at el.
             self.link
                 .root()
                 .upcast::<EventTarget>()
-                .fire_event(atom!("error"));
+                .fire_event(atom!("error"), CanGc::note());
         } else {
             // Step 2. Otherwise, fire an event named load at el.
             self.link
                 .root()
                 .upcast::<EventTarget>()
-                .fire_event(atom!("load"));
+                .fire_event(atom!("load"), CanGc::note());
         }
     }
 
@@ -751,7 +768,12 @@ impl FetchResponseListener for PrefetchContext {
     }
 
     fn submit_resource_timing(&mut self) {
-        submit_timing(self)
+        submit_timing(self, CanGc::note())
+    }
+
+    fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<csp::Violation>) {
+        let global = &self.resource_timing_global();
+        global.report_csp_violations(violations);
     }
 }
 

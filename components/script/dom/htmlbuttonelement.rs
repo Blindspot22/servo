@@ -6,9 +6,9 @@ use std::cell::Cell;
 use std::default::Default;
 
 use dom_struct::dom_struct;
-use html5ever::{local_name, namespace_url, LocalName, Prefix};
+use html5ever::{LocalName, Prefix, local_name};
 use js::rust::HandleObject;
-use style_dom::ElementState;
+use stylo_dom::ElementState;
 
 use crate::dom::activation::Activatable;
 use crate::dom::attr::Attr;
@@ -26,11 +26,12 @@ use crate::dom::htmlformelement::{
     FormControl, FormDatum, FormDatumValue, FormSubmitterElement, HTMLFormElement, ResetFrom,
     SubmittedFrom,
 };
-use crate::dom::node::{window_from_node, BindContext, Node, UnbindContext};
+use crate::dom::node::{BindContext, Node, NodeTraits, UnbindContext};
 use crate::dom::nodelist::NodeList;
-use crate::dom::validation::{is_barred_by_datalist_ancestor, Validatable};
+use crate::dom::validation::{Validatable, is_barred_by_datalist_ancestor};
 use crate::dom::validitystate::{ValidationFlags, ValidityState};
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
 
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf, PartialEq)]
 enum ButtonType {
@@ -40,7 +41,7 @@ enum ButtonType {
 }
 
 #[dom_struct]
-pub struct HTMLButtonElement {
+pub(crate) struct HTMLButtonElement {
     htmlelement: HTMLElement,
     button_type: Cell<ButtonType>,
     form_owner: MutNullableDom<HTMLFormElement>,
@@ -68,12 +69,13 @@ impl HTMLButtonElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLButtonElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLButtonElement::new_inherited(
@@ -81,16 +83,17 @@ impl HTMLButtonElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 
     #[inline]
-    pub fn is_submit_button(&self) -> bool {
+    pub(crate) fn is_submit_button(&self) -> bool {
         self.button_type.get() == ButtonType::Submit
     }
 }
 
-impl HTMLButtonElementMethods for HTMLButtonElement {
+impl HTMLButtonElementMethods<crate::DomTypeHolder> for HTMLButtonElement {
     // https://html.spec.whatwg.org/multipage/#dom-fe-disabled
     make_bool_getter!(Disabled, "disabled");
 
@@ -102,8 +105,14 @@ impl HTMLButtonElementMethods for HTMLButtonElement {
         self.form_owner()
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-button-type
-    make_enumerated_getter!(Type, "type", "submit", "reset" | "button");
+    // <https://html.spec.whatwg.org/multipage/#dom-button-type>
+    make_enumerated_getter!(
+        Type,
+        "type",
+        "submit" | "reset" | "button",
+        missing => "submit",
+        invalid => "submit"
+    );
 
     // https://html.spec.whatwg.org/multipage/#dom-button-type
     make_setter!(SetType, "type");
@@ -118,15 +127,21 @@ impl HTMLButtonElementMethods for HTMLButtonElement {
     make_enumerated_getter!(
         FormEnctype,
         "formenctype",
-        "application/x-www-form-urlencoded",
-        "text/plain" | "multipart/form-data"
+        "application/x-www-form-urlencoded" | "multipart/form-data" | "text/plain",
+        invalid => "application/x-www-form-urlencoded"
     );
 
     // https://html.spec.whatwg.org/multipage/#dom-fs-formenctype
     make_setter!(SetFormEnctype, "formenctype");
 
     // https://html.spec.whatwg.org/multipage/#dom-fs-formmethod
-    make_enumerated_getter!(FormMethod, "formmethod", "get", "post" | "dialog");
+    make_enumerated_getter!(
+        FormMethod,
+        "formmethod",
+        "get" | "post" | "dialog",
+        missing => "get",
+        invalid => "get"
+    );
 
     // https://html.spec.whatwg.org/multipage/#dom-fs-formmethod
     make_setter!(SetFormMethod, "formmethod");
@@ -169,13 +184,13 @@ impl HTMLButtonElementMethods for HTMLButtonElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-checkvalidity
-    fn CheckValidity(&self) -> bool {
-        self.check_validity()
+    fn CheckValidity(&self, can_gc: CanGc) -> bool {
+        self.check_validity(can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-reportvalidity
-    fn ReportValidity(&self) -> bool {
-        self.report_validity()
+    fn ReportValidity(&self, can_gc: CanGc) -> bool {
+        self.report_validity(can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-validationmessage
@@ -192,7 +207,7 @@ impl HTMLButtonElementMethods for HTMLButtonElement {
 impl HTMLButtonElement {
     /// <https://html.spec.whatwg.org/multipage/#constructing-the-form-data-set>
     /// Steps range from 3.1 to 3.7 (specific to HTMLButtonElement)
-    pub fn form_datum(&self, submitter: Option<FormSubmitterElement>) -> Option<FormDatum> {
+    pub(crate) fn form_datum(&self, submitter: Option<FormSubmitterElement>) -> Option<FormDatum> {
         // Step 3.1: disabled state check is in get_unclean_dataset
 
         // Step 3.1: only run steps if this is the submitter
@@ -227,8 +242,10 @@ impl VirtualMethods for HTMLButtonElement {
         Some(self.upcast::<HTMLElement>() as &dyn VirtualMethods)
     }
 
-    fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation) {
-        self.super_type().unwrap().attribute_mutated(attr, mutation);
+    fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation, can_gc: CanGc) {
+        self.super_type()
+            .unwrap()
+            .attribute_mutated(attr, mutation, can_gc);
         match *attr.local_name() {
             local_name!("disabled") => {
                 let el = self.upcast::<Element>();
@@ -244,9 +261,9 @@ impl VirtualMethods for HTMLButtonElement {
                         el.check_ancestors_disabled_state_for_form_control();
                     },
                 }
-                el.update_sequentially_focusable_status();
+                el.update_sequentially_focusable_status(can_gc);
                 self.validity_state()
-                    .perform_validation_and_update(ValidationFlags::all());
+                    .perform_validation_and_update(ValidationFlags::all(), can_gc);
             },
             local_name!("type") => match mutation {
                 AttributeMutation::Set(_) => {
@@ -257,32 +274,32 @@ impl VirtualMethods for HTMLButtonElement {
                     };
                     self.button_type.set(value);
                     self.validity_state()
-                        .perform_validation_and_update(ValidationFlags::all());
+                        .perform_validation_and_update(ValidationFlags::all(), can_gc);
                 },
                 AttributeMutation::Removed => {
                     self.button_type.set(ButtonType::Submit);
                 },
             },
             local_name!("form") => {
-                self.form_attribute_mutated(mutation);
+                self.form_attribute_mutated(mutation, can_gc);
                 self.validity_state()
-                    .perform_validation_and_update(ValidationFlags::empty());
+                    .perform_validation_and_update(ValidationFlags::empty(), can_gc);
             },
             _ => {},
         }
     }
 
-    fn bind_to_tree(&self, context: &BindContext) {
+    fn bind_to_tree(&self, context: &BindContext, can_gc: CanGc) {
         if let Some(s) = self.super_type() {
-            s.bind_to_tree(context);
+            s.bind_to_tree(context, can_gc);
         }
 
         self.upcast::<Element>()
             .check_ancestors_disabled_state_for_form_control();
     }
 
-    fn unbind_from_tree(&self, context: &UnbindContext) {
-        self.super_type().unwrap().unbind_from_tree(context);
+    fn unbind_from_tree(&self, context: &UnbindContext, can_gc: CanGc) {
+        self.super_type().unwrap().unbind_from_tree(context, can_gc);
 
         let node = self.upcast::<Node>();
         let el = self.upcast::<Element>();
@@ -318,7 +335,7 @@ impl Validatable for HTMLButtonElement {
 
     fn validity_state(&self) -> DomRoot<ValidityState> {
         self.validity_state
-            .or_init(|| ValidityState::new(&window_from_node(self), self.upcast()))
+            .or_init(|| ValidityState::new(&self.owner_window(), self.upcast(), CanGc::note()))
     }
 
     fn is_instance_validatable(&self) -> bool {
@@ -342,7 +359,7 @@ impl Activatable for HTMLButtonElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#run-post-click-activation-steps
-    fn activation_behavior(&self, _event: &Event, _target: &EventTarget) {
+    fn activation_behavior(&self, _event: &Event, _target: &EventTarget, can_gc: CanGc) {
         let ty = self.button_type.get();
         match ty {
             //https://html.spec.whatwg.org/multipage/#attr-button-type-submit-state
@@ -352,13 +369,14 @@ impl Activatable for HTMLButtonElement {
                     owner.submit(
                         SubmittedFrom::NotFromForm,
                         FormSubmitterElement::Button(self),
+                        can_gc,
                     );
                 }
             },
             ButtonType::Reset => {
                 // TODO: is document owner fully active?
                 if let Some(owner) = self.form_owner() {
-                    owner.reset(ResetFrom::NotFromForm);
+                    owner.reset(ResetFrom::NotFromForm, can_gc);
                 }
             },
             _ => (),

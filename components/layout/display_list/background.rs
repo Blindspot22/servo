@@ -3,339 +3,359 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use app_units::Au;
-use euclid::default::{Point2D, Rect, SideOffsets2D, Size2D};
-use style::computed_values::background_attachment::single_value::T as BackgroundAttachment;
-use style::computed_values::background_clip::single_value::T as BackgroundClip;
-use style::computed_values::background_origin::single_value::T as BackgroundOrigin;
-use style::properties::style_structs::Background;
-use style::values::computed::{BackgroundSize, NonNegativeLengthPercentageOrAuto};
-use style::values::specified::background::BackgroundRepeatKeyword;
-use webrender_api::BorderRadius;
+use euclid::{Point2D, Size2D, Vector2D};
+use style::computed_values::background_attachment::SingleComputedValue as BackgroundAttachment;
+use style::computed_values::background_clip::single_value::T as Clip;
+use style::computed_values::background_origin::single_value::T as Origin;
+use style::properties::ComputedValues;
+use style::values::computed::LengthPercentage;
+use style::values::computed::background::BackgroundSize as Size;
+use style::values::specified::background::{
+    BackgroundRepeat as RepeatXY, BackgroundRepeatKeyword as Repeat,
+};
+use webrender_api::{self as wr, units};
+use wr::ClipChainId;
+use wr::units::LayoutSize;
 
-use crate::display_list::border;
+use crate::replaced::NaturalSizes;
 
-/// Placment information for both image and gradient backgrounds.
-#[derive(Clone, Copy, Debug)]
-pub struct BackgroundPlacement {
-    /// Rendering bounds. The background will start in the uppper-left corner
-    /// and fill the whole area.
-    pub bounds: Rect<Au>,
-    /// Background tile size. Some backgrounds are repeated. These are the
-    /// dimensions of a single image of the background.
-    pub tile_size: Size2D<Au>,
-    /// Spacing between tiles. Some backgrounds are not repeated seamless
-    /// but have seams between them like tiles in real life.
-    pub tile_spacing: Size2D<Au>,
-    /// A clip area. While the background is rendered according to all the
-    /// measures above it is only shown within these bounds.
-    pub clip_rect: Rect<Au>,
-    /// Rounded corners for the clip_rect.
-    pub clip_radii: BorderRadius,
+pub(super) struct BackgroundLayer {
+    pub common: wr::CommonItemProperties,
+    pub bounds: units::LayoutRect,
+    pub tile_size: units::LayoutSize,
+    pub tile_spacing: units::LayoutSize,
+    pub repeat: bool,
 }
 
-/// Access element at index modulo the array length.
-///
-/// Obviously it does not work with empty arrays.
-///
-/// This is used for multiple layered background images.
-/// See: <https://drafts.csswg.org/css-backgrounds-3/#layering>
-pub fn get_cyclic<T>(arr: &[T], index: usize) -> &T {
-    &arr[index % arr.len()]
+#[derive(Debug)]
+struct Layout1DResult {
+    repeat: bool,
+    bounds_origin: f32,
+    bounds_size: f32,
+    tile_spacing: f32,
 }
 
-/// For a given area and an image compute how big the
-/// image should be displayed on the background.
-fn compute_background_image_size(
-    bg_size: &BackgroundSize,
-    bounds_size: Size2D<Au>,
-    intrinsic_size: Option<Size2D<Au>>,
-) -> Size2D<Au> {
-    match intrinsic_size {
-        None => match bg_size {
-            BackgroundSize::Cover | BackgroundSize::Contain => bounds_size,
-            BackgroundSize::ExplicitSize { width, height } => Size2D::new(
-                width
-                    .to_used_value(bounds_size.width)
-                    .unwrap_or(bounds_size.width),
-                height
-                    .to_used_value(bounds_size.height)
-                    .unwrap_or(bounds_size.height),
-            ),
-        },
-        Some(own_size) => {
-            // If `image_aspect_ratio` < `bounds_aspect_ratio`, the image is tall; otherwise, it is
-            // wide.
-            let image_aspect_ratio = own_size.width.to_f32_px() / own_size.height.to_f32_px();
-            let bounds_aspect_ratio =
-                bounds_size.width.to_f32_px() / bounds_size.height.to_f32_px();
-            match (bg_size, image_aspect_ratio < bounds_aspect_ratio) {
-                (BackgroundSize::Contain, false) | (BackgroundSize::Cover, true) => Size2D::new(
-                    bounds_size.width,
-                    bounds_size.width.scale_by(image_aspect_ratio.recip()),
-                ),
-                (BackgroundSize::Contain, true) | (BackgroundSize::Cover, false) => Size2D::new(
-                    bounds_size.height.scale_by(image_aspect_ratio),
-                    bounds_size.height,
-                ),
-                (
-                    BackgroundSize::ExplicitSize {
-                        width,
-                        height: NonNegativeLengthPercentageOrAuto::Auto,
-                    },
-                    _,
-                ) => {
-                    let width = width
-                        .to_used_value(bounds_size.width)
-                        .unwrap_or(own_size.width);
-                    Size2D::new(width, width.scale_by(image_aspect_ratio.recip()))
-                },
-                (
-                    BackgroundSize::ExplicitSize {
-                        width: NonNegativeLengthPercentageOrAuto::Auto,
-                        height,
-                    },
-                    _,
-                ) => {
-                    let height = height
-                        .to_used_value(bounds_size.height)
-                        .unwrap_or(own_size.height);
-                    Size2D::new(height.scale_by(image_aspect_ratio), height)
-                },
-                (BackgroundSize::ExplicitSize { width, height }, _) => Size2D::new(
-                    width
-                        .to_used_value(bounds_size.width)
-                        .unwrap_or(own_size.width),
-                    height
-                        .to_used_value(bounds_size.height)
-                        .unwrap_or(own_size.height),
-                ),
+fn get_cyclic<T>(values: &[T], layer_index: usize) -> &T {
+    &values[layer_index % values.len()]
+}
+
+pub(super) struct BackgroundPainter<'a> {
+    pub style: &'a ComputedValues,
+    pub positioning_area_override: Option<units::LayoutRect>,
+    pub painting_area_override: Option<units::LayoutRect>,
+}
+
+impl<'a> BackgroundPainter<'a> {
+    /// Get the painting area for this background, which is the actual rectangle in the
+    /// current coordinate system that the background will be painted.
+    pub(super) fn painting_area(
+        &self,
+        fragment_builder: &'a super::BuilderForBoxFragment,
+        builder: &mut super::DisplayListBuilder,
+        layer_index: usize,
+    ) -> units::LayoutRect {
+        let fb = fragment_builder;
+        if let Some(painting_area_override) = self.painting_area_override.as_ref() {
+            return *painting_area_override;
+        }
+        if self.positioning_area_override.is_some() {
+            return fb.border_rect;
+        }
+
+        let background = self.style.get_background();
+        if &BackgroundAttachment::Fixed ==
+            get_cyclic(&background.background_attachment.0, layer_index)
+        {
+            let viewport_size = builder.display_list.compositor_info.viewport_size;
+            return units::LayoutRect::from_origin_and_size(Point2D::origin(), viewport_size);
+        }
+
+        match get_cyclic(&background.background_clip.0, layer_index) {
+            Clip::ContentBox => *fragment_builder.content_rect(),
+            Clip::PaddingBox => *fragment_builder.padding_rect(),
+            Clip::BorderBox => fragment_builder.border_rect,
+        }
+    }
+
+    fn clip(
+        &self,
+        fragment_builder: &'a super::BuilderForBoxFragment,
+        builder: &mut super::DisplayListBuilder,
+        layer_index: usize,
+    ) -> Option<ClipChainId> {
+        if self.painting_area_override.is_some() {
+            return None;
+        }
+
+        if self.positioning_area_override.is_some() {
+            return fragment_builder.border_edge_clip(builder, false);
+        }
+
+        // The 'backgound-clip' property maps directly to `clip_rect` in `CommonItemProperties`:
+        let background = self.style.get_background();
+        let force_clip_creation = get_cyclic(&background.background_attachment.0, layer_index) ==
+            &BackgroundAttachment::Fixed;
+        match get_cyclic(&background.background_clip.0, layer_index) {
+            Clip::ContentBox => fragment_builder.content_edge_clip(builder, force_clip_creation),
+            Clip::PaddingBox => fragment_builder.padding_edge_clip(builder, force_clip_creation),
+            Clip::BorderBox => fragment_builder.border_edge_clip(builder, force_clip_creation),
+        }
+    }
+
+    /// Get the [`wr::CommonItemProperties`] for this background. This includes any clipping
+    /// established by border radii as well as special clipping and spatial node assignment
+    /// necessary for `background-attachment`.
+    pub(super) fn common_properties(
+        &self,
+        fragment_builder: &'a super::BuilderForBoxFragment,
+        builder: &mut super::DisplayListBuilder,
+        layer_index: usize,
+        painting_area: units::LayoutRect,
+    ) -> wr::CommonItemProperties {
+        let clip = self.clip(fragment_builder, builder, layer_index);
+        let style = &fragment_builder.fragment.style;
+        let mut common = builder.common_properties(painting_area, style);
+        if let Some(clip_chain_id) = clip {
+            common.clip_chain_id = clip_chain_id;
+        }
+        if &BackgroundAttachment::Fixed ==
+            get_cyclic(&style.get_background().background_attachment.0, layer_index)
+        {
+            common.spatial_id = builder.current_reference_frame_scroll_node_id.spatial_id;
+        }
+        common
+    }
+
+    /// Get the positioning area of the background which is the rectangle that defines where
+    /// the origin of the background content is, regardless of where the background is actual
+    /// painted.
+    pub(super) fn positioning_area(
+        &self,
+        fragment_builder: &'a super::BuilderForBoxFragment,
+        layer_index: usize,
+    ) -> units::LayoutRect {
+        if let Some(positioning_area_override) = self.positioning_area_override {
+            return positioning_area_override;
+        }
+
+        match get_cyclic(
+            &self.style.get_background().background_attachment.0,
+            layer_index,
+        ) {
+            BackgroundAttachment::Scroll => match get_cyclic(
+                &self.style.get_background().background_origin.0,
+                layer_index,
+            ) {
+                Origin::ContentBox => *fragment_builder.content_rect(),
+                Origin::PaddingBox => *fragment_builder.padding_rect(),
+                Origin::BorderBox => fragment_builder.border_rect,
+            },
+            BackgroundAttachment::Fixed => {
+                // This isn't the viewport size because that rects larger than the viewport might be
+                // transformed down into areas smaller than the viewport.
+                units::LayoutRect::from_origin_and_size(
+                    Point2D::origin(),
+                    LayoutSize::new(f32::MAX, f32::MAX),
+                )
+            },
+        }
+    }
+}
+
+pub(super) fn layout_layer(
+    fragment_builder: &mut super::BuilderForBoxFragment,
+    painter: &BackgroundPainter,
+    builder: &mut super::DisplayListBuilder,
+    layer_index: usize,
+    natural_sizes: NaturalSizes,
+) -> Option<BackgroundLayer> {
+    let painting_area = painter.painting_area(fragment_builder, builder, layer_index);
+    let positioning_area = painter.positioning_area(fragment_builder, layer_index);
+    let common = painter.common_properties(fragment_builder, builder, layer_index, painting_area);
+
+    // https://drafts.csswg.org/css-backgrounds/#background-size
+    enum ContainOrCover {
+        Contain,
+        Cover,
+    }
+    let size_contain_or_cover = |background_size| {
+        let mut tile_size = positioning_area.size();
+        if let Some(natural_ratio) = natural_sizes.ratio {
+            let positioning_ratio = positioning_area.size().width / positioning_area.size().height;
+            // Whether the tile width (as opposed to height)
+            // is scaled to that of the positioning area
+            let fit_width = match background_size {
+                ContainOrCover::Contain => positioning_ratio <= natural_ratio,
+                ContainOrCover::Cover => positioning_ratio > natural_ratio,
+            };
+            // The other dimension needs to be adjusted
+            if fit_width {
+                tile_size.height = tile_size.width / natural_ratio
+            } else {
+                tile_size.width = tile_size.height * natural_ratio
             }
-        },
-    }
-}
-
-/// Compute a rounded clip rect for the background.
-pub fn clip(
-    bg_clip: BackgroundClip,
-    absolute_bounds: Rect<Au>,
-    border: SideOffsets2D<Au>,
-    border_padding: SideOffsets2D<Au>,
-    border_radii: BorderRadius,
-) -> (Rect<Au>, BorderRadius) {
-    match bg_clip {
-        BackgroundClip::BorderBox => (absolute_bounds, border_radii),
-        BackgroundClip::PaddingBox => (
-            absolute_bounds.inner_rect(border),
-            border::inner_radii(border_radii, border),
-        ),
-        BackgroundClip::ContentBox => (
-            absolute_bounds.inner_rect(border_padding),
-            border::inner_radii(border_radii, border_padding),
-        ),
-    }
-}
-
-/// Determines where to place an element background image or gradient.
-///
-/// Images have their resolution as intrinsic size while gradients have
-/// no intrinsic size.
-///
-/// Return `None` if the background size is zero, otherwise a [`BackgroundPlacement`].
-#[allow(clippy::too_many_arguments)]
-pub fn placement(
-    bg: &Background,
-    viewport_size: Size2D<Au>,
-    absolute_bounds: Rect<Au>,
-    intrinsic_size: Option<Size2D<Au>>,
-    border: SideOffsets2D<Au>,
-    border_padding: SideOffsets2D<Au>,
-    border_radii: BorderRadius,
-    index: usize,
-) -> Option<BackgroundPlacement> {
-    let bg_attachment = *get_cyclic(&bg.background_attachment.0, index);
-    let bg_clip = *get_cyclic(&bg.background_clip.0, index);
-    let bg_origin = *get_cyclic(&bg.background_origin.0, index);
-    let bg_position_x = get_cyclic(&bg.background_position_x.0, index);
-    let bg_position_y = get_cyclic(&bg.background_position_y.0, index);
-    let bg_repeat = get_cyclic(&bg.background_repeat.0, index);
-    let bg_size = get_cyclic(&bg.background_size.0, index);
-
-    let (clip_rect, clip_radii) = clip(
-        bg_clip,
-        absolute_bounds,
-        border,
-        border_padding,
-        border_radii,
-    );
-
-    let mut bounds = match bg_attachment {
-        BackgroundAttachment::Scroll => match bg_origin {
-            BackgroundOrigin::BorderBox => absolute_bounds,
-            BackgroundOrigin::PaddingBox => absolute_bounds.inner_rect(border),
-            BackgroundOrigin::ContentBox => absolute_bounds.inner_rect(border_padding),
-        },
-        BackgroundAttachment::Fixed => Rect::new(Point2D::origin(), viewport_size),
+        }
+        tile_size
     };
 
-    let mut tile_size = compute_background_image_size(bg_size, bounds.size, intrinsic_size);
-    if tile_size.is_empty() {
+    let b = painter.style.get_background();
+    let mut tile_size = match get_cyclic(&b.background_size.0, layer_index) {
+        Size::Contain => size_contain_or_cover(ContainOrCover::Contain),
+        Size::Cover => size_contain_or_cover(ContainOrCover::Cover),
+        Size::ExplicitSize { width, height } => {
+            let mut width = width.non_auto().map(|lp| {
+                lp.0.to_used_value(Au::from_f32_px(positioning_area.size().width))
+            });
+            let mut height = height.non_auto().map(|lp| {
+                lp.0.to_used_value(Au::from_f32_px(positioning_area.size().height))
+            });
+
+            if width.is_none() && height.is_none() {
+                // Both computed values are 'auto':
+                // use natural sizes, treating missing width or height as 'auto'
+                width = natural_sizes.width;
+                height = natural_sizes.height;
+            }
+
+            match (width, height) {
+                (Some(w), Some(h)) => units::LayoutSize::new(w.to_f32_px(), h.to_f32_px()),
+                (Some(w), None) => {
+                    let h = if let Some(natural_ratio) = natural_sizes.ratio {
+                        w.scale_by(1.0 / natural_ratio)
+                    } else if let Some(natural_height) = natural_sizes.height {
+                        natural_height
+                    } else {
+                        // Treated as 100%
+                        Au::from_f32_px(positioning_area.size().height)
+                    };
+                    units::LayoutSize::new(w.to_f32_px(), h.to_f32_px())
+                },
+                (None, Some(h)) => {
+                    let w = if let Some(natural_ratio) = natural_sizes.ratio {
+                        h.scale_by(natural_ratio)
+                    } else if let Some(natural_width) = natural_sizes.width {
+                        natural_width
+                    } else {
+                        // Treated as 100%
+                        Au::from_f32_px(positioning_area.size().width)
+                    };
+                    units::LayoutSize::new(w.to_f32_px(), h.to_f32_px())
+                },
+                // Both comptued values were 'auto', and neither natural size is present
+                (None, None) => size_contain_or_cover(ContainOrCover::Contain),
+            }
+        },
+    };
+
+    if tile_size.width == 0.0 || tile_size.height == 0.0 {
         return None;
     }
 
-    let mut tile_spacing = Size2D::zero();
-    let own_position = bounds.size - tile_size;
-    let pos_x = bg_position_x.to_used_value(own_position.width);
-    let pos_y = bg_position_y.to_used_value(own_position.height);
-    tile_image_axis(
-        bg_repeat.0,
-        &mut bounds.origin.x,
-        &mut bounds.size.width,
+    let RepeatXY(repeat_x, repeat_y) = *get_cyclic(&b.background_repeat.0, layer_index);
+    let result_x = layout_1d(
         &mut tile_size.width,
-        &mut tile_spacing.width,
-        pos_x,
-        clip_rect.origin.x,
-        clip_rect.size.width,
+        repeat_x,
+        get_cyclic(&b.background_position_x.0, layer_index),
+        painting_area.min.x - positioning_area.min.x,
+        painting_area.size().width,
+        positioning_area.size().width,
     );
-    tile_image_axis(
-        bg_repeat.1,
-        &mut bounds.origin.y,
-        &mut bounds.size.height,
+    let result_y = layout_1d(
         &mut tile_size.height,
-        &mut tile_spacing.height,
-        pos_y,
-        clip_rect.origin.y,
-        clip_rect.size.height,
+        repeat_y,
+        get_cyclic(&b.background_position_y.0, layer_index),
+        painting_area.min.y - positioning_area.min.y,
+        painting_area.size().height,
+        positioning_area.size().height,
     );
+    let bounds = units::LayoutRect::from_origin_and_size(
+        positioning_area.min + Vector2D::new(result_x.bounds_origin, result_y.bounds_origin),
+        Size2D::new(result_x.bounds_size, result_y.bounds_size),
+    );
+    let tile_spacing = units::LayoutSize::new(result_x.tile_spacing, result_y.tile_spacing);
 
-    if tile_size.is_empty() {
-        return None;
-    }
-
-    Some(BackgroundPlacement {
+    Some(BackgroundLayer {
+        common,
         bounds,
         tile_size,
         tile_spacing,
-        clip_rect,
-        clip_radii,
+        repeat: result_x.repeat || result_y.repeat,
     })
 }
 
-fn tile_image_round(
-    position: &mut Au,
-    size: &mut Au,
-    absolute_anchor_origin: Au,
-    image_size: &mut Au,
-) {
-    if *size == Au(0) || *image_size == Au(0) {
-        *position = Au(0);
-        *size = Au(0);
-        return;
+/// Abstract over the horizontal or vertical dimension
+/// Coordinates (0, 0) for the purpose of this function are the positioning area’s origin.
+fn layout_1d(
+    tile_size: &mut f32,
+    mut repeat: Repeat,
+    position: &LengthPercentage,
+    painting_area_origin: f32,
+    painting_area_size: f32,
+    positioning_area_size: f32,
+) -> Layout1DResult {
+    // https://drafts.csswg.org/css-backgrounds/#background-repeat
+    if let Repeat::Round = repeat {
+        *tile_size = positioning_area_size / (positioning_area_size / *tile_size).round();
     }
-
-    let number_of_tiles = (size.to_f32_px() / image_size.to_f32_px()).round().max(1.0);
-    *image_size = *size / (number_of_tiles as i32);
-    tile_image(position, size, absolute_anchor_origin, *image_size);
-}
-
-fn tile_image_spaced(
-    position: &mut Au,
-    size: &mut Au,
-    tile_spacing: &mut Au,
-    absolute_anchor_origin: Au,
-    image_size: Au,
-) {
-    if *size == Au(0) || image_size == Au(0) {
-        *position = Au(0);
-        *size = Au(0);
-        *tile_spacing = Au(0);
-        return;
+    // https://drafts.csswg.org/css-backgrounds/#background-position
+    let mut position = position
+        .to_used_value(Au::from_f32_px(positioning_area_size - *tile_size))
+        .to_f32_px();
+    let mut tile_spacing = 0.0;
+    // https://drafts.csswg.org/css-backgrounds/#background-repeat
+    if let Repeat::Space = repeat {
+        // The most entire tiles we can fit
+        let tile_count = (positioning_area_size / *tile_size).floor();
+        if tile_count >= 2.0 {
+            position = 0.0;
+            // Make the outsides of the first and last of that many tiles
+            // touch the edges of the positioning area:
+            let total_space = positioning_area_size - *tile_size * tile_count;
+            let spaces_count = tile_count - 1.0;
+            tile_spacing = total_space / spaces_count;
+        } else {
+            repeat = Repeat::NoRepeat
+        }
     }
-
-    // Per the spec, if the space available is not enough for two images, just tile as
-    // normal but only display a single tile.
-    if image_size * 2 >= *size {
-        tile_image(position, size, absolute_anchor_origin, image_size);
-        *tile_spacing = Au(0);
-        *size = image_size;
-        return;
-    }
-
-    // Take the box size, remove room for two tiles on the edges, and then calculate how many
-    // other tiles fit in between them.
-    let size_remaining = *size - (image_size * 2);
-    let num_middle_tiles = (size_remaining.to_f32_px() / image_size.to_f32_px()).floor() as i32;
-
-    // Allocate the remaining space as padding between tiles. background-position is ignored
-    // as per the spec, so the position is just the box origin. We are also ignoring
-    // background-attachment here, which seems unspecced when combined with
-    // background-repeat: space.
-    let space_for_middle_tiles = image_size * num_middle_tiles;
-    *tile_spacing = (size_remaining - space_for_middle_tiles) / (num_middle_tiles + 1);
-}
-
-/// Tile an image
-fn tile_image(position: &mut Au, size: &mut Au, absolute_anchor_origin: Au, image_size: Au) {
-    // Avoid division by zero below!
-    // Images with a zero width or height are not displayed.
-    // Therefore the positions do not matter and can be left unchanged.
-    // NOTE: A possible optimization is not to build
-    // display items in this case at all.
-    if image_size == Au(0) {
-        return;
-    }
-
-    let delta_pixels = absolute_anchor_origin - *position;
-    let image_size_px = image_size.to_f32_px();
-    let tile_count = ((delta_pixels.to_f32_px() + image_size_px - 1.0) / image_size_px).floor();
-    let offset = image_size * (tile_count as i32);
-    let new_position = absolute_anchor_origin - offset;
-    *size = *position - new_position + *size;
-    *position = new_position;
-}
-
-/// For either the x or the y axis adjust various values to account for tiling.
-///
-/// This is done separately for both axes because the repeat keywords may differ.
-#[allow(clippy::too_many_arguments)]
-fn tile_image_axis(
-    repeat: BackgroundRepeatKeyword,
-    position: &mut Au,
-    size: &mut Au,
-    tile_size: &mut Au,
-    tile_spacing: &mut Au,
-    offset: Au,
-    clip_origin: Au,
-    clip_size: Au,
-) {
-    let absolute_anchor_origin = *position + offset;
     match repeat {
-        BackgroundRepeatKeyword::NoRepeat => {
-            *position += offset;
-            *size = *tile_size;
-        },
-        BackgroundRepeatKeyword::Repeat => {
-            *position = clip_origin;
-            *size = clip_size;
-            tile_image(position, size, absolute_anchor_origin, *tile_size);
-        },
-        BackgroundRepeatKeyword::Space => {
-            tile_image_spaced(
-                position,
-                size,
+        Repeat::Repeat | Repeat::Round | Repeat::Space => {
+            // WebRender’s `RepeatingImageDisplayItem` contains a `bounds` rectangle and:
+            //
+            // * The tiling is clipped to the intersection of `clip_rect` and `bounds`
+            // * The origin (top-left corner) of `bounds` is the position
+            //   of the “first” (top-left-most) tile.
+            //
+            // In the general case that first tile is not the one that is positioned by
+            // `background-position`.
+            // We want it to be the top-left-most tile that intersects with `clip_rect`.
+            // We find it by offsetting by a whole number of strides,
+            // then compute `bounds` such that:
+            //
+            // * Its bottom-right is the bottom-right of `clip_rect`
+            // * Its top-left is the top-left of first tile.
+            let tile_stride = *tile_size + tile_spacing;
+            let offset = position - painting_area_origin;
+            let bounds_origin = position - tile_stride * (offset / tile_stride).ceil();
+            let bounds_end = painting_area_origin + painting_area_size;
+            let bounds_size = bounds_end - bounds_origin;
+            Layout1DResult {
+                repeat: true,
+                bounds_origin,
+                bounds_size,
                 tile_spacing,
-                absolute_anchor_origin,
-                *tile_size,
-            );
-            let combined_tile_size = *tile_size + *tile_spacing;
-            *position = clip_origin;
-            *size = clip_size;
-            tile_image(position, size, absolute_anchor_origin, combined_tile_size);
+            }
         },
-        BackgroundRepeatKeyword::Round => {
-            tile_image_round(position, size, absolute_anchor_origin, tile_size);
-            *position = clip_origin;
-            *size = clip_size;
-            tile_image(position, size, absolute_anchor_origin, *tile_size);
+        Repeat::NoRepeat => {
+            // `RepeatingImageDisplayItem` always repeats in both dimension.
+            // When we want only one of the dimensions to repeat,
+            // we use the `bounds` rectangle to clip the tiling to one tile
+            // in that dimension.
+            Layout1DResult {
+                repeat: false,
+                bounds_origin: position,
+                bounds_size: *tile_size,
+                tile_spacing: 0.0,
+            }
         },
     }
 }

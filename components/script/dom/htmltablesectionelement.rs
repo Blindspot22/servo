@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
-use html5ever::{local_name, namespace_url, ns, LocalName, Prefix};
+use html5ever::{LocalName, Prefix, local_name, ns};
 use js::rust::HandleObject;
 use style::attr::{AttrValue, LengthOrPercentageOrAuto};
 use style::color::AbsoluteColor;
@@ -16,14 +16,15 @@ use crate::dom::bindings::root::{DomRoot, LayoutDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
 use crate::dom::element::{Element, LayoutElementHelpers};
-use crate::dom::htmlcollection::{CollectionFilter, HTMLCollection};
+use crate::dom::htmlcollection::HTMLCollection;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmltablerowelement::HTMLTableRowElement;
-use crate::dom::node::{window_from_node, Node};
+use crate::dom::node::{Node, NodeTraits};
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct HTMLTableSectionElement {
+pub(crate) struct HTMLTableSectionElement {
     htmlelement: HTMLElement,
 }
 
@@ -38,12 +39,13 @@ impl HTMLTableSectionElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLTableSectionElement> {
         let n = Node::reflect_node_with_proto(
             Box::new(HTMLTableSectionElement::new_inherited(
@@ -51,6 +53,7 @@ impl HTMLTableSectionElement {
             )),
             document,
             proto,
+            can_gc,
         );
 
         n.upcast::<Node>().set_weird_parser_insertion_mode();
@@ -58,39 +61,44 @@ impl HTMLTableSectionElement {
     }
 }
 
-#[derive(JSTraceable)]
-struct RowsFilter;
-impl CollectionFilter for RowsFilter {
-    fn filter(&self, elem: &Element, root: &Node) -> bool {
-        elem.is::<HTMLTableRowElement>() &&
-            elem.upcast::<Node>().GetParentNode().as_deref() == Some(root)
-    }
-}
-
-impl HTMLTableSectionElementMethods for HTMLTableSectionElement {
+impl HTMLTableSectionElementMethods<crate::DomTypeHolder> for HTMLTableSectionElement {
     // https://html.spec.whatwg.org/multipage/#dom-tbody-rows
     fn Rows(&self) -> DomRoot<HTMLCollection> {
-        HTMLCollection::create(&window_from_node(self), self.upcast(), Box::new(RowsFilter))
+        HTMLCollection::new_with_filter_fn(
+            &self.owner_window(),
+            self.upcast(),
+            |element, root| {
+                element.is::<HTMLTableRowElement>() &&
+                    element.upcast::<Node>().GetParentNode().as_deref() == Some(root)
+            },
+            CanGc::note(),
+        )
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-tbody-insertrow
-    fn InsertRow(&self, index: i32) -> Fallible<DomRoot<HTMLElement>> {
+    fn InsertRow(&self, index: i32, can_gc: CanGc) -> Fallible<DomRoot<HTMLElement>> {
         let node = self.upcast::<Node>();
         node.insert_cell_or_row(
             index,
             || self.Rows(),
-            || HTMLTableRowElement::new(local_name!("tr"), None, &node.owner_doc(), None),
+            || HTMLTableRowElement::new(local_name!("tr"), None, &node.owner_doc(), None, can_gc),
+            can_gc,
         )
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-tbody-deleterow
     fn DeleteRow(&self, index: i32) -> ErrorResult {
         let node = self.upcast::<Node>();
-        node.delete_cell_or_row(index, || self.Rows(), |n| n.is::<HTMLTableRowElement>())
+        node.delete_cell_or_row(
+            index,
+            || self.Rows(),
+            |n| n.is::<HTMLTableRowElement>(),
+            CanGc::note(),
+        )
     }
 }
 
-pub trait HTMLTableSectionElementLayoutHelpers {
+pub(crate) trait HTMLTableSectionElementLayoutHelpers {
     fn get_background_color(self) -> Option<AbsoluteColor>;
     fn get_height(self) -> LengthOrPercentageOrAuto;
 }

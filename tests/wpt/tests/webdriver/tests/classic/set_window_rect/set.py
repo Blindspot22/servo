@@ -5,12 +5,15 @@
 
 import pytest
 
-import mozinfo
-
 from webdriver.transport import Response
 
 from tests.support.asserts import assert_error, assert_success
-from tests.support.helpers import is_fullscreen, is_maximized
+from tests.support.helpers import (
+    is_fullscreen,
+    is_maximized,
+    is_not_maximized,
+    is_wayland,
+)
 
 
 def set_window_rect(session, rect):
@@ -116,7 +119,7 @@ def test_restore_from_fullscreen(session):
 
 
 def test_restore_from_maximized(session):
-    assert not is_maximized(session)
+    assert is_not_maximized(session)
 
     original = session.window.rect
     target_rect = {
@@ -127,12 +130,12 @@ def test_restore_from_maximized(session):
     }
 
     session.window.maximize()
-    assert is_maximized(session)
+    assert is_maximized(session, original)
 
     response = set_window_rect(session, target_rect)
     value = assert_success(response, session.window.rect)
 
-    assert not is_maximized(session)
+    assert is_not_maximized(session)
     assert value == target_rect
 
 
@@ -141,7 +144,7 @@ def test_x_y_floats(session):
     value = assert_success(response)
 
     # Wayland doesn't return correct coordinates after changing window position.
-    if mozinfo.display != "wayland":
+    if not is_wayland():
         assert value["x"] == 150
         assert value["y"] == 250
 
@@ -149,20 +152,20 @@ def test_x_y_floats(session):
     value = assert_success(response, session.window.rect)
 
     # Wayland doesn't return correct coordinates after changing window position.
-    if mozinfo.display != "wayland":
+    if not is_wayland():
         assert value["x"] == 150
         assert value["y"] == 250
 
 
 def test_width_height_floats(session):
-    response = set_window_rect(session, {"width": 500.5, "height": 420})
+    response = set_window_rect(session, {"width": 550.5, "height": 420})
     value = assert_success(response, session.window.rect)
-    assert value["width"] == 500
+    assert value["width"] == 550
     assert value["height"] == 420
 
-    response = set_window_rect(session, {"width": 500, "height": 450.5})
+    response = set_window_rect(session, {"width": 550, "height": 450.5})
     value = assert_success(response, session.window.rect)
-    assert value["width"] == 500
+    assert value["width"] == 550
     assert value["height"] == 450
 
 
@@ -215,7 +218,7 @@ def test_set_to_available_size(
     value = assert_success(response, session.window.rect)
 
     # Wayland doesn't return correct coordinates after changing window position.
-    if mozinfo.display != "wayland":
+    if not is_wayland():
         assert value == target_rect
     else:
         target_rect["width"] == available_width
@@ -335,7 +338,7 @@ def test_x_y(session):
     assert value["height"] == original["height"]
 
     # Wayland doesn't return correct coordinates after changing window position.
-    if mozinfo.display != "wayland":
+    if not is_wayland():
         assert value["x"] == original["x"] + 10
         assert value["y"] == original["y"] + 10
 
@@ -369,7 +372,7 @@ def test_x_as_current(session):
     assert value["height"] == original["height"]
 
     # Wayland doesn't return correct coordinates after changing window position.
-    if mozinfo.display != "wayland":
+    if not is_wayland():
         assert value["x"] == original["x"]
         assert value["y"] == original["y"] + 10
 
@@ -386,7 +389,7 @@ def test_y_as_current(session):
     assert value["width"] == original["width"]
     assert value["height"] == original["height"]
     # Wayland doesn't return correct coordinates after changing window position.
-    if mozinfo.display != "wayland":
+    if not is_wayland():
         assert value["x"] == original["x"] + 10
         assert value["y"] == original["y"]
 
@@ -404,9 +407,9 @@ def test_negative_x_y(session, minimal_screen_position):
         assert value["height"] == original["height"]
 
         # Wayland doesn't return correct coordinates after changing window position.
-        if mozinfo.display != "wayland":
-            assert value["x"] <= 0
-            assert value["y"] <= 0
+        if not is_wayland():
+            assert value["x"] <= minimal_screen_position[0]
+            assert value["y"] <= minimal_screen_position[1]
 
     # On macOS when not running headless, windows can only be moved off the
     # screen on the horizontal axis.  The system menu bar also blocks windows

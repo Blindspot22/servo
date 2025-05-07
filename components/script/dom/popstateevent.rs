@@ -5,8 +5,8 @@
 use dom_struct::dom_struct;
 use js::jsapi::Heap;
 use js::jsval::JSVal;
-use js::rust::{HandleObject, HandleValue};
-use servo_atoms::Atom;
+use js::rust::{HandleObject, HandleValue, MutableHandleValue};
+use stylo_atoms::Atom;
 
 use crate::dom::bindings::codegen::Bindings::EventBinding::EventMethods;
 use crate::dom::bindings::codegen::Bindings::PopStateEventBinding;
@@ -24,7 +24,7 @@ use crate::script_runtime::{CanGc, JSContext};
 
 // https://html.spec.whatwg.org/multipage/#the-popstateevent-interface
 #[dom_struct]
-pub struct PopStateEvent {
+pub(crate) struct PopStateEvent {
     event: Event,
     #[ignore_malloc_size_of = "Defined in rust-mozjs"]
     state: Heap<JSVal>,
@@ -69,21 +69,19 @@ impl PopStateEvent {
         ev
     }
 
-    pub fn dispatch_jsval(target: &EventTarget, window: &Window, state: HandleValue) {
-        let event = PopStateEvent::new(
-            window,
-            None,
-            atom!("popstate"),
-            false,
-            false,
-            state,
-            CanGc::note(),
-        );
-        event.upcast::<Event>().fire(target);
+    pub(crate) fn dispatch_jsval(
+        target: &EventTarget,
+        window: &Window,
+        state: HandleValue,
+        can_gc: CanGc,
+    ) {
+        let event =
+            PopStateEvent::new(window, None, atom!("popstate"), false, false, state, can_gc);
+        event.upcast::<Event>().fire(target, can_gc);
     }
 }
 
-impl PopStateEventMethods for PopStateEvent {
+impl PopStateEventMethods<crate::DomTypeHolder> for PopStateEvent {
     // https://html.spec.whatwg.org/multipage/#popstateevent
     fn Constructor(
         window: &Window,
@@ -104,8 +102,8 @@ impl PopStateEventMethods for PopStateEvent {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-popstateevent-state
-    fn State(&self, _cx: JSContext) -> JSVal {
-        self.state.get()
+    fn State(&self, _cx: JSContext, mut retval: MutableHandleValue) {
+        retval.set(self.state.get())
     }
 
     // https://dom.spec.whatwg.org/#dom-event-istrusted

@@ -17,7 +17,8 @@ For more detailed build instructions, see the Servo book under [Setting up your 
 
 ### macOS
 
-- Download and install [`python`](https://www.python.org/downloads/macos/), [Xcode](https://developer.apple.com/xcode/), and [`brew`](https://brew.sh/)
+- Download and install [Xcode](https://developer.apple.com/xcode/) and [`brew`](https://brew.sh/).
+- Install `uv`: `curl -LsSf https://astral.sh/uv/install.sh | sh` 
 - Install `rustup`: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 - Restart your shell to make sure `cargo` is available
 - Install the other dependencies: `./mach bootstrap`
@@ -25,11 +26,12 @@ For more detailed build instructions, see the Servo book under [Setting up your 
 
 ### Linux
 
-- Install `curl` and `python`:
-  - Arch: `sudo pacman -S --needed curl python python-pip`
-  - Debian, Ubuntu: `sudo apt install curl python3-pip python3-venv python3-setuptools`
-  - Fedora: `sudo dnf install curl python3 python3-pip python3-devel`
-  - Gentoo: `sudo emerge net-misc/curl dev-python/pip`
+- Install `curl`:
+  - Arch: `sudo pacman -S --needed curl`
+  - Debian, Ubuntu: `sudo apt install curl`
+  - Fedora: `sudo dnf install curl`
+  - Gentoo: `sudo emerge net-misc/curl`
+- Install `uv`: `curl -LsSf https://astral.sh/uv/install.sh | sh` 
 - Install `rustup`: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 - Restart your shell to make sure `cargo` is available
 - Install the other dependencies: `./mach bootstrap`
@@ -37,7 +39,7 @@ For more detailed build instructions, see the Servo book under [Setting up your 
 
 ### Windows
 
-- Download and install [`python`](https://www.python.org/downloads/windows/), [`choco`](https://chocolatey.org/install#individual), and [`rustup`](https://win.rustup.rs/)
+- Download [`uv`](https://docs.astral.sh/uv/getting-started/installation/#standalone-installer), [`choco`](https://chocolatey.org/install#individual), and [`rustup`](https://win.rustup.rs/)
   - Be sure to select *Quick install via the Visual Studio Community installer*
 - In the Visual Studio Installer, ensure the following components are installed:
   - **Windows 10 SDK (10.0.19041.0)** (`Microsoft.VisualStudio.Component.Windows10SDK.19041`)
@@ -60,8 +62,8 @@ For more detailed build instructions, see the Servo book under [Setting up your 
   `$ANDROID_SDK_ROOT/cmdline-tools/latest`.
 - Run the following command to install the necessary components:
   ```shell
-  sudo $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --install
-   "build-tools;34.0.00 \
+  sudo $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --install \
+   "build-tools;34.0.0" \
    "emulator" \
    "ndk;26.2.11394342" \
    "platform-tools" \

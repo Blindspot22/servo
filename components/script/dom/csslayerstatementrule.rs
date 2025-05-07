@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
-use js::jsval::JSVal;
+use js::rust::MutableHandleValue;
 use servo_arc::Arc;
 use style::shared_lock::ToCssWithGuard;
 use style::stylesheets::{CssRuleType, LayerStatementRule};
@@ -17,10 +17,10 @@ use crate::dom::bindings::utils::to_frozen_array;
 use crate::dom::cssrule::{CSSRule, SpecificCSSRule};
 use crate::dom::cssstylesheet::CSSStyleSheet;
 use crate::dom::window::Window;
-use crate::script_runtime::JSContext as SafeJSContext;
+use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 
 #[dom_struct]
-pub struct CSSLayerStatementRule {
+pub(crate) struct CSSLayerStatementRule {
     cssrule: CSSRule,
     #[ignore_malloc_size_of = "Arc"]
     #[no_trace]
@@ -28,7 +28,7 @@ pub struct CSSLayerStatementRule {
 }
 
 impl CSSLayerStatementRule {
-    pub fn new_inherited(
+    pub(crate) fn new_inherited(
         parent_stylesheet: &CSSStyleSheet,
         layerstatementrule: Arc<LayerStatementRule>,
     ) -> CSSLayerStatementRule {
@@ -38,11 +38,12 @@ impl CSSLayerStatementRule {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         window: &Window,
         parent_stylesheet: &CSSStyleSheet,
         layerstatementrule: Arc<LayerStatementRule>,
+        can_gc: CanGc,
     ) -> DomRoot<CSSLayerStatementRule> {
         reflect_dom_object(
             Box::new(CSSLayerStatementRule::new_inherited(
@@ -50,6 +51,7 @@ impl CSSLayerStatementRule {
                 layerstatementrule,
             )),
             window,
+            can_gc,
         )
     }
 }
@@ -65,15 +67,15 @@ impl SpecificCSSRule for CSSLayerStatementRule {
     }
 }
 
-impl CSSLayerStatementRuleMethods for CSSLayerStatementRule {
+impl CSSLayerStatementRuleMethods<crate::DomTypeHolder> for CSSLayerStatementRule {
     /// <https://drafts.csswg.org/css-cascade-5/#dom-csslayerstatementrule-namelist>
-    fn NameList(&self, cx: SafeJSContext) -> JSVal {
+    fn NameList(&self, cx: SafeJSContext, can_gc: CanGc, retval: MutableHandleValue) {
         let names: Vec<DOMString> = self
             .layerstatementrule
             .names
             .iter()
             .map(|name| DOMString::from_string(name.to_css_string()))
             .collect();
-        to_frozen_array(names.as_slice(), cx)
+        to_frozen_array(names.as_slice(), cx, retval, can_gc)
     }
 }

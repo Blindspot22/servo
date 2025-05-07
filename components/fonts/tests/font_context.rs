@@ -9,34 +9,32 @@ mod font_context {
     use std::collections::HashMap;
     use std::ffi::OsStr;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicI32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicI32, Ordering};
     use std::thread;
 
     use app_units::Au;
+    use compositing_traits::CrossProcessCompositorApi;
     use fonts::platform::font::PlatformFont;
     use fonts::{
-        fallback_font_families, FallbackFontSelectionOptions, FontContext, FontDescriptor,
-        FontFamilyDescriptor, FontIdentifier, FontSearchScope, FontTemplate, FontTemplates,
-        LocalFontIdentifier, PlatformFontMethods, SystemFontServiceMessage, SystemFontServiceProxy,
-        SystemFontServiceProxySender,
+        FallbackFontSelectionOptions, FontContext, FontDescriptor, FontFamilyDescriptor,
+        FontIdentifier, FontSearchScope, FontTemplate, FontTemplates, LocalFontIdentifier,
+        PlatformFontMethods, SystemFontServiceMessage, SystemFontServiceProxy,
+        SystemFontServiceProxySender, fallback_font_families,
     };
     use ipc_channel::ipc::{self, IpcReceiver};
     use net_traits::ResourceThreads;
     use parking_lot::Mutex;
     use servo_arc::Arc as ServoArc;
-    use servo_atoms::Atom;
+    use style::ArcSlice;
     use style::properties::longhands::font_variant_caps::computed_value::T as FontVariantCaps;
     use style::properties::style_structs::Font as FontStyleStruct;
     use style::values::computed::font::{
-        FamilyName, FontFamily, FontFamilyList, FontFamilyNameSyntax, FontSize, FontStretch,
-        FontStyle, FontWeight, SingleFontFamily,
+        FamilyName, FontFamily, FontFamilyList, FontFamilyNameSyntax, FontStretch, FontStyle,
+        FontWeight, SingleFontFamily,
     };
-    use style::values::computed::{FontLanguageOverride, XLang};
-    use style::values::generics::font::LineHeight;
-    use style::ArcSlice;
+    use stylo_atoms::Atom;
     use webrender_api::{FontInstanceKey, FontKey, IdNamespace};
-    use webrender_traits::CrossProcessCompositorApi;
 
     struct TestContext {
         context: FontContext,
@@ -139,6 +137,7 @@ mod font_context {
                         break;
                     },
                     SystemFontServiceMessage::Ping => {},
+                    SystemFontServiceMessage::CollectMemoryReport(..) => {},
                 }
             }
         }
@@ -194,18 +193,7 @@ mod font_context {
     }
 
     fn style() -> FontStyleStruct {
-        let mut style = FontStyleStruct {
-            font_family: FontFamily::serif(),
-            font_style: FontStyle::NORMAL,
-            font_variant_caps: FontVariantCaps::Normal,
-            font_weight: FontWeight::normal(),
-            font_size: FontSize::medium(),
-            font_stretch: FontStretch::hundred(),
-            hash: 0,
-            font_language_override: FontLanguageOverride::normal(),
-            line_height: LineHeight::Normal,
-            _x_lang: XLang::get_initial_value(),
-        };
+        let mut style = FontStyleStruct::initial_values();
         style.compute_font_hash();
         style
     }
@@ -276,7 +264,7 @@ mod font_context {
 
         let font = group
             .write()
-            .find_by_codepoint(&mut context.context, 'a', None)
+            .find_by_codepoint(&mut context.context, 'a', None, None)
             .unwrap();
         assert_eq!(&font_face_name(&font.identifier()), "csstest-ascii");
         assert_eq!(
@@ -290,7 +278,7 @@ mod font_context {
 
         let font = group
             .write()
-            .find_by_codepoint(&mut context.context, 'a', None)
+            .find_by_codepoint(&mut context.context, 'a', None, None)
             .unwrap();
         assert_eq!(&font_face_name(&font.identifier()), "csstest-ascii");
         assert_eq!(
@@ -304,7 +292,7 @@ mod font_context {
 
         let font = group
             .write()
-            .find_by_codepoint(&mut context.context, 'á', None)
+            .find_by_codepoint(&mut context.context, 'á', None, None)
             .unwrap();
         assert_eq!(&font_face_name(&font.identifier()), "csstest-basic-regular");
         assert_eq!(
@@ -328,7 +316,7 @@ mod font_context {
 
         let font = group
             .write()
-            .find_by_codepoint(&mut context.context, 'a', None)
+            .find_by_codepoint(&mut context.context, 'a', None, None)
             .unwrap();
         assert_eq!(
             &font_face_name(&font.identifier()),
@@ -338,7 +326,7 @@ mod font_context {
 
         let font = group
             .write()
-            .find_by_codepoint(&mut context.context, 'á', None)
+            .find_by_codepoint(&mut context.context, 'á', None, None)
             .unwrap();
         assert_eq!(
             &font_face_name(&font.identifier()),
@@ -369,6 +357,19 @@ mod font_context {
             .context
             .matching_templates(&font_descriptor, &family_descriptor)[0]
             .clone();
+
+        let _ = context
+            .context
+            .matching_templates(&font_descriptor, &family_descriptor);
+
+        assert_eq!(
+            context
+                .system_font_service
+                .find_font_count
+                .fetch_add(0, Ordering::Relaxed),
+            1,
+            "we should only have requested matching templates from the font service once"
+        );
 
         let font1 = context
             .context

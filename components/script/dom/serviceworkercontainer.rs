@@ -5,17 +5,19 @@
 use std::default::Default;
 use std::rc::Rc;
 
+use constellation_traits::{
+    Job, JobError, JobResult, JobResultValue, JobType, ScriptToConstellationMessage,
+};
 use dom_struct::dom_struct;
 use ipc_channel::ipc;
 use ipc_channel::router::ROUTER;
-use script_traits::{Job, JobError, JobResult, JobResultValue, JobType, ScriptMsg};
 
 use crate::dom::bindings::codegen::Bindings::ServiceWorkerContainerBinding::{
     RegistrationOptions, ServiceWorkerContainerMethods,
 };
 use crate::dom::bindings::error::Error;
 use crate::dom::bindings::refcounted::TrustedPromise;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject};
+use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object};
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::USVString;
 use crate::dom::client::Client;
@@ -24,13 +26,12 @@ use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
 use crate::dom::serviceworker::ServiceWorker;
 use crate::dom::serviceworkerregistration::ServiceWorkerRegistration;
-use crate::realms::{enter_realm, InRealm};
-use crate::task::TaskCanceller;
-use crate::task_source::dom_manipulation::DOMManipulationTaskSource;
-use crate::task_source::{TaskSource, TaskSourceName};
+use crate::realms::{InRealm, enter_realm};
+use crate::script_runtime::CanGc;
+use crate::task_source::SendableTaskSource;
 
 #[dom_struct]
-pub struct ServiceWorkerContainer {
+pub(crate) struct ServiceWorkerContainer {
     eventtarget: EventTarget,
     controller: MutNullableDom<ServiceWorker>,
     client: Dom<Client>,
@@ -45,15 +46,15 @@ impl ServiceWorkerContainer {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(global: &GlobalScope) -> DomRoot<ServiceWorkerContainer> {
-        let client = Client::new(global.as_window());
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(global: &GlobalScope, can_gc: CanGc) -> DomRoot<ServiceWorkerContainer> {
+        let client = Client::new(global.as_window(), can_gc);
         let container = ServiceWorkerContainer::new_inherited(&client);
-        reflect_dom_object(Box::new(container), global)
+        reflect_dom_object(Box::new(container), global, can_gc)
     }
 }
 
-impl ServiceWorkerContainerMethods for ServiceWorkerContainer {
+impl ServiceWorkerContainerMethods<crate::DomTypeHolder> for ServiceWorkerContainer {
     // https://w3c.github.io/ServiceWorker/#service-worker-container-controller-attribute
     fn GetController(&self) -> Option<DomRoot<ServiceWorker>> {
         self.client.get_controller()
@@ -66,12 +67,13 @@ impl ServiceWorkerContainerMethods for ServiceWorkerContainer {
         script_url: USVString,
         options: &RegistrationOptions,
         comp: InRealm,
+        can_gc: CanGc,
     ) -> Rc<Promise> {
         // A: Step 2.
         let global = self.client.global();
 
         // A: Step 1
-        let promise = Promise::new_in_current_realm(comp);
+        let promise = Promise::new_in_current_realm(comp, can_gc);
         let USVString(ref script_url) = script_url;
 
         // A: Step 3
@@ -80,7 +82,7 @@ impl ServiceWorkerContainerMethods for ServiceWorkerContainer {
             Ok(url) => url,
             Err(_) => {
                 // B: Step 1
-                promise.reject_error(Error::Type("Invalid script URL".to_owned()));
+                promise.reject_error(Error::Type("Invalid script URL".to_owned()), can_gc);
                 return promise;
             },
         };
@@ -92,7 +94,7 @@ impl ServiceWorkerContainerMethods for ServiceWorkerContainer {
                 match api_base_url.join(inner_scope) {
                     Ok(url) => url,
                     Err(_) => {
-                        promise.reject_error(Error::Type("Invalid scope URL".to_owned()));
+                        promise.reject_error(Error::Type("Invalid scope URL".to_owned()), can_gc);
                         return promise;
                     },
                 }
@@ -106,7 +108,10 @@ impl ServiceWorkerContainerMethods for ServiceWorkerContainer {
         match script_url.scheme() {
             "https" | "http" => {},
             _ => {
-                promise.reject_error(Error::Type("Only secure origins are allowed".to_owned()));
+                promise.reject_error(
+                    Error::Type("Only secure origins are allowed".to_owned()),
+                    can_gc,
+                );
                 return promise;
             },
         }
@@ -114,9 +119,10 @@ impl ServiceWorkerContainerMethods for ServiceWorkerContainer {
         if script_url.path().to_ascii_lowercase().contains("%2f") ||
             script_url.path().to_ascii_lowercase().contains("%5c")
         {
-            promise.reject_error(Error::Type(
-                "Script URL contains forbidden characters".to_owned(),
-            ));
+            promise.reject_error(
+                Error::Type("Script URL contains forbidden characters".to_owned()),
+                can_gc,
+            );
             return promise;
         }
 
@@ -124,7 +130,10 @@ impl ServiceWorkerContainerMethods for ServiceWorkerContainer {
         match scope.scheme() {
             "https" | "http" => {},
             _ => {
-                promise.reject_error(Error::Type("Only secure origins are allowed".to_owned()));
+                promise.reject_error(
+                    Error::Type("Only secure origins are allowed".to_owned()),
+                    can_gc,
+                );
                 return promise;
             },
         }
@@ -132,35 +141,27 @@ impl ServiceWorkerContainerMethods for ServiceWorkerContainer {
         if scope.path().to_ascii_lowercase().contains("%2f") ||
             scope.path().to_ascii_lowercase().contains("%5c")
         {
-            promise.reject_error(Error::Type(
-                "Scope URL contains forbidden characters".to_owned(),
-            ));
+            promise.reject_error(
+                Error::Type("Scope URL contains forbidden characters".to_owned()),
+                can_gc,
+            );
             return promise;
         }
 
         // Setup the callback for reject/resolve of the promise,
         // from steps running "in-parallel" from here in the serviceworker manager.
-        let (task_source, task_canceller) = (
-            global.dom_manipulation_task_source(),
-            global.task_canceller(TaskSourceName::DOMManipulation),
-        );
-
         let mut handler = RegisterJobResultHandler {
             trusted_promise: Some(TrustedPromise::new(promise.clone())),
-            task_source,
-            task_canceller,
+            task_source: global.task_manager().dom_manipulation_task_source().into(),
         };
 
         let (job_result_sender, job_result_receiver) = ipc::channel().expect("ipc channel failure");
 
-        ROUTER.add_route(
-            job_result_receiver.to_opaque(),
-            Box::new(move |message| {
-                let msg = message.to();
-                match msg {
-                    Ok(msg) => handler.handle(msg),
-                    Err(err) => warn!("Error receiving a JobResult: {:?}", err),
-                }
+        ROUTER.add_typed_route(
+            job_result_receiver,
+            Box::new(move |message| match message {
+                Ok(msg) => handler.handle(msg),
+                Err(err) => warn!("Error receiving a JobResult: {:?}", err),
             }),
         );
 
@@ -180,7 +181,7 @@ impl ServiceWorkerContainerMethods for ServiceWorkerContainer {
         // B: Step 14: schedule job.
         let _ = global
             .script_to_constellation_chan()
-            .send(ScriptMsg::ScheduleJob(job));
+            .send(ScriptToConstellationMessage::ScheduleJob(job));
 
         // A: Step 7
         promise
@@ -191,15 +192,14 @@ impl ServiceWorkerContainerMethods for ServiceWorkerContainer {
 /// <https://w3c.github.io/ServiceWorker/#register>
 struct RegisterJobResultHandler {
     trusted_promise: Option<TrustedPromise>,
-    task_source: DOMManipulationTaskSource,
-    task_canceller: TaskCanceller,
+    task_source: SendableTaskSource,
 }
 
 impl RegisterJobResultHandler {
     /// <https://w3c.github.io/ServiceWorker/#reject-job-promise>
     /// <https://w3c.github.io/ServiceWorker/#resolve-job-promise>
     /// Handle a result to either resolve or reject the register job promise.
-    pub fn handle(&mut self, result: JobResult) {
+    pub(crate) fn handle(&mut self, result: JobResult) {
         match result {
             JobResult::RejectPromise(error) => {
                 let promise = self
@@ -208,22 +208,23 @@ impl RegisterJobResultHandler {
                     .expect("No promise to resolve for SW Register job.");
 
                 // Step 1
-                let _ = self.task_source.queue_with_canceller(
-                    task!(reject_promise_with_security_error: move || {
+                self.task_source
+                    .queue(task!(reject_promise_with_security_error: move || {
                         let promise = promise.root();
                         let _ac = enter_realm(&*promise.global());
                         match error {
                             JobError::TypeError => {
-                                promise.reject_error(Error::Type("Failed to register a ServiceWorker".to_string()));
+                                promise.reject_error(
+                                    Error::Type("Failed to register a ServiceWorker".to_string()),
+                                    CanGc::note(),
+                                );
                             },
                             JobError::SecurityError => {
-                                promise.reject_error(Error::Security);
+                                promise.reject_error(Error::Security, CanGc::note());
                             },
                         }
 
-                    }),
-                    &self.task_canceller,
-                );
+                    }));
 
                 // TODO: step 2, handle equivalent jobs.
             },
@@ -234,35 +235,33 @@ impl RegisterJobResultHandler {
                     .expect("No promise to resolve for SW Register job.");
 
                 // Step 1
-                let _ = self.task_source.queue_with_canceller(
-                    task!(resolve_promise: move || {
-                        let promise = promise.root();
-                        let global = promise.global();
-                        let _ac = enter_realm(&*global);
+                self.task_source.queue(task!(resolve_promise: move || {
+                    let promise = promise.root();
+                    let global = promise.global();
+                    let _ac = enter_realm(&*global);
 
-                        // Step 1.1
-                        let JobResultValue::Registration {
-                            id,
-                            installing_worker,
-                            waiting_worker,
-                            active_worker,
-                        } = value;
+                    // Step 1.1
+                    let JobResultValue::Registration {
+                        id,
+                        installing_worker,
+                        waiting_worker,
+                        active_worker,
+                    } = value;
 
-                        // Step 1.2 (Job type is "register").
-                        let registration = global.get_serviceworker_registration(
-                            &job.script_url,
-                            &job.scope_url,
-                            id,
-                            installing_worker,
-                            waiting_worker,
-                            active_worker,
-                        );
+                    // Step 1.2 (Job type is "register").
+                    let registration = global.get_serviceworker_registration(
+                        &job.script_url,
+                        &job.scope_url,
+                        id,
+                        installing_worker,
+                        waiting_worker,
+                        active_worker,
+                        CanGc::note()
+                    );
 
-                        // Step 1.4
-                        promise.resolve_native(&*registration);
-                    }),
-                    &self.task_canceller,
-                );
+                    // Step 1.4
+                    promise.resolve_native(&*registration, CanGc::note());
+                }));
 
                 // TODO: step 2, handle equivalent jobs.
             },

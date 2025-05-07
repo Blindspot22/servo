@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
-use html5ever::{local_name, namespace_url, ns, LocalName, Prefix};
+use html5ever::{LocalName, Prefix, local_name, ns};
 use js::rust::HandleObject;
 use style::attr::AttrValue;
 
@@ -25,9 +25,10 @@ use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmlformelement::{FormControl, FormControlElementHelpers, HTMLFormElement};
 use crate::dom::node::{Node, ShadowIncluding};
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct HTMLLabelElement {
+pub(crate) struct HTMLLabelElement {
     htmlelement: HTMLElement,
 }
 
@@ -42,12 +43,13 @@ impl HTMLLabelElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLLabelElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLLabelElement::new_inherited(
@@ -55,6 +57,7 @@ impl HTMLLabelElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 }
@@ -73,14 +76,14 @@ impl Activatable for HTMLLabelElement {
     // at all, we are free to do an implementation-dependent thing;
     // firing a click event is an example, and the precise details of that
     // click event (e.g. isTrusted) are not specified.
-    fn activation_behavior(&self, _event: &Event, _target: &EventTarget) {
+    fn activation_behavior(&self, _event: &Event, _target: &EventTarget, can_gc: CanGc) {
         if let Some(e) = self.GetControl() {
-            e.Click();
+            e.Click(can_gc);
         }
     }
 }
 
-impl HTMLLabelElementMethods for HTMLLabelElement {
+impl HTMLLabelElementMethods<crate::DomTypeHolder> for HTMLLabelElement {
     // https://html.spec.whatwg.org/multipage/#dom-fae-form
     fn GetForm(&self) -> Option<DomRoot<HTMLFormElement>> {
         self.form_owner()
@@ -154,16 +157,18 @@ impl VirtualMethods for HTMLLabelElement {
         }
     }
 
-    fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation) {
-        self.super_type().unwrap().attribute_mutated(attr, mutation);
+    fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation, can_gc: CanGc) {
+        self.super_type()
+            .unwrap()
+            .attribute_mutated(attr, mutation, can_gc);
         if *attr.local_name() == local_name!("form") {
-            self.form_attribute_mutated(mutation);
+            self.form_attribute_mutated(mutation, can_gc);
         }
     }
 }
 
 impl HTMLLabelElement {
-    pub fn first_labelable_descendant(&self) -> Option<DomRoot<HTMLElement>> {
+    pub(crate) fn first_labelable_descendant(&self) -> Option<DomRoot<HTMLElement>> {
         self.upcast::<Node>()
             .traverse_preorder(ShadowIncluding::No)
             .filter_map(DomRoot::downcast::<HTMLElement>)

@@ -5,14 +5,14 @@ import {GamepadHand, GamepadMapping} from '/gen/device/gamepad/public/mojom/game
 // This polyfill library implements the WebXR Test API as specified here:
 // https://github.com/immersive-web/webxr-test-api
 
-const defaultMojoFromFloor = {
+const defaultMojoFromStage = {
   matrix: [1, 0,     0, 0,
            0, 1,     0, 0,
            0, 0,     1, 0,
            0, -1.65, 0, 1]
 };
 const default_stage_parameters = {
-  mojoFromFloor: defaultMojoFromFloor,
+  mojoFromStage: defaultMojoFromStage,
   bounds: null
 };
 
@@ -512,8 +512,8 @@ class MockRuntime {
       this.stageParameters_.bounds = this.bounds_;
     }
 
-    // floorOrigin is passed in as mojoFromFloor.
-    this.stageParameters_.mojoFromFloor =
+    // floorOrigin is passed in as mojoFromStage.
+    this.stageParameters_.mojoFromStage =
         {matrix: getMatrixFromTransform(floorOrigin)};
 
     this._onStageParametersUpdated();
@@ -757,30 +757,34 @@ class MockRuntime {
     const viewport_size = 20;
     return [{
         eye: vrMojom.XREye.kLeft,
-        fieldOfView: {
-          upDegrees: 48.316,
-          downDegrees: 50.099,
-          leftDegrees: 50.899,
-          rightDegrees: 35.197
+        geometry: {
+          fieldOfView: {
+            upDegrees: 48.316,
+            downDegrees: 50.099,
+            leftDegrees: 50.899,
+            rightDegrees: 35.197
+          },
+          mojoFromView: this._getMojoFromViewerWithOffset(composeGFXTransform({
+            position: [-0.032, 0, 0],
+            orientation: [0, 0, 0, 1]
+          }))
         },
-        mojoFromView: this._getMojoFromViewerWithOffset(composeGFXTransform({
-          position: [-0.032, 0, 0],
-          orientation: [0, 0, 0, 1]
-        })),
         viewport: { x: 0, y: 0, width: viewport_size, height: viewport_size }
       },
       {
         eye: vrMojom.XREye.kRight,
-        fieldOfView: {
-          upDegrees: 48.316,
-          downDegrees: 50.099,
-          leftDegrees: 50.899,
-          rightDegrees: 35.197
+        geometry: {
+          fieldOfView: {
+            upDegrees: 48.316,
+            downDegrees: 50.099,
+            leftDegrees: 50.899,
+            rightDegrees: 35.197
+          },
+          mojoFromView: this._getMojoFromViewerWithOffset(composeGFXTransform({
+            position: [0.032, 0, 0],
+            orientation: [0, 0, 0, 1]
+          }))
         },
-        mojoFromView: this._getMojoFromViewerWithOffset(composeGFXTransform({
-          position: [0.032, 0, 0],
-          orientation: [0, 0, 0, 1]
-        })),
         viewport: { x: viewport_size, y: 0, width: viewport_size, height: viewport_size }
       }];
   }
@@ -835,13 +839,15 @@ class MockRuntime {
 
     return {
       eye: viewEye,
-      fieldOfView: fov,
-      mojoFromView: this._getMojoFromViewerWithOffset(composeGFXTransform(fakeXRViewInit.viewOffset)),
+      geometry: {
+        fieldOfView: fov,
+        mojoFromView: this._getMojoFromViewerWithOffset(composeGFXTransform(fakeXRViewInit.viewOffset))
+      },
       viewport: {
         x: xOffset,
-        y: 0,
-        width: fakeXRViewInit.resolution.width,
-        height: fakeXRViewInit.resolution.height
+      y: 0,
+      width: fakeXRViewInit.resolution.width,
+      height: fakeXRViewInit.resolution.height
       },
       isFirstPersonObserver: fakeXRViewInit.isFirstPersonObserver ? true : false,
       viewOffset: composeGFXTransform(fakeXRViewInit.viewOffset)
@@ -915,12 +921,12 @@ class MockRuntime {
 
         let frame_views = this.primaryViews_;
         for (let i = 0; i < this.primaryViews_.length; i++) {
-          this.primaryViews_[i].mojoFromView =
+          this.primaryViews_[i].geometry.mojoFromView =
             this._getMojoFromViewerWithOffset(this.primaryViews_[i].viewOffset);
         }
         if (this.enabledFeatures_.includes(xrSessionMojom.XRSessionFeature.SECONDARY_VIEWS)) {
           for (let i = 0; i < this.secondaryViews_.length; i++) {
-            this.secondaryViews_[i].mojoFromView =
+            this.secondaryViews_[i].geometry.mojoFromView =
               this._getMojoFromViewerWithOffset(this.secondaryViews_[i].viewOffset);
           }
 
@@ -928,15 +934,17 @@ class MockRuntime {
         }
 
         const frameData = {
-          mojoFromViewer: this.pose_,
-          views: frame_views,
+          renderInfo: {
+            frameId: this.next_frame_id_,
+            mojoFromViewer: this.pose_,
+            views: frame_views
+          },
           mojoSpaceReset: mojo_space_reset,
           inputState: input_state,
           timeDelta: {
             // window.performance.now() is in milliseconds, so convert to microseconds.
             microseconds: BigInt(Math.floor(window.performance.now() * 1000)),
           },
-          frameId: this.next_frame_id_,
           bufferHolder: null,
           cameraImageSize: this.cameraImage_ ? {
             width: this.cameraImage_.width,
@@ -954,7 +962,9 @@ class MockRuntime {
 
         this._calculateAnchorInformation(frameData);
 
-        this._calculateDepthInformation(frameData);
+        if (options.depthActive) {
+          this._calculateDepthInformation(frameData);
+        }
 
         this._injectAdditionalFrameData(options, frameData);
 
@@ -1205,6 +1215,11 @@ class MockRuntime {
 
         this.enabledFeatures_ = enabled_features;
 
+        let selectedDepthType;
+        if (sessionOptions.depthOptions && sessionOptions.depthOptions.depthTypeRequest.length != 0) {
+          selectedDepthType = sessionOptions.depthOptions.depthTypeRequest[0];
+        }
+
         return Promise.resolve({
           session: {
             submitFrameSink: submit_frame_sink,
@@ -1217,9 +1232,12 @@ class MockRuntime {
               depthConfiguration: enabled_features.includes(
                                       xrSessionMojom.XRSessionFeature.DEPTH) ?
                   {
+                    // TODO(https://crbug.com/409806803): Update support via
+                    // a webxr-test-api method.
                     depthUsage: xrSessionMojom.XRDepthUsage.kCPUOptimized,
                     depthDataFormat:
                         xrSessionMojom.XRDepthDataFormat.kLuminanceAlpha,
+                    depthType: selectedDepthType,
                   } :
                   null,
               views: this._getDefaultViews(),
@@ -1249,6 +1267,7 @@ class MockRuntime {
     switch (feature) {
       case xrSessionMojom.XRSessionFeature.DEPTH:
         // This matches what Chrome can currently support.
+        // TODO(https://crbug.com/409806803): Add a webxr-test-api for this.
         return options.depthOptions &&
                (options.depthOptions.usagePreferences.length == 0 ||
                 options.depthOptions.usagePreferences.includes(
@@ -1640,11 +1659,11 @@ class MockRuntime {
         case vrMojom.XRReferenceSpaceType.kLocal:
           return XRMathHelper.identity();
         case vrMojom.XRReferenceSpaceType.kLocalFloor:
-          if (this.stageParameters_ == null || this.stageParameters_.mojoFromFloor == null) {
+          if (this.stageParameters_ == null || this.stageParameters_.mojoFromStage == null) {
             console.warn("Standing transform not available.");
             return null;
           }
-          return this.stageParameters_.mojoFromFloor.matrix;
+          return this.stageParameters_.mojoFromStage.matrix;
         case vrMojom.XRReferenceSpaceType.kViewer:
           return mojo_from_viewer;
         case vrMojom.XRReferenceSpaceType.kBoundedFloor:

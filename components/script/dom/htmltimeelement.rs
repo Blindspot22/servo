@@ -12,9 +12,10 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::node::Node;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct HTMLTimeElement {
+pub(crate) struct HTMLTimeElement {
     htmlelement: HTMLElement,
 }
 
@@ -29,22 +30,24 @@ impl HTMLTimeElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLTimeElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLTimeElement::new_inherited(local_name, prefix, document)),
             document,
             proto,
+            can_gc,
         )
     }
 }
 
-impl HTMLTimeElementMethods for HTMLTimeElement {
+impl HTMLTimeElementMethods<crate::DomTypeHolder> for HTMLTimeElement {
     // https://html.spec.whatwg.org/multipage/#dom-time-datetime
     make_getter!(DateTime, "datetime");
 

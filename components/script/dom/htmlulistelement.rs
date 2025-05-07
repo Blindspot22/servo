@@ -12,9 +12,10 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::node::Node;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct HTMLUListElement {
+pub(crate) struct HTMLUListElement {
     htmlelement: HTMLElement,
 }
 
@@ -29,12 +30,13 @@ impl HTMLUListElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLUListElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLUListElement::new_inherited(
@@ -42,11 +44,12 @@ impl HTMLUListElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 }
 
-impl HTMLUListElementMethods for HTMLUListElement {
+impl HTMLUListElementMethods<crate::DomTypeHolder> for HTMLUListElement {
     // https://html.spec.whatwg.org/multipage/#dom-ul-compact
     make_bool_getter!(Compact, "compact");
 

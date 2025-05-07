@@ -8,19 +8,19 @@ use crate::dom::bindings::codegen::Bindings::XMLHttpRequestEventTargetBinding::X
 use crate::dom::eventtarget::EventTarget;
 
 #[dom_struct]
-pub struct XMLHttpRequestEventTarget {
+pub(crate) struct XMLHttpRequestEventTarget {
     eventtarget: EventTarget,
 }
 
 impl XMLHttpRequestEventTarget {
-    pub fn new_inherited() -> XMLHttpRequestEventTarget {
+    pub(crate) fn new_inherited() -> XMLHttpRequestEventTarget {
         XMLHttpRequestEventTarget {
             eventtarget: EventTarget::new_inherited(),
         }
     }
 }
 
-impl XMLHttpRequestEventTargetMethods for XMLHttpRequestEventTarget {
+impl XMLHttpRequestEventTargetMethods<crate::DomTypeHolder> for XMLHttpRequestEventTarget {
     // https://xhr.spec.whatwg.org/#handler-xhr-onloadstart
     event_handler!(loadstart, GetOnloadstart, SetOnloadstart);
 

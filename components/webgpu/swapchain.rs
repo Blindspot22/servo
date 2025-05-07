@@ -8,36 +8,29 @@ use std::slice;
 use std::sync::{Arc, Mutex};
 
 use arrayvec::ArrayVec;
+use compositing_traits::{WebrenderExternalImageApi, WebrenderImageSource};
 use euclid::default::Size2D;
 use ipc_channel::ipc::IpcSender;
 use log::{error, warn};
-use malloc_size_of::MallocSizeOf;
 use serde::{Deserialize, Serialize};
+use snapshot::{IpcSnapshot, Snapshot};
+use webgpu_traits::{
+    ContextConfiguration, Error, PRESENTATION_BUFFER_COUNT, WebGPUContextId, WebGPUMsg,
+};
 use webrender::{RenderApi, Transaction};
 use webrender_api::units::DeviceIntSize;
 use webrender_api::{
     DirtyRect, DocumentId, ExternalImageData, ExternalImageId, ExternalImageType, ImageData,
     ImageDescriptor, ImageDescriptorFlags, ImageFormat, ImageKey,
 };
-use webrender_traits::{WebrenderExternalImageApi, WebrenderImageSource};
 use wgpu_core::device::HostMap;
 use wgpu_core::global::Global;
 use wgpu_core::id;
-use wgpu_core::resource::{BufferAccessError, BufferMapCallback, BufferMapOperation};
+use wgpu_core::resource::{BufferAccessError, BufferMapOperation};
 
-use crate::{wgt, ContextConfiguration, Error, WebGPUMsg};
+use crate::wgt;
 
-pub const PRESENTATION_BUFFER_COUNT: usize = 10;
 const DEFAULT_IMAGE_FORMAT: ImageFormat = ImageFormat::RGBA8;
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-pub struct WebGPUContextId(pub u64);
-
-impl MallocSizeOf for WebGPUContextId {
-    fn size_of(&self, _ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
-        0
-    }
-}
 
 pub type WGPUImageMap = Arc<Mutex<HashMap<WebGPUContextId, ContextData>>>;
 
@@ -213,6 +206,7 @@ impl ContextData {
             id: ExternalImageId(context_id.0),
             channel_index: 0,
             image_type: ExternalImageType::Buffer,
+            normalized_uvs: false,
         });
 
         Self {
@@ -371,6 +365,36 @@ impl crate::WGPU {
         );
     }
 
+    pub(crate) fn get_image(&self, context_id: WebGPUContextId) -> IpcSnapshot {
+        let webgpu_contexts = self.wgpu_image_map.lock().unwrap();
+        let context_data = webgpu_contexts.get(&context_id).unwrap();
+        let size = context_data.image_desc.size().cast().cast_unit();
+        let data = if let Some(present_buffer) = context_data
+            .swap_chain
+            .as_ref()
+            .and_then(|swap_chain| swap_chain.data.as_ref())
+        {
+            let format = match context_data.image_desc.0.format {
+                ImageFormat::RGBA8 => snapshot::PixelFormat::RGBA,
+                ImageFormat::BGRA8 => snapshot::PixelFormat::BGRA,
+                _ => unimplemented!(),
+            };
+            let alpha_mode = if context_data.image_desc.0.is_opaque() {
+                snapshot::AlphaMode::AsOpaque {
+                    premultiplied: false,
+                }
+            } else {
+                snapshot::AlphaMode::Transparent {
+                    premultiplied: true,
+                }
+            };
+            Snapshot::from_vec(size, format, alpha_mode, present_buffer.slice().to_vec())
+        } else {
+            Snapshot::cleared(size)
+        };
+        data.as_ipc()
+    }
+
     pub(crate) fn update_context(
         &self,
         context_id: WebGPUContextId,
@@ -383,17 +407,11 @@ impl crate::WGPU {
         let presentation_id = context_data.next_presentation_id();
         context_data.check_and_update_presentation_id(presentation_id);
 
-        // If configuration is not provided or presentation format is not valid
-        // the context will be dummy until recreation
-        let format = config.as_ref().and_then(|config| match config.format {
-            wgt::TextureFormat::Rgba8Unorm => Some(ImageFormat::RGBA8),
-            wgt::TextureFormat::Bgra8Unorm => Some(ImageFormat::BGRA8),
-            _ => None,
-        });
-
-        let needs_image_update = if let Some(format) = format {
-            let config = config.expect("Config should exist when valid format is available");
-            let new_image_desc = WebGPUImageDescriptor::new(format, size, config.is_opaque);
+        // If configuration is not provided
+        // the context will be dummy/empty until recreation
+        let needs_image_update = if let Some(config) = config {
+            let new_image_desc =
+                WebGPUImageDescriptor::new(config.format(), size, config.is_opaque);
             let needs_swapchain_rebuild = context_data.swap_chain.is_none() ||
                 new_image_desc.buffer_size() != context_data.image_desc.buffer_size();
             if needs_swapchain_rebuild {
@@ -466,15 +484,15 @@ impl crate::WGPU {
         let (encoder_id, error) =
             global.device_create_command_encoder(device_id, &comm_desc, Some(encoder_id));
         err(error)?;
-        let buffer_cv = wgt::ImageCopyBuffer {
+        let buffer_cv = wgt::TexelCopyBufferInfo {
             buffer: buffer_id,
-            layout: wgt::ImageDataLayout {
+            layout: wgt::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(image_desc.buffer_stride() as u32),
                 rows_per_image: None,
             },
         };
-        let texture_cv = wgt::ImageCopyTexture {
+        let texture_cv = wgt::TexelCopyTextureInfo {
             texture: texture_id,
             mip_level: 0,
             origin: wgt::Origin3d::ZERO,
@@ -506,7 +524,7 @@ impl crate::WGPU {
             let webrender_api = Arc::clone(&self.webrender_api);
             let webrender_document = self.webrender_document;
             let token = self.poller.token();
-            BufferMapCallback::from_rust(Box::from(move |result| {
+            Box::new(move |result| {
                 drop(token);
                 update_wr_image(
                     result,
@@ -519,7 +537,7 @@ impl crate::WGPU {
                     image_desc,
                     presentation_id,
                 );
-            }))
+            })
         };
         let map_op = BufferMapOperation {
             host: HostMap::Read,

@@ -32,6 +32,7 @@ macro_rules! make_limited_int_setter(
         fn $attr(&self, value: i32) -> $crate::dom::bindings::error::ErrorResult {
             use $crate::dom::bindings::inheritance::Castable;
             use $crate::dom::element::Element;
+            use $crate::script_runtime::CanGc;
 
             let value = if value < 0 {
                 return Err($crate::dom::bindings::error::Error::IndexSize);
@@ -40,7 +41,7 @@ macro_rules! make_limited_int_setter(
             };
 
             let element = self.upcast::<Element>();
-            element.set_int_attribute(&html5ever::local_name!($htmlname), value);
+            element.set_int_attribute(&html5ever::local_name!($htmlname), value, CanGc::note());
             Ok(())
         }
     );
@@ -52,9 +53,10 @@ macro_rules! make_int_setter(
         fn $attr(&self, value: i32) {
             use $crate::dom::bindings::inheritance::Castable;
             use $crate::dom::element::Element;
+            use $crate::script_runtime::CanGc;
 
             let element = self.upcast::<Element>();
-            element.set_int_attribute(&html5ever::local_name!($htmlname), value)
+            element.set_int_attribute(&html5ever::local_name!($htmlname), value, CanGc::note())
         }
     );
     ($attr:ident, $htmlname:tt) => {
@@ -111,9 +113,10 @@ macro_rules! make_url_setter(
         fn $attr(&self, value: USVString) {
             use $crate::dom::bindings::inheritance::Castable;
             use $crate::dom::element::Element;
+            use $crate::script_runtime::CanGc;
             let element = self.upcast::<Element>();
             element.set_url_attribute(&html5ever::local_name!($htmlname),
-                                         value);
+                                         value, CanGc::note());
         }
     );
 );
@@ -125,7 +128,7 @@ macro_rules! make_form_action_getter(
             use $crate::dom::bindings::inheritance::Castable;
             use $crate::dom::element::Element;
             let element = self.upcast::<Element>();
-            let doc = $crate::dom::node::document_from_node(self);
+            let doc = $crate::dom::node::NodeTraits::owner_document(self);
             let attr = element.get_attribute(&html5ever::ns!(), &html5ever::local_name!($htmlname));
             let value = attr.as_ref().map(|attr| attr.value());
             let value = match value {
@@ -148,28 +151,93 @@ macro_rules! make_labels_getter(
             use $crate::dom::nodelist::NodeList;
             self.$memo.or_init(|| NodeList::new_labels_list(
                 self.upcast::<Node>().owner_doc().window(),
-                self.upcast::<HTMLElement>()
+                self.upcast::<HTMLElement>(),
+                CanGc::note()
                 )
             )
         }
     );
 );
 
-#[macro_export]
+/// Implements the `To determine the state of an attribute` steps from
+/// <https://html.spec.whatwg.org/multipage/#keywords-and-enumerated-attributes>
 macro_rules! make_enumerated_getter(
-    ( $attr:ident, $htmlname:tt, $default:expr, $($choices:pat_param)|+) => (
+    ($attr:ident,
+        $htmlname:tt,
+        $($choices:literal)|+,
+        missing => $missing:literal,
+        invalid => $invalid:literal
+    ) => (
         fn $attr(&self) -> DOMString {
             use $crate::dom::bindings::inheritance::Castable;
             use $crate::dom::element::Element;
-            let element = self.upcast::<Element>();
-            let mut val = element.get_string_attribute(&html5ever::local_name!($htmlname));
-            val.make_ascii_lowercase();
-            // https://html.spec.whatwg.org/multipage/#attr-fs-method
-            match &*val {
-                $($choices)|+ => val,
-                _ => DOMString::from($default)
+            use $crate::dom::bindings::codegen::Bindings::AttrBinding::Attr_Binding::AttrMethods;
+
+            let attr_or_none = self.upcast::<Element>()
+                .get_attribute(&html5ever::ns!(), &html5ever::local_name!($htmlname));
+            match attr_or_none  {
+                // Step 1. If the attribute is not specified:
+                None => {
+                    // Step 1.1. If the attribute has a missing value default state defined, then return that
+                    // missing value default state.
+                    // Step 1.2 Otherwise, return no state.
+                    return DOMString::from($missing);
+                },
+                Some(attr) => {
+                    // Step 2. If the attribute's value is an ASCII case-insensitive match for one of the keywords
+                    // defined for the attribute, then return the state represented by that keyword.
+                    let value: DOMString = attr.Value().to_ascii_lowercase().into();
+                    $(
+                        if value.str() == $choices {
+                            return value;
+                        }
+                    )+
+
+                    // Step 3. If the attribute has an invalid value default state defined, then return that invalid
+                    // value default state.
+                    // Step 4. Return no state.
+                    return DOMString::from($invalid);
+                }
             }
         }
+    );
+    ($attr:ident,
+        $htmlname:tt,
+        $($choices:literal)|+,
+    ) => (
+        make_enumerated_getter!(
+            $attr,
+            $htmlname,
+            $($choices)|+,
+            missing => "",
+            invalid => ""
+        );
+    );
+    ($attr:ident,
+        $htmlname:tt,
+        $($choices:literal)|+,
+        invalid => $invalid:literal
+    ) => (
+        make_enumerated_getter!(
+            $attr,
+            $htmlname,
+            $($choices)|+,
+            missing => "",
+            invalid => $invalid
+        );
+    );
+    ($attr:ident,
+        $htmlname:tt,
+        $($choices:literal)|+,
+        missing => $missing:literal,
+    ) => (
+        make_enumerated_getter!(
+            $attr,
+            $htmlname,
+            $($choices)|+,
+            missing => $missing,
+            invalid => ""
+        );
     );
 );
 
@@ -181,8 +249,9 @@ macro_rules! make_setter(
         fn $attr(&self, value: DOMString) {
             use $crate::dom::bindings::inheritance::Castable;
             use $crate::dom::element::Element;
+            use $crate::script_runtime::CanGc;
             let element = self.upcast::<Element>();
-            element.set_string_attribute(&html5ever::local_name!($htmlname), value)
+            element.set_string_attribute(&html5ever::local_name!($htmlname), value, CanGc::note())
         }
     );
 );
@@ -193,8 +262,9 @@ macro_rules! make_bool_setter(
         fn $attr(&self, value: bool) {
             use $crate::dom::bindings::inheritance::Castable;
             use $crate::dom::element::Element;
+            use $crate::script_runtime::CanGc;
             let element = self.upcast::<Element>();
-            element.set_bool_attribute(&html5ever::local_name!($htmlname), value)
+            element.set_bool_attribute(&html5ever::local_name!($htmlname), value, CanGc::note())
         }
     );
 );
@@ -206,18 +276,39 @@ macro_rules! make_uint_setter(
             use $crate::dom::bindings::inheritance::Castable;
             use $crate::dom::element::Element;
             use $crate::dom::values::UNSIGNED_LONG_MAX;
+            use $crate::script_runtime::CanGc;
             let value = if value > UNSIGNED_LONG_MAX {
                 $default
             } else {
                 value
             };
             let element = self.upcast::<Element>();
-            element.set_uint_attribute(&html5ever::local_name!($htmlname), value)
+            element.set_uint_attribute(&html5ever::local_name!($htmlname), value, CanGc::note())
         }
     );
     ($attr:ident, $htmlname:tt) => {
         make_uint_setter!($attr, $htmlname, 0);
     };
+);
+
+#[macro_export]
+macro_rules! make_clamped_uint_setter(
+    ($attr:ident, $htmlname:tt, $min:expr, $max:expr, $default:expr) => (
+        fn $attr(&self, value: u32) {
+            use $crate::dom::bindings::inheritance::Castable;
+            use $crate::dom::element::Element;
+            use $crate::dom::values::UNSIGNED_LONG_MAX;
+            use $crate::script_runtime::CanGc;
+            let value = if value > UNSIGNED_LONG_MAX {
+                $default
+            } else {
+                value.clamp($min, $max)
+            };
+
+            let element = self.upcast::<Element>();
+            element.set_uint_attribute(&html5ever::local_name!($htmlname), value, CanGc::note())
+        }
+    );
 );
 
 #[macro_export]
@@ -227,6 +318,7 @@ macro_rules! make_limited_uint_setter(
             use $crate::dom::bindings::inheritance::Castable;
             use $crate::dom::element::Element;
             use $crate::dom::values::UNSIGNED_LONG_MAX;
+            use $crate::script_runtime::CanGc;
             let value = if value == 0 {
                 return Err($crate::dom::bindings::error::Error::IndexSize);
             } else if value > UNSIGNED_LONG_MAX {
@@ -235,7 +327,7 @@ macro_rules! make_limited_uint_setter(
                 value
             };
             let element = self.upcast::<Element>();
-            element.set_uint_attribute(&html5ever::local_name!($htmlname), value);
+            element.set_uint_attribute(&html5ever::local_name!($htmlname), value, CanGc::note());
             Ok(())
         }
     );
@@ -250,8 +342,9 @@ macro_rules! make_atomic_setter(
         fn $attr(&self, value: DOMString) {
             use $crate::dom::bindings::inheritance::Castable;
             use $crate::dom::element::Element;
+            use $crate::script_runtime::CanGc;
             let element = self.upcast::<Element>();
-            element.set_atomic_attribute(&html5ever::local_name!($htmlname), value)
+            element.set_atomic_attribute(&html5ever::local_name!($htmlname), value, CanGc::note())
         }
     );
 );
@@ -263,9 +356,10 @@ macro_rules! make_legacy_color_setter(
             use $crate::dom::bindings::inheritance::Castable;
             use $crate::dom::element::Element;
             use style::attr::AttrValue;
+            use $crate::script_runtime::CanGc;
             let element = self.upcast::<Element>();
             let value = AttrValue::from_legacy_color(value.into());
-            element.set_attribute(&html5ever::local_name!($htmlname), value)
+            element.set_attribute(&html5ever::local_name!($htmlname), value, CanGc::note())
         }
     );
 );
@@ -276,9 +370,10 @@ macro_rules! make_dimension_setter(
         fn $attr(&self, value: DOMString) {
             use $crate::dom::bindings::inheritance::Castable;
             use $crate::dom::element::Element;
+            use $crate::script_runtime::CanGc;
             let element = self.upcast::<Element>();
             let value = AttrValue::from_dimension(value.into());
-            element.set_attribute(&html5ever::local_name!($htmlname), value)
+            element.set_attribute(&html5ever::local_name!($htmlname), value, CanGc::note())
         }
     );
 );
@@ -289,9 +384,10 @@ macro_rules! make_nonzero_dimension_setter(
         fn $attr(&self, value: DOMString) {
             use $crate::dom::bindings::inheritance::Castable;
             use $crate::dom::element::Element;
+            use $crate::script_runtime::CanGc;
             let element = self.upcast::<Element>();
             let value = AttrValue::from_nonzero_dimension(value.into());
-            element.set_attribute(&html5ever::local_name!($htmlname), value)
+            element.set_attribute(&html5ever::local_name!($htmlname), value, CanGc::note())
         }
     );
 );
@@ -318,8 +414,9 @@ macro_rules! define_event_handler(
         fn $getter(&self) -> Option<::std::rc::Rc<$handler>> {
             use crate::dom::bindings::inheritance::Castable;
             use crate::dom::eventtarget::EventTarget;
+            use crate::script_runtime::CanGc;
             let eventtarget = self.upcast::<EventTarget>();
-            eventtarget.get_event_handler_common(stringify!($event_type))
+            eventtarget.get_event_handler_common(stringify!($event_type), CanGc::note())
         }
 
         fn $setter(&self, listener: Option<::std::rc::Rc<$handler>>) {
@@ -334,7 +431,7 @@ macro_rules! define_event_handler(
 macro_rules! define_window_owned_event_handler(
     ($handler: ty, $event_type: ident, $getter: ident, $setter: ident) => (
         fn $getter(&self) -> Option<::std::rc::Rc<$handler>> {
-            let document = document_from_node(self);
+            let document = self.owner_document();
             if document.has_browsing_context() {
                 document.window().$getter()
             } else {
@@ -343,7 +440,7 @@ macro_rules! define_window_owned_event_handler(
         }
 
         fn $setter(&self, listener: Option<::std::rc::Rc<$handler>>) {
-            let document = document_from_node(self);
+            let document = self.owner_document();
             if document.has_browsing_context() {
                 document.window().$setter(listener)
             }
@@ -560,37 +657,22 @@ macro_rules! document_and_element_event_handlers(
     )
 );
 
-#[macro_export]
-macro_rules! rooted_vec {
-    (let mut $name:ident) => {
-        let mut root = $crate::dom::bindings::trace::RootableVec::new_unrooted();
-        let mut $name = $crate::dom::bindings::trace::RootedVec::new(&mut root);
-    };
-    (let $name:ident <- $iter:expr) => {
-        let mut root = $crate::dom::bindings::trace::RootableVec::new_unrooted();
-        let $name = $crate::dom::bindings::trace::RootedVec::from_iter(&mut root, $iter);
-    };
-    (let mut $name:ident <- $iter:expr) => {
-        let mut root = $crate::dom::bindings::trace::RootableVec::new_unrooted();
-        let mut $name = $crate::dom::bindings::trace::RootedVec::from_iter(&mut root, $iter);
-    };
-}
-
 /// DOM struct implementation for simple interfaces inheriting from PerformanceEntry.
 macro_rules! impl_performance_entry_struct(
     ($binding:ident, $struct:ident, $type:expr) => (
         use base::cross_process_instant::CrossProcessInstant;
-        use time_03::Duration;
+        use time::Duration;
 
         use crate::dom::bindings::reflector::reflect_dom_object;
         use crate::dom::bindings::root::DomRoot;
         use crate::dom::bindings::str::DOMString;
         use crate::dom::globalscope::GlobalScope;
         use crate::dom::performanceentry::PerformanceEntry;
+        use crate::script_runtime::CanGc;
         use dom_struct::dom_struct;
 
         #[dom_struct]
-        pub struct $struct {
+        pub(crate) struct $struct {
             entry: PerformanceEntry,
         }
 
@@ -605,13 +687,13 @@ macro_rules! impl_performance_entry_struct(
                 }
             }
 
-            #[allow(crown::unrooted_must_root)]
-            pub fn new(global: &GlobalScope,
+            #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+            pub(crate) fn new(global: &GlobalScope,
                        name: DOMString,
                        start_time: CrossProcessInstant,
                        duration: Duration) -> DomRoot<$struct> {
                 let entry = $struct::new_inherited(name, start_time, duration);
-                reflect_dom_object(Box::new(entry), global)
+                reflect_dom_object(Box::new(entry), global, CanGc::note())
             }
         }
     );
@@ -630,38 +712,4 @@ macro_rules! handle_potential_webgl_error {
     ($context:expr, $call:expr) => {
         handle_potential_webgl_error!($context, $call, ())
     };
-}
-
-macro_rules! impl_rare_data (
-    ($type:ty) => (
-        fn rare_data(&self) -> Ref<Option<Box<$type>>> {
-            self.rare_data.borrow()
-        }
-
-        #[allow(dead_code)]
-        fn rare_data_mut(&self) -> RefMut<Option<Box<$type>>> {
-            self.rare_data.borrow_mut()
-        }
-
-        fn ensure_rare_data(&self) -> RefMut<Box<$type>> {
-            let mut rare_data = self.rare_data.borrow_mut();
-            if rare_data.is_none() {
-                *rare_data = Some(Default::default());
-            }
-            RefMut::map(rare_data, |rare_data| {
-                rare_data.as_mut().unwrap()
-            })
-        }
-    );
-);
-
-#[macro_export]
-macro_rules! optional_root_object_to_js_or_null {
-    ($cx: expr, $binding:expr) => {{
-        rooted!(in($cx) let mut rval = NullValue());
-        if let Some(object) = $binding {
-            object.to_jsval($cx, rval.handle_mut());
-        }
-        rval.get()
-    }};
 }

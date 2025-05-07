@@ -11,9 +11,10 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::document::Document;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::node::Node;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct HTMLMenuElement {
+pub(crate) struct HTMLMenuElement {
     htmlelement: HTMLElement,
 }
 
@@ -28,22 +29,24 @@ impl HTMLMenuElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLMenuElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLMenuElement::new_inherited(local_name, prefix, document)),
             document,
             proto,
+            can_gc,
         )
     }
 }
 
-impl HTMLMenuElementMethods for HTMLMenuElement {
+impl HTMLMenuElementMethods<crate::DomTypeHolder> for HTMLMenuElement {
     // spec just mandates that compact reflects the content attribute,
     // with no other semantics. Layout could use it to
     // change line spacing, but nothing requires it to do so.

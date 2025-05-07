@@ -15,9 +15,10 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::texttrack::TextTrack;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct TextTrackCue {
+pub(crate) struct TextTrackCue {
     eventtarget: EventTarget,
     id: DomRefCell<DOMString>,
     track: Option<Dom<TextTrack>>,
@@ -27,7 +28,7 @@ pub struct TextTrackCue {
 }
 
 impl TextTrackCue {
-    pub fn new_inherited(
+    pub(crate) fn new_inherited(
         id: DOMString,
         start_time: f64,
         end_time: f64,
@@ -44,29 +45,31 @@ impl TextTrackCue {
     }
 
     #[allow(dead_code)]
-    pub fn new(
+    pub(crate) fn new(
         window: &Window,
         id: DOMString,
         start_time: f64,
         end_time: f64,
         track: Option<&TextTrack>,
+        can_gc: CanGc,
     ) -> DomRoot<TextTrackCue> {
         reflect_dom_object(
             Box::new(TextTrackCue::new_inherited(id, start_time, end_time, track)),
             window,
+            can_gc,
         )
     }
 
-    pub fn id(&self) -> DOMString {
+    pub(crate) fn id(&self) -> DOMString {
         self.id.borrow().clone()
     }
 
-    pub fn get_track(&self) -> Option<DomRoot<TextTrack>> {
+    pub(crate) fn get_track(&self) -> Option<DomRoot<TextTrack>> {
         self.track.as_ref().map(|t| DomRoot::from_ref(&**t))
     }
 }
 
-impl TextTrackCueMethods for TextTrackCue {
+impl TextTrackCueMethods<crate::DomTypeHolder> for TextTrackCue {
     // https://html.spec.whatwg.org/multipage/#dom-texttrackcue-id
     fn Id(&self) -> DOMString {
         self.id()

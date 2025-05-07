@@ -7,27 +7,30 @@ use std::cell::Cell;
 
 use base::cross_process_instant::CrossProcessInstant;
 use base::id::PipelineId;
-use base64::engine::general_purpose;
 use base64::Engine as _;
-use content_security_policy::{self as csp, CspList};
+use base64::engine::general_purpose;
+use content_security_policy as csp;
 use dom_struct::dom_struct;
 use embedder_traits::resources::{self, Resource};
 use encoding_rs::Encoding;
 use html5ever::buffer_queue::BufferQueue;
 use html5ever::tendril::fmt::UTF8;
 use html5ever::tendril::{ByteTendril, StrTendril, TendrilSink};
-use html5ever::tokenizer::TokenizerResult;
-use html5ever::tree_builder::{ElementFlags, NextParserState, NodeOrText, QuirksMode, TreeSink};
-use html5ever::{local_name, namespace_url, ns, Attribute, ExpandedName, LocalName, QualName};
+use html5ever::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
+use html5ever::{Attribute, ExpandedName, LocalName, QualName, local_name, ns};
 use hyper_serde::Serde;
+use markup5ever::TokenizerResult;
 use mime::{self, Mime};
+use net_traits::policy_container::PolicyContainer;
+use net_traits::request::RequestId;
 use net_traits::{
     FetchMetadata, FetchResponseListener, Metadata, NetworkError, ResourceFetchTiming,
     ResourceTimingType,
 };
 use profile_traits::time::{
-    profile, ProfilerCategory, TimerMetadata, TimerMetadataFrameType, TimerMetadataReflowType,
+    ProfilerCategory, ProfilerChan, TimerMetadata, TimerMetadataFrameType, TimerMetadataReflowType,
 };
+use profile_traits::time_profile;
 use script_traits::DocumentActivity;
 use servo_config::pref;
 use servo_url::ServoUrl;
@@ -42,15 +45,19 @@ use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
 use crate::dom::bindings::codegen::Bindings::HTMLImageElementBinding::HTMLImageElementMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLTemplateElementBinding::HTMLTemplateElementMethods;
 use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
+use crate::dom::bindings::codegen::Bindings::ShadowRootBinding::{
+    ShadowRootMode, SlotAssignmentMode,
+};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
+use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object};
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::settings_stack::is_execution_stack_empty;
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::characterdata::CharacterData;
 use crate::dom::comment::Comment;
 use crate::dom::document::{Document, DocumentSource, HasBrowsingContext, IsHTMLDocument};
+use crate::dom::documentfragment::DocumentFragment;
 use crate::dom::documenttype::DocumentType;
 use crate::dom::element::{CustomElementCreationMode, Element, ElementCreator};
 use crate::dom::globalscope::GlobalScope;
@@ -63,6 +70,7 @@ use crate::dom::node::{Node, ShadowIncluding};
 use crate::dom::performanceentry::PerformanceEntry;
 use crate::dom::performancenavigationtiming::PerformanceNavigationTiming;
 use crate::dom::processinginstruction::ProcessingInstruction;
+use crate::dom::shadowroot::IsUserAgentWidget;
 use crate::dom::text::Text;
 use crate::dom::virtualmethods::vtable_for;
 use crate::network_listener::PreInvoke;
@@ -74,6 +82,8 @@ mod async_html;
 mod html;
 mod prefetch;
 mod xml;
+
+pub(crate) use html::serialize_html_fragment;
 
 #[dom_struct]
 /// The parser maintains two input streams: one for input from script through
@@ -88,7 +98,7 @@ mod xml;
 ///                          ^
 ///                 insertion point
 /// ```
-pub struct ServoParser {
+pub(crate) struct ServoParser {
     reflector: Reflector,
     /// The document associated with this parser.
     document: Dom<Document>,
@@ -129,39 +139,40 @@ pub struct ServoParser {
     prefetch_input: BufferQueue,
 }
 
-pub struct ElementAttribute {
+pub(crate) struct ElementAttribute {
     name: QualName,
     value: DOMString,
 }
 
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf, PartialEq)]
-pub enum ParsingAlgorithm {
+pub(crate) enum ParsingAlgorithm {
     Normal,
     Fragment,
 }
 
 impl ElementAttribute {
-    pub fn new(name: QualName, value: DOMString) -> ElementAttribute {
+    pub(crate) fn new(name: QualName, value: DOMString) -> ElementAttribute {
         ElementAttribute { name, value }
     }
 }
 
 impl ServoParser {
-    pub fn parser_is_not_active(&self) -> bool {
+    pub(crate) fn parser_is_not_active(&self) -> bool {
         self.can_write()
     }
 
-    pub fn parse_html_document(
+    pub(crate) fn parse_html_document(
         document: &Document,
         input: Option<DOMString>,
         url: ServoUrl,
         can_gc: CanGc,
     ) {
-        let parser = if pref!(dom.servoparser.async_html_tokenizer.enabled) {
+        let parser = if pref!(dom_servoparser_async_html_tokenizer_enabled) {
             ServoParser::new(
                 document,
                 Tokenizer::AsyncHtml(self::async_html::Tokenizer::new(document, url, None)),
                 ParserKind::Normal,
+                can_gc,
             )
         } else {
             ServoParser::new(
@@ -173,6 +184,7 @@ impl ServoParser {
                     ParsingAlgorithm::Normal,
                 )),
                 ParserKind::Normal,
+                can_gc,
             )
         };
 
@@ -185,11 +197,12 @@ impl ServoParser {
     }
 
     // https://html.spec.whatwg.org/multipage/#parsing-html-fragments
-    pub fn parse_html_fragment(
+    pub(crate) fn parse_html_fragment(
         context: &Element,
         input: DOMString,
+        allow_declarative_shadow_roots: bool,
         can_gc: CanGc,
-    ) -> impl Iterator<Item = DomRoot<Node>> {
+    ) -> impl Iterator<Item = DomRoot<Node>> + use<'_> {
         let context_node = context.upcast::<Node>();
         let context_document = context_node.owner_doc();
         let window = context_document.window();
@@ -213,8 +226,11 @@ impl ServoParser {
             loader,
             None,
             None,
-            None,
             Default::default(),
+            false,
+            allow_declarative_shadow_roots,
+            Some(context_document.insecure_requests_policy()),
+            context_document.has_trustworthy_ancestor_or_current_origin(),
             can_gc,
         );
 
@@ -240,6 +256,7 @@ impl ServoParser {
                 ParsingAlgorithm::Fragment,
             )),
             ParserKind::Normal,
+            can_gc,
         );
         parser.parse_complete_string_chunk(String::from(input), can_gc);
 
@@ -250,7 +267,7 @@ impl ServoParser {
         }
     }
 
-    pub fn parse_html_script_input(document: &Document, url: ServoUrl) {
+    pub(crate) fn parse_html_script_input(document: &Document, url: ServoUrl) {
         let parser = ServoParser::new(
             document,
             Tokenizer::Html(self::html::Tokenizer::new(
@@ -260,12 +277,13 @@ impl ServoParser {
                 ParsingAlgorithm::Normal,
             )),
             ParserKind::ScriptCreated,
+            CanGc::note(),
         );
         *parser.bom_sniff.borrow_mut() = None;
         document.set_current_parser(Some(&parser));
     }
 
-    pub fn parse_xml_document(
+    pub(crate) fn parse_xml_document(
         document: &Document,
         input: Option<DOMString>,
         url: ServoUrl,
@@ -275,6 +293,7 @@ impl ServoParser {
             document,
             Tokenizer::Xml(self::xml::Tokenizer::new(document, url)),
             ParserKind::Normal,
+            can_gc,
         );
 
         // Set as the document's current parser and initialize with `input`, if given.
@@ -285,11 +304,11 @@ impl ServoParser {
         }
     }
 
-    pub fn script_nesting_level(&self) -> usize {
+    pub(crate) fn script_nesting_level(&self) -> usize {
         self.script_nesting_level.get()
     }
 
-    pub fn is_script_created(&self) -> bool {
+    pub(crate) fn is_script_created(&self) -> bool {
         self.script_created_parser
     }
 
@@ -307,7 +326,7 @@ impl ServoParser {
     ///     ^
     ///     insertion point
     /// ```
-    pub fn resume_with_pending_parsing_blocking_script(
+    pub(crate) fn resume_with_pending_parsing_blocking_script(
         &self,
         script: &HTMLScriptElement,
         result: ScriptResult,
@@ -325,7 +344,7 @@ impl ServoParser {
         assert_eq!(script_nesting_level, 0);
 
         self.script_nesting_level.set(script_nesting_level + 1);
-        script.execute(result);
+        script.execute(result, can_gc);
         self.script_nesting_level.set(script_nesting_level);
 
         if !self.suspended.get() && !self.aborted.get() {
@@ -333,21 +352,19 @@ impl ServoParser {
         }
     }
 
-    pub fn can_write(&self) -> bool {
+    pub(crate) fn can_write(&self) -> bool {
         self.script_created_parser || self.script_nesting_level.get() > 0
     }
 
     /// Steps 6-8 of <https://html.spec.whatwg.org/multipage/#document.write()>
-    pub fn write(&self, text: Vec<DOMString>, can_gc: CanGc) {
+    pub(crate) fn write(&self, text: DOMString, can_gc: CanGc) {
         assert!(self.can_write());
 
         if self.document.has_pending_parsing_blocking_script() {
             // There is already a pending parsing blocking script so the
             // parser is suspended, we just append everything to the
             // script input and abort these steps.
-            for chunk in text {
-                self.script_input.push_back(String::from(chunk).into());
-            }
+            self.script_input.push_back(String::from(text).into());
             return;
         }
 
@@ -357,11 +374,30 @@ impl ServoParser {
         assert!(self.script_input.is_empty());
 
         let input = BufferQueue::default();
-        for chunk in text {
-            input.push_back(String::from(chunk).into());
-        }
+        input.push_back(String::from(text).into());
 
-        self.tokenize(|tokenizer| tokenizer.feed(&input, can_gc));
+        let profiler_chan = self
+            .document
+            .window()
+            .as_global_scope()
+            .time_profiler_chan()
+            .clone();
+        let profiler_metadata = TimerMetadata {
+            url: self.document.url().as_str().into(),
+            iframe: TimerMetadataFrameType::RootWindow,
+            incremental: TimerMetadataReflowType::FirstReflow,
+        };
+        self.tokenize(
+            |tokenizer| {
+                tokenizer.feed(
+                    &input,
+                    can_gc,
+                    profiler_chan.clone(),
+                    profiler_metadata.clone(),
+                )
+            },
+            can_gc,
+        );
 
         if self.suspended.get() {
             // Parser got suspended, insert remaining input at end of
@@ -377,7 +413,7 @@ impl ServoParser {
     }
 
     // Steps 4-6 of https://html.spec.whatwg.org/multipage/#dom-document-close
-    pub fn close(&self, can_gc: CanGc) {
+    pub(crate) fn close(&self, can_gc: CanGc) {
         assert!(self.script_created_parser);
 
         // Step 4.
@@ -393,7 +429,7 @@ impl ServoParser {
     }
 
     // https://html.spec.whatwg.org/multipage/#abort-a-parser
-    pub fn abort(&self, can_gc: CanGc) {
+    pub(crate) fn abort(&self, can_gc: CanGc) {
         assert!(!self.aborted.get());
         self.aborted.set(true);
 
@@ -403,22 +439,23 @@ impl ServoParser {
 
         // Step 2.
         self.document
-            .set_ready_state(DocumentReadyState::Interactive);
+            .set_ready_state(DocumentReadyState::Interactive, can_gc);
 
         // Step 3.
         self.tokenizer.end(can_gc);
         self.document.set_current_parser(None);
 
         // Step 4.
-        self.document.set_ready_state(DocumentReadyState::Complete);
+        self.document
+            .set_ready_state(DocumentReadyState::Complete, can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#active-parser
-    pub fn is_active(&self) -> bool {
+    pub(crate) fn is_active(&self) -> bool {
         self.script_nesting_level() > 0 && !self.aborted.get()
     }
 
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn new_inherited(document: &Document, tokenizer: Tokenizer, kind: ParserKind) -> Self {
         ServoParser {
             reflector: Reflector::new(),
@@ -438,11 +475,17 @@ impl ServoParser {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    fn new(document: &Document, tokenizer: Tokenizer, kind: ParserKind) -> DomRoot<Self> {
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    fn new(
+        document: &Document,
+        tokenizer: Tokenizer,
+        kind: ParserKind,
+        can_gc: CanGc,
+    ) -> DomRoot<Self> {
         reflect_dom_object(
             Box::new(ServoParser::new_inherited(document, tokenizer, kind)),
             document.window(),
+            can_gc,
         )
     }
 
@@ -514,25 +557,6 @@ impl ServoParser {
     }
 
     fn parse_sync(&self, can_gc: CanGc) {
-        let metadata = TimerMetadata {
-            url: self.document.url().as_str().into(),
-            iframe: TimerMetadataFrameType::RootWindow,
-            incremental: TimerMetadataReflowType::FirstReflow,
-        };
-        let profiler_category = self.tokenizer.profiler_category();
-        profile(
-            profiler_category,
-            Some(metadata),
-            self.document
-                .window()
-                .upcast::<GlobalScope>()
-                .time_profiler_chan()
-                .clone(),
-            || self.do_parse_sync(can_gc),
-        )
-    }
-
-    fn do_parse_sync(&self, can_gc: CanGc) {
         assert!(self.script_input.is_empty());
 
         // This parser will continue to parse while there is either pending input or
@@ -546,7 +570,29 @@ impl ServoParser {
                 }
             }
         }
-        self.tokenize(|tokenizer| tokenizer.feed(&self.network_input, can_gc));
+
+        let profiler_chan = self
+            .document
+            .window()
+            .as_global_scope()
+            .time_profiler_chan()
+            .clone();
+        let profiler_metadata = TimerMetadata {
+            url: self.document.url().as_str().into(),
+            iframe: TimerMetadataFrameType::RootWindow,
+            incremental: TimerMetadataReflowType::FirstReflow,
+        };
+        self.tokenize(
+            |tokenizer| {
+                tokenizer.feed(
+                    &self.network_input,
+                    can_gc,
+                    profiler_chan.clone(),
+                    profiler_metadata.clone(),
+                )
+            },
+            can_gc,
+        );
 
         if self.suspended.get() {
             return;
@@ -576,7 +622,7 @@ impl ServoParser {
         }
     }
 
-    fn tokenize<F>(&self, feed: F)
+    fn tokenize<F>(&self, feed: F, can_gc: CanGc)
     where
         F: Fn(&Tokenizer) -> TokenizerResult<DomRoot<HTMLScriptElement>>,
     {
@@ -584,7 +630,9 @@ impl ServoParser {
             assert!(!self.suspended.get());
             assert!(!self.aborted.get());
 
-            self.document.reflow_if_reflow_timer_expired();
+            self.document
+                .window()
+                .reflow_if_reflow_timer_expired(can_gc);
             let script = match feed(&self.tokenizer) {
                 TokenizerResult::Done => return,
                 TokenizerResult::Script(script) => script,
@@ -599,14 +647,14 @@ impl ServoParser {
             if is_execution_stack_empty() {
                 self.document
                     .window()
-                    .upcast::<GlobalScope>()
-                    .perform_a_microtask_checkpoint(CanGc::note());
+                    .as_global_scope()
+                    .perform_a_microtask_checkpoint(can_gc);
             }
 
             let script_nesting_level = self.script_nesting_level.get();
 
             self.script_nesting_level.set(script_nesting_level + 1);
-            script.prepare();
+            script.prepare(can_gc);
             self.script_nesting_level.set(script_nesting_level);
 
             if self.document.has_pending_parsing_blocking_script() {
@@ -629,7 +677,7 @@ impl ServoParser {
 
         // Step 1.
         self.document
-            .set_ready_state(DocumentReadyState::Interactive);
+            .set_ready_state(DocumentReadyState::Interactive, can_gc);
 
         // Step 2.
         self.tokenizer.end(can_gc);
@@ -656,7 +704,7 @@ where
 
     fn next(&mut self) -> Option<DomRoot<Node>> {
         let next = self.inner.next()?;
-        next.remove_self();
+        next.remove_self(CanGc::note());
         Some(next)
     }
 
@@ -672,7 +720,7 @@ enum ParserKind {
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
-#[crown::unrooted_must_root_lint::must_root]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 enum Tokenizer {
     Html(self::html::Tokenizer),
     AsyncHtml(self::async_html::Tokenizer),
@@ -684,11 +732,28 @@ impl Tokenizer {
         &self,
         input: &BufferQueue,
         can_gc: CanGc,
+        profiler_chan: ProfilerChan,
+        profiler_metadata: TimerMetadata,
     ) -> TokenizerResult<DomRoot<HTMLScriptElement>> {
         match *self {
-            Tokenizer::Html(ref tokenizer) => tokenizer.feed(input),
-            Tokenizer::AsyncHtml(ref tokenizer) => tokenizer.feed(input, can_gc),
-            Tokenizer::Xml(ref tokenizer) => tokenizer.feed(input),
+            Tokenizer::Html(ref tokenizer) => time_profile!(
+                ProfilerCategory::ScriptParseHTML,
+                Some(profiler_metadata),
+                profiler_chan,
+                || tokenizer.feed(input),
+            ),
+            Tokenizer::AsyncHtml(ref tokenizer) => time_profile!(
+                ProfilerCategory::ScriptParseHTML,
+                Some(profiler_metadata),
+                profiler_chan,
+                || tokenizer.feed(input, can_gc),
+            ),
+            Tokenizer::Xml(ref tokenizer) => time_profile!(
+                ProfilerCategory::ScriptParseXML,
+                Some(profiler_metadata),
+                profiler_chan,
+                || tokenizer.feed(input),
+            ),
         }
     }
 
@@ -715,19 +780,11 @@ impl Tokenizer {
             Tokenizer::Xml(_) => unimplemented!(),
         }
     }
-
-    fn profiler_category(&self) -> ProfilerCategory {
-        match *self {
-            Tokenizer::Html(_) => ProfilerCategory::ScriptParseHTML,
-            Tokenizer::AsyncHtml(_) => ProfilerCategory::ScriptParseHTML,
-            Tokenizer::Xml(_) => ProfilerCategory::ScriptParseXML,
-        }
-    }
 }
 
 /// The context required for asynchronously fetching a document
 /// and parsing it progressively.
-pub struct ParserContext {
+pub(crate) struct ParserContext {
     /// The parser that initiated the request.
     parser: Option<Trusted<ServoParser>>,
     /// Is this a synthesized document
@@ -743,7 +800,7 @@ pub struct ParserContext {
 }
 
 impl ParserContext {
-    pub fn new(id: PipelineId, url: ServoUrl) -> ParserContext {
+    pub(crate) fn new(id: PipelineId, url: ServoUrl) -> ParserContext {
         ParserContext {
             parser: None,
             is_synthesized_document: false,
@@ -753,14 +810,35 @@ impl ParserContext {
             pushed_entry_index: None,
         }
     }
+
+    pub(crate) fn append_parent_to_csp_list(&self, policy_container: Option<&PolicyContainer>) {
+        let Some(policy_container) = policy_container else {
+            return;
+        };
+        let Some(parent_csp_list) = &policy_container.csp_list else {
+            return;
+        };
+        let Some(parser) = self.parser.as_ref().map(|p| p.root()) else {
+            return;
+        };
+        let new_csp_list = match parser.document.get_csp_list() {
+            None => parent_csp_list.clone(),
+            Some(original_csp_list) => {
+                let mut appended_csp_list = original_csp_list.clone();
+                appended_csp_list.append(parent_csp_list.clone());
+                appended_csp_list.to_owned()
+            },
+        };
+        parser.document.set_csp_list(Some(new_csp_list));
+    }
 }
 
 impl FetchResponseListener for ParserContext {
-    fn process_request_body(&mut self) {}
+    fn process_request_body(&mut self, _: RequestId) {}
 
-    fn process_request_eof(&mut self) {}
+    fn process_request_eof(&mut self, _: RequestId) {}
 
-    fn process_response(&mut self, meta_result: Result<FetchMetadata, NetworkError>) {
+    fn process_response(&mut self, _: RequestId, meta_result: Result<FetchMetadata, NetworkError>) {
         let (metadata, error) = match meta_result {
             Ok(meta) => (
                 Some(match meta {
@@ -791,29 +869,9 @@ impl FetchResponseListener for ParserContext {
             .map(Serde::into_inner)
             .map(Into::into);
 
-        // https://www.w3.org/TR/CSP/#initialize-document-csp
-        // TODO: Implement step 1 (local scheme special case)
-        let csp_list = metadata.as_ref().and_then(|m| {
-            let h = m.headers.as_ref()?;
-            let mut csp = h.get_all("content-security-policy").iter();
-            // This silently ignores the CSP if it contains invalid Unicode.
-            // We should probably report an error somewhere.
-            let c = csp.next().and_then(|c| c.to_str().ok())?;
-            let mut csp_list = CspList::parse(
-                c,
-                csp::PolicySource::Header,
-                csp::PolicyDisposition::Enforce,
-            );
-            for c in csp {
-                let c = c.to_str().ok()?;
-                csp_list.append(CspList::parse(
-                    c,
-                    csp::PolicySource::Header,
-                    csp::PolicyDisposition::Enforce,
-                ));
-            }
-            Some(csp_list)
-        });
+        let csp_list = metadata
+            .as_ref()
+            .and_then(|m| GlobalScope::parse_csp_list_from_metadata(&m.headers));
 
         let parser = match ScriptThread::page_headers_available(&self.id, metadata, CanGc::note()) {
             Some(parser) => parser,
@@ -851,10 +909,10 @@ impl FetchResponseListener for ParserContext {
 
                 let doc = &parser.document;
                 let doc_body = DomRoot::upcast::<Node>(doc.GetBody().unwrap());
-                let img = HTMLImageElement::new(local_name!("img"), None, doc, None);
+                let img = HTMLImageElement::new(local_name!("img"), None, doc, None, CanGc::note());
                 img.SetSrc(USVString(self.url.to_string()));
                 doc_body
-                    .AppendChild(&DomRoot::upcast::<Node>(img))
+                    .AppendChild(&DomRoot::upcast::<Node>(img), CanGc::note())
                     .expect("Appending failed");
             },
             (mime::TEXT, mime::PLAIN, _) => {
@@ -911,7 +969,7 @@ impl FetchResponseListener for ParserContext {
         }
     }
 
-    fn process_response_chunk(&mut self, payload: Vec<u8>) {
+    fn process_response_chunk(&mut self, _: RequestId, payload: Vec<u8>) {
         if self.is_synthesized_document {
             return;
         }
@@ -929,7 +987,11 @@ impl FetchResponseListener for ParserContext {
     // This method is called via script_thread::handle_fetch_eof, so we must call
     // submit_resource_timing in this function
     // Resource listeners are called via net_traits::Action::process, which handles submission for them
-    fn process_response_eof(&mut self, status: Result<ResourceFetchTiming, NetworkError>) {
+    fn process_response_eof(
+        &mut self,
+        _: RequestId,
+        status: Result<ResourceFetchTiming, NetworkError>,
+    ) {
         let parser = match self.parser.as_ref() {
             Some(parser) => parser.root(),
             None => return,
@@ -964,6 +1026,7 @@ impl FetchResponseListener for ParserContext {
                 &document.global(),
                 CrossProcessInstant::now(),
                 document,
+                CanGc::note(),
             );
             document
                 .global()
@@ -997,22 +1060,33 @@ impl FetchResponseListener for ParserContext {
             &document.global(),
             CrossProcessInstant::now(),
             document,
+            CanGc::note(),
         );
-        self.pushed_entry_index = document
-            .global()
-            .performance()
-            .queue_entry(performance_entry.upcast::<PerformanceEntry>());
+        self.pushed_entry_index = document.global().performance().queue_entry(
+            performance_entry.upcast::<PerformanceEntry>(),
+            CanGc::note(),
+        );
+    }
+
+    fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<csp::Violation>) {
+        let parser = match self.parser.as_ref() {
+            Some(parser) => parser.root(),
+            None => return,
+        };
+        let document = &parser.document;
+        let global = &document.global();
+        global.report_csp_violations(violations);
     }
 }
 
 impl PreInvoke for ParserContext {}
 
-pub struct FragmentContext<'a> {
-    pub context_elem: &'a Node,
-    pub form_elem: Option<&'a Node>,
+pub(crate) struct FragmentContext<'a> {
+    pub(crate) context_elem: &'a Node,
+    pub(crate) form_elem: Option<&'a Node>,
 }
 
-#[allow(crown::unrooted_must_root)]
+#[cfg_attr(crown, allow(crown::unrooted_must_root))]
 fn insert(
     parent: &Node,
     reference_child: Option<&Node>,
@@ -1030,7 +1104,7 @@ fn insert(
             if element_in_non_fragment {
                 ScriptThread::push_new_element_queue();
             }
-            parent.InsertBefore(&n, reference_child).unwrap();
+            parent.InsertBefore(&n, reference_child, can_gc).unwrap();
             if element_in_non_fragment {
                 ScriptThread::pop_current_element_queue(can_gc);
             }
@@ -1045,16 +1119,18 @@ fn insert(
             if let Some(text) = text {
                 text.upcast::<CharacterData>().append_data(&t);
             } else {
-                let text = Text::new(String::from(t).into(), &parent.owner_doc());
-                parent.InsertBefore(text.upcast(), reference_child).unwrap();
+                let text = Text::new(String::from(t).into(), &parent.owner_doc(), can_gc);
+                parent
+                    .InsertBefore(text.upcast(), reference_child, can_gc)
+                    .unwrap();
             }
         },
     }
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
-#[crown::unrooted_must_root_lint::must_root]
-pub struct Sink {
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
+pub(crate) struct Sink {
     #[no_trace]
     base_url: ServoUrl,
     document: Dom<Document>,
@@ -1078,20 +1154,23 @@ impl Sink {
 
 impl TreeSink for Sink {
     type Output = Self;
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn finish(self) -> Self {
         self
     }
 
     type Handle = Dom<Node>;
-    type ElemName<'a> = ExpandedName<'a> where Self: 'a;
+    type ElemName<'a>
+        = ExpandedName<'a>
+    where
+        Self: 'a;
 
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn get_document(&self) -> Dom<Node> {
         Dom::from_ref(self.document.upcast())
     }
 
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn get_template_contents(&self, target: &Dom<Node>) -> Dom<Node> {
         let template = target
             .downcast::<HTMLTemplateElement>()
@@ -1113,41 +1192,52 @@ impl TreeSink for Sink {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn create_element(
         &self,
         name: QualName,
         attrs: Vec<Attribute>,
-        _flags: ElementFlags,
+        flags: ElementFlags,
     ) -> Dom<Node> {
         let attrs = attrs
             .into_iter()
             .map(|attr| ElementAttribute::new(attr.name, DOMString::from(String::from(attr.value))))
             .collect();
+        let parsing_algorithm = if flags.template {
+            ParsingAlgorithm::Fragment
+        } else {
+            self.parsing_algorithm
+        };
         let element = create_element_for_token(
             name,
             attrs,
             &self.document,
             ElementCreator::ParserCreated(self.current_line.get()),
-            self.parsing_algorithm,
+            parsing_algorithm,
             CanGc::note(),
         );
         Dom::from_ref(element.upcast())
     }
 
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn create_comment(&self, text: StrTendril) -> Dom<Node> {
-        let comment = Comment::new(DOMString::from(String::from(text)), &self.document, None);
+        let comment = Comment::new(
+            DOMString::from(String::from(text)),
+            &self.document,
+            None,
+            CanGc::note(),
+        );
         Dom::from_ref(comment.upcast())
     }
 
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn create_pi(&self, target: StrTendril, data: StrTendril) -> Dom<Node> {
         let doc = &*self.document;
         let pi = ProcessingInstruction::new(
             DOMString::from(String::from(target)),
             DOMString::from(String::from(data)),
             doc,
+            CanGc::note(),
         );
         Dom::from_ref(pi.upcast())
     }
@@ -1178,11 +1268,11 @@ impl TreeSink for Sink {
         let control = elem.and_then(|e| e.as_maybe_form_control());
 
         if let Some(control) = control {
-            control.set_form_owner_from_parser(&form);
+            control.set_form_owner_from_parser(&form, CanGc::note());
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn append_before_sibling(&self, sibling: &Dom<Node>, new_node: NodeOrText<Dom<Node>>) {
         let parent = sibling
             .GetParentNode()
@@ -1210,12 +1300,12 @@ impl TreeSink for Sink {
         self.document.set_quirks_mode(mode);
     }
 
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn append(&self, parent: &Dom<Node>, child: NodeOrText<Dom<Node>>) {
         insert(parent, None, child, self.parsing_algorithm, CanGc::note());
     }
 
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn append_based_on_parent_node(
         &self,
         elem: &Dom<Node>,
@@ -1241,9 +1331,10 @@ impl TreeSink for Sink {
             Some(DOMString::from(String::from(public_id))),
             Some(DOMString::from(String::from(system_id))),
             doc,
+            CanGc::note(),
         );
         doc.upcast::<Node>()
-            .AppendChild(doctype.upcast())
+            .AppendChild(doctype.upcast(), CanGc::note())
             .expect("Appending failed");
     }
 
@@ -1256,13 +1347,14 @@ impl TreeSink for Sink {
                 attr.name,
                 DOMString::from(String::from(attr.value)),
                 None,
+                CanGc::note(),
             );
         }
     }
 
     fn remove_from_parent(&self, target: &Dom<Node>) {
         if let Some(ref parent) = target.GetParentNode() {
-            parent.RemoveChild(target).unwrap();
+            parent.RemoveChild(target, CanGc::note()).unwrap();
         }
     }
 
@@ -1273,18 +1365,9 @@ impl TreeSink for Sink {
         }
     }
 
-    fn complete_script(&self, node: &Dom<Node>) -> NextParserState {
-        if let Some(script) = node.downcast() {
-            self.script.set(Some(script));
-            NextParserState::Suspend
-        } else {
-            NextParserState::Continue
-        }
-    }
-
     fn reparent_children(&self, node: &Dom<Node>, new_parent: &Dom<Node>) {
         while let Some(ref child) = node.GetFirstChild() {
-            new_parent.AppendChild(child).unwrap();
+            new_parent.AppendChild(child, CanGc::note()).unwrap();
         }
     }
 
@@ -1306,6 +1389,96 @@ impl TreeSink for Sink {
     fn pop(&self, node: &Dom<Node>) {
         let node = DomRoot::from_ref(&**node);
         vtable_for(&node).pop();
+    }
+
+    fn allow_declarative_shadow_roots(&self, intended_parent: &Dom<Node>) -> bool {
+        intended_parent.owner_doc().allow_declarative_shadow_roots()
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#parsing-main-inhead>
+    /// A start tag whose tag name is "template"
+    /// Attach shadow path
+    fn attach_declarative_shadow(
+        &self,
+        host: &Dom<Node>,
+        template: &Dom<Node>,
+        attrs: Vec<Attribute>,
+    ) -> Result<(), String> {
+        let host_element = host.downcast::<Element>().unwrap();
+
+        if host_element.shadow_root().is_some() {
+            return Err(String::from("Already in a shadow host"));
+        }
+
+        let template_element = template.downcast::<HTMLTemplateElement>().unwrap();
+
+        // Step 3. Let mode be template start tag's shadowrootmode attribute's value.
+        // Step 4. Let clonable be true if template start tag has a shadowrootclonable attribute; otherwise false.
+        // Step 5. Let delegatesfocus be true if template start tag
+        // has a shadowrootdelegatesfocus attribute; otherwise false.
+        // Step 6. Let serializable be true if template start tag
+        // has a shadowrootserializable attribute; otherwise false.
+        let mut shadow_root_mode = ShadowRootMode::Open;
+        let mut clonable = false;
+        let mut delegatesfocus = false;
+        let mut serializable = false;
+
+        let attrs: Vec<ElementAttribute> = attrs
+            .clone()
+            .into_iter()
+            .map(|attr| ElementAttribute::new(attr.name, DOMString::from(String::from(attr.value))))
+            .collect();
+
+        attrs
+            .iter()
+            .for_each(|attr: &ElementAttribute| match attr.name.local {
+                local_name!("shadowrootmode") => {
+                    if attr.value.str().eq_ignore_ascii_case("open") {
+                        shadow_root_mode = ShadowRootMode::Open;
+                    } else if attr.value.str().eq_ignore_ascii_case("closed") {
+                        shadow_root_mode = ShadowRootMode::Closed;
+                    } else {
+                        unreachable!("shadowrootmode value is not open nor closed");
+                    }
+                },
+                local_name!("shadowrootclonable") => {
+                    clonable = true;
+                },
+                local_name!("shadowrootdelegatesfocus") => {
+                    delegatesfocus = true;
+                },
+                local_name!("shadowrootserializable") => {
+                    serializable = true;
+                },
+                _ => {},
+            });
+
+        // Step 8.1. Attach a shadow root with declarative shadow host element,
+        // mode, clonable, serializable, delegatesFocus, and "named".
+        match host_element.attach_shadow(
+            IsUserAgentWidget::No,
+            shadow_root_mode,
+            clonable,
+            serializable,
+            delegatesfocus,
+            SlotAssignmentMode::Named,
+            CanGc::note(),
+        ) {
+            Ok(shadow_root) => {
+                // Step 8.3. Set shadow's declarative to true.
+                shadow_root.set_declarative(true);
+
+                // Set 8.4. Set template's template contents property to shadow.
+                let shadow = shadow_root.upcast::<DocumentFragment>();
+                template_element.set_contents(Some(shadow));
+
+                // Step 8.5. Set shadow’s available to element internals to true.
+                shadow_root.set_available_to_element_internals(true);
+
+                Ok(())
+            },
+            Err(_) => Err(String::from("Attaching shadow fails")),
+        }
     }
 }
 
@@ -1339,7 +1512,7 @@ fn create_element_for_token(
         if is_execution_stack_empty() {
             document
                 .window()
-                .upcast::<GlobalScope>()
+                .as_global_scope()
                 .perform_a_microtask_checkpoint(can_gc);
         }
         // Step 6.3
@@ -1369,7 +1542,7 @@ fn create_element_for_token(
 
     // Step 8
     for attr in attrs {
-        element.set_attribute_from_parser(attr.name, attr.value, None);
+        element.set_attribute_from_parser(attr.name, attr.value, None, can_gc);
     }
 
     // _now_ we can sanitize (and we sanitize now even if the "value"

@@ -4,16 +4,19 @@
 
 use std::sync::Arc;
 
+use base::id::PipelineId;
+use compositing_traits::CrossProcessCompositorApi;
 use ipc_channel::ipc::IpcSender;
 use log::debug;
+use malloc_size_of::MallocSizeOfOps;
 use malloc_size_of_derive::MallocSizeOf;
 use pixels::{Image, ImageMetadata};
+use profile_traits::mem::Report;
 use serde::{Deserialize, Serialize};
 use servo_url::{ImmutableOrigin, ServoUrl};
-use webrender_traits::CrossProcessCompositorApi;
 
-use crate::request::CorsSettings;
 use crate::FetchResponseMsg;
+use crate::request::CorsSettings;
 
 // ======================================================================
 // Aux structs and enums.
@@ -28,22 +31,31 @@ pub enum ImageOrMetadataAvailable {
         url: ServoUrl,
         is_placeholder: bool,
     },
-    MetadataAvailable(ImageMetadata),
+    MetadataAvailable(ImageMetadata, PendingImageId),
 }
 
 /// This is optionally passed to the image cache when requesting
 /// and image, and returned to the specified event loop when the
 /// image load completes. It is typically used to trigger a reflow
 /// and/or repaint.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct ImageResponder {
-    id: PendingImageId,
+    pipeline_id: PipelineId,
+    pub id: PendingImageId,
     sender: IpcSender<PendingImageResponse>,
 }
 
 impl ImageResponder {
-    pub fn new(sender: IpcSender<PendingImageResponse>, id: PendingImageId) -> ImageResponder {
-        ImageResponder { sender, id }
+    pub fn new(
+        sender: IpcSender<PendingImageResponse>,
+        pipeline_id: PipelineId,
+        id: PendingImageId,
+    ) -> ImageResponder {
+        ImageResponder {
+            pipeline_id,
+            sender,
+            id,
+        }
     }
 
     pub fn respond(&self, response: ImageResponse) {
@@ -52,6 +64,7 @@ impl ImageResponder {
         // That's not a case that's worth warning about.
         // TODO(#15501): are there cases in which we should perform cleanup?
         let _ = self.sender.send(PendingImageResponse {
+            pipeline_id: self.pipeline_id,
             response,
             id: self.id,
         });
@@ -62,11 +75,11 @@ impl ImageResponder {
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub enum ImageResponse {
     /// The requested image was loaded.
-    Loaded(#[ignore_malloc_size_of = "Arc"] Arc<Image>, ServoUrl),
+    Loaded(#[conditional_malloc_size_of] Arc<Image>, ServoUrl),
     /// The request image metadata was loaded.
     MetadataLoaded(ImageMetadata),
     /// The requested image failed to load, so a placeholder was loaded instead.
-    PlaceholderLoaded(#[ignore_malloc_size_of = "Arc"] Arc<Image>, ServoUrl),
+    PlaceholderLoaded(#[conditional_malloc_size_of] Arc<Image>, ServoUrl),
     /// Neither the requested image nor the placeholder could be loaded.
     None,
 }
@@ -75,8 +88,9 @@ pub enum ImageResponse {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
 pub struct PendingImageId(pub u64);
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PendingImageResponse {
+    pub pipeline_id: PipelineId,
     pub response: ImageResponse,
     pub id: PendingImageId,
 }
@@ -99,9 +113,11 @@ pub enum ImageCacheResult {
 }
 
 pub trait ImageCache: Sync + Send {
-    fn new(compositor_api: CrossProcessCompositorApi) -> Self
+    fn new(compositor_api: CrossProcessCompositorApi, rippy_data: Vec<u8>) -> Self
     where
         Self: Sized;
+
+    fn memory_report(&self, prefix: &str, ops: &mut MallocSizeOfOps) -> Report;
 
     /// Definitively check whether there is a cached, fully loaded image available.
     fn get_image(
@@ -119,25 +135,16 @@ pub trait ImageCache: Sync + Send {
         use_placeholder: UsePlaceholder,
     ) -> ImageCacheResult;
 
-    /// Add a listener for the provided pending image id, eventually called by
-    /// ImageCacheStore::complete_load.
-    /// If only metadata is available, Available(ImageOrMetadataAvailable) will
-    /// be returned.
-    /// If Available(ImageOrMetadataAvailable::Image) or LoadError is the final value,
-    /// the provided listener will be dropped (consumed & not added to PendingLoad).
-    fn track_image(
-        &self,
-        url: ServoUrl,
-        origin: ImmutableOrigin,
-        cors_setting: Option<CorsSettings>,
-        sender: IpcSender<PendingImageResponse>,
-        use_placeholder: UsePlaceholder,
-    ) -> ImageCacheResult;
-
     /// Add a new listener for the given pending image id. If the image is already present,
     /// the responder will still receive the expected response.
-    fn add_listener(&self, id: PendingImageId, listener: ImageResponder);
+    fn add_listener(&self, listener: ImageResponder);
 
     /// Inform the image cache about a response for a pending request.
     fn notify_pending_response(&self, id: PendingImageId, action: FetchResponseMsg);
+
+    /// Create new image cache based on this one, while reusing the existing thread_pool.
+    fn create_new_image_cache(
+        &self,
+        compositor_api: CrossProcessCompositorApi,
+    ) -> Arc<dyn ImageCache>;
 }

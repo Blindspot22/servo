@@ -3,14 +3,14 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
-use servo_atoms::Atom;
+use stylo_atoms::Atom;
 
 use crate::dom::bindings::codegen::Bindings::HTMLCollectionBinding::HTMLCollectionMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLFormControlsCollectionBinding::HTMLFormControlsCollectionMethods;
 use crate::dom::bindings::codegen::Bindings::NodeBinding::{GetRootNodeOptions, NodeMethods};
 use crate::dom::bindings::codegen::UnionTypes::RadioNodeListOrElement;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject};
+use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::element::Element;
@@ -19,9 +19,10 @@ use crate::dom::htmlformelement::HTMLFormElement;
 use crate::dom::node::Node;
 use crate::dom::radionodelist::RadioNodeList;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct HTMLFormControlsCollection {
+pub(crate) struct HTMLFormControlsCollection {
     collection: HTMLCollection,
     form: Dom<HTMLFormElement>,
 }
@@ -40,19 +41,21 @@ impl HTMLFormControlsCollection {
         }
     }
 
-    pub fn new(
+    pub(crate) fn new(
         window: &Window,
         form: &HTMLFormElement,
         filter: Box<dyn CollectionFilter + 'static>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLFormControlsCollection> {
         reflect_dom_object(
             Box::new(HTMLFormControlsCollection::new_inherited(form, filter)),
             window,
+            can_gc,
         )
     }
 }
 
-impl HTMLFormControlsCollectionMethods for HTMLFormControlsCollection {
+impl HTMLFormControlsCollectionMethods<crate::DomTypeHolder> for HTMLFormControlsCollection {
     // FIXME: This shouldn't need to be implemented here since HTMLCollection (the parent of
     // HTMLFormControlsCollection) implements Length
     // https://dom.spec.whatwg.org/#dom-htmlcollection-length
@@ -61,7 +64,7 @@ impl HTMLFormControlsCollectionMethods for HTMLFormControlsCollection {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-htmlformcontrolscollection-nameditem
-    fn NamedItem(&self, name: DOMString) -> Option<RadioNodeListOrElement> {
+    fn NamedItem(&self, name: DOMString, can_gc: CanGc) -> Option<RadioNodeListOrElement> {
         // Step 1
         if name.is_empty() {
             return None;
@@ -92,7 +95,9 @@ impl HTMLFormControlsCollectionMethods for HTMLFormControlsCollection {
                 // specifically HTMLFormElement::Elements(),
                 // and the collection filter excludes image inputs.
                 Some(RadioNodeListOrElement::RadioNodeList(
-                    RadioNodeList::new_controls_except_image_inputs(window, &self.form, &name),
+                    RadioNodeList::new_controls_except_image_inputs(
+                        window, &self.form, &name, can_gc,
+                    ),
                 ))
             }
         // Step 3
@@ -102,8 +107,8 @@ impl HTMLFormControlsCollectionMethods for HTMLFormControlsCollection {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-htmlformcontrolscollection-nameditem
-    fn NamedGetter(&self, name: DOMString) -> Option<RadioNodeListOrElement> {
-        self.NamedItem(name)
+    fn NamedGetter(&self, name: DOMString, can_gc: CanGc) -> Option<RadioNodeListOrElement> {
+        self.NamedItem(name, can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#the-htmlformcontrolscollection-interface:supported-property-names

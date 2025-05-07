@@ -11,11 +11,11 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::testbinding::TestBinding;
 
 #[dom_struct]
-pub struct TestBindingProxy {
+pub(crate) struct TestBindingProxy {
     testbinding_: TestBinding,
 }
 
-impl TestBindingProxyMethods for TestBindingProxy {
+impl TestBindingProxyMethods<crate::DomTypeHolder> for TestBindingProxy {
     fn Length(&self) -> u32 {
         0
     }

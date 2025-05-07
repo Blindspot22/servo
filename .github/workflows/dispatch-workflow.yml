@@ -11,10 +11,19 @@ on:
       wpt-args:
         required: true
         type: string
-      wpt-layout:
+      wpt:
         required: true
-        type: string
+        type: boolean
+      number-of-wpt-chunks:
+        required: true
+        type: number
       unit-tests:
+        required: true
+        type: boolean
+      build-libservo:
+        required: true
+        type: boolean
+      bencher:
         required: true
         type: boolean
 
@@ -27,6 +36,8 @@ jobs:
     with:
       profile: ${{ inputs.profile }}
       unit-tests: ${{ inputs.unit-tests }}
+      build-libservo: ${{ inputs.build-libservo }}
+      bencher: ${{ inputs.bencher }}
 
   macos:
     if: ${{ inputs.workflow == 'macos' }}
@@ -35,9 +46,11 @@ jobs:
     secrets: inherit
     with:
       profile: ${{ inputs.profile }}
-      wpt-layout: ${{ inputs.wpt-layout }}
+      wpt: ${{ inputs.wpt }}
       unit-tests: ${{ inputs.unit-tests }}
+      build-libservo: ${{ inputs.build-libservo }}
       wpt-args: ${{ inputs.wpt-args }}
+      bencher: ${{ inputs.bencher }}
 
   linux:
     if: ${{ inputs.workflow == 'linux' }}
@@ -46,9 +59,12 @@ jobs:
     secrets: inherit
     with:
       profile: ${{ inputs.profile }}
-      wpt-layout: ${{ inputs.wpt-layout }}
+      wpt: ${{ inputs.wpt }}
+      number-of-wpt-chunks: ${{ inputs.number-of-wpt-chunks }}
       unit-tests: ${{ inputs.unit-tests }}
+      build-libservo: ${{ inputs.build-libservo }}
       wpt-args: ${{ inputs.wpt-args }}
+      bencher: ${{ inputs.bencher }}
 
   lint:
     if: ${{ inputs.workflow == 'lint' }}
@@ -63,10 +79,13 @@ jobs:
     secrets: inherit
     with:
       profile: ${{ inputs.profile }}
+      bencher: ${{ inputs.bencher }}
 
   ohos:
     if: ${{ inputs.workflow == 'ohos' }}
     name: OpenHarmony
     uses: ./.github/workflows/ohos.yml
+    secrets: inherit
     with:
       profile: ${{ inputs.profile }}
+      bencher: ${{ inputs.bencher }}

@@ -22,7 +22,7 @@ use crate::dom::window::Window;
 use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct WheelEvent {
+pub(crate) struct WheelEvent {
     mouseevent: MouseEvent,
     delta_x: Cell<Finite<f64>>,
     delta_y: Cell<Finite<f64>>,
@@ -50,7 +50,7 @@ impl WheelEvent {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         window: &Window,
         type_: DOMString,
         can_bubble: EventBubbles,
@@ -61,20 +61,11 @@ impl WheelEvent {
         delta_y: Finite<f64>,
         delta_z: Finite<f64>,
         delta_mode: u32,
+        can_gc: CanGc,
     ) -> DomRoot<WheelEvent> {
         Self::new_with_proto(
-            window,
-            None,
-            type_,
-            can_bubble,
-            cancelable,
-            view,
-            detail,
-            delta_x,
-            delta_y,
-            delta_z,
-            delta_mode,
-            CanGc::note(),
+            window, None, type_, can_bubble, cancelable, view, detail, delta_x, delta_y, delta_z,
+            delta_mode, can_gc,
         )
     }
 
@@ -110,7 +101,7 @@ impl WheelEvent {
     }
 }
 
-impl WheelEventMethods for WheelEvent {
+impl WheelEventMethods<crate::DomTypeHolder> for WheelEvent {
     // https://w3c.github.io/uievents/#dom-wheelevent-wheelevent
     fn Constructor(
         window: &Window,

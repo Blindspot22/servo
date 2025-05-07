@@ -1,5 +1,5 @@
 // META: title=test WebNN API split operation
-// META: global=window,dedicatedworker
+// META: global=window
 // META: variant=?cpu
 // META: variant=?gpu
 // META: variant=?npu
@@ -534,7 +534,7 @@ const splitTests = [
 if (navigator.ml) {
   splitTests.forEach((test) => {
     webnn_conformance_test(
-        buildGraphAndCompute, getSplitPrecisionTolerance, test);
+        buildAndExecuteGraph, getSplitPrecisionTolerance, test);
   });
 } else {
   test(() => assert_implements(navigator.ml, 'missing navigator.ml'));

@@ -8,12 +8,13 @@ use dom_struct::dom_struct;
 
 use crate::dom::bindings::codegen::Bindings::GamepadButtonBinding::GamepadButtonMethods;
 use crate::dom::bindings::num::Finite;
-use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
+use crate::dom::bindings::reflector::{Reflector, reflect_dom_object};
 use crate::dom::bindings::root::DomRoot;
-use crate::dom::globalscope::GlobalScope;
+use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct GamepadButton {
+pub(crate) struct GamepadButton {
     reflector_: Reflector,
     pressed: Cell<bool>,
     touched: Cell<bool>,
@@ -21,7 +22,7 @@ pub struct GamepadButton {
 }
 
 impl GamepadButton {
-    pub fn new_inherited(pressed: bool, touched: bool) -> GamepadButton {
+    pub(crate) fn new_inherited(pressed: bool, touched: bool) -> GamepadButton {
         Self {
             reflector_: Reflector::new(),
             pressed: Cell::new(pressed),
@@ -30,15 +31,21 @@ impl GamepadButton {
         }
     }
 
-    pub fn new(global: &GlobalScope, pressed: bool, touched: bool) -> DomRoot<GamepadButton> {
+    pub(crate) fn new(
+        window: &Window,
+        pressed: bool,
+        touched: bool,
+        can_gc: CanGc,
+    ) -> DomRoot<GamepadButton> {
         reflect_dom_object(
             Box::new(GamepadButton::new_inherited(pressed, touched)),
-            global,
+            window,
+            can_gc,
         )
     }
 }
 
-impl GamepadButtonMethods for GamepadButton {
+impl GamepadButtonMethods<crate::DomTypeHolder> for GamepadButton {
     // https://www.w3.org/TR/gamepad/#widl-GamepadButton-pressed
     fn Pressed(&self) -> bool {
         self.pressed.get()
@@ -56,7 +63,7 @@ impl GamepadButtonMethods for GamepadButton {
 }
 
 impl GamepadButton {
-    pub fn update(&self, pressed: bool, touched: bool, value: f64) {
+    pub(crate) fn update(&self, pressed: bool, touched: bool, value: f64) {
         self.pressed.set(pressed);
         self.touched.set(touched);
         self.value.set(value);

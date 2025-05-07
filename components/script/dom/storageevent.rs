@@ -4,7 +4,7 @@
 
 use dom_struct::dom_struct;
 use js::rust::HandleObject;
-use servo_atoms::Atom;
+use stylo_atoms::Atom;
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::EventBinding::EventMethods;
@@ -21,7 +21,7 @@ use crate::dom::window::Window;
 use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct StorageEvent {
+pub(crate) struct StorageEvent {
     event: Event,
     key: DomRefCell<Option<DOMString>>,
     old_value: DomRefCell<Option<DOMString>>,
@@ -32,7 +32,7 @@ pub struct StorageEvent {
 
 #[allow(non_snake_case)]
 impl StorageEvent {
-    pub fn new_inherited(
+    pub(crate) fn new_inherited(
         key: Option<DOMString>,
         old_value: Option<DOMString>,
         new_value: Option<DOMString>,
@@ -49,8 +49,12 @@ impl StorageEvent {
         }
     }
 
-    pub fn new_uninitialized(window: &Window, url: DOMString) -> DomRoot<StorageEvent> {
-        Self::new_uninitialized_with_proto(window, None, url, CanGc::note())
+    pub(crate) fn new_uninitialized(
+        window: &Window,
+        url: DOMString,
+        can_gc: CanGc,
+    ) -> DomRoot<StorageEvent> {
+        Self::new_uninitialized_with_proto(window, None, url, can_gc)
     }
 
     fn new_uninitialized_with_proto(
@@ -68,7 +72,7 @@ impl StorageEvent {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         global: &Window,
         type_: Atom,
         bubbles: EventBubbles,
@@ -78,6 +82,7 @@ impl StorageEvent {
         newValue: Option<DOMString>,
         url: DOMString,
         storageArea: Option<&Storage>,
+        can_gc: CanGc,
     ) -> DomRoot<StorageEvent> {
         Self::new_with_proto(
             global,
@@ -90,7 +95,7 @@ impl StorageEvent {
             newValue,
             url,
             storageArea,
-            CanGc::note(),
+            can_gc,
         )
     }
 
@@ -129,7 +134,7 @@ impl StorageEvent {
 }
 
 #[allow(non_snake_case)]
-impl StorageEventMethods for StorageEvent {
+impl StorageEventMethods<crate::DomTypeHolder> for StorageEvent {
     // https://html.spec.whatwg.org/multipage/#storageevent
     fn Constructor(
         global: &Window,

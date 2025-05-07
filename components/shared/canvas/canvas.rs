@@ -6,13 +6,66 @@ use std::default::Default;
 use std::str::FromStr;
 
 use euclid::default::{Point2D, Rect, Size2D, Transform2D};
-use ipc_channel::ipc::{IpcBytesReceiver, IpcBytesSender, IpcSender, IpcSharedMemory};
+use ipc_channel::ipc::{IpcBytesReceiver, IpcSender};
 use malloc_size_of_derive::MallocSizeOf;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
+use snapshot::IpcSnapshot;
 use style::color::AbsoluteColor;
 use style::properties::style_structs::Font as FontStyleStruct;
-use webrender_api::ImageKey;
+
+#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub enum PathSegment {
+    ClosePath,
+    MoveTo {
+        x: f32,
+        y: f32,
+    },
+    LineTo {
+        x: f32,
+        y: f32,
+    },
+    Quadratic {
+        cpx: f32,
+        cpy: f32,
+        x: f32,
+        y: f32,
+    },
+    Bezier {
+        cp1x: f32,
+        cp1y: f32,
+        cp2x: f32,
+        cp2y: f32,
+        x: f32,
+        y: f32,
+    },
+    ArcTo {
+        cp1x: f32,
+        cp1y: f32,
+        cp2x: f32,
+        cp2y: f32,
+        radius: f32,
+    },
+    Ellipse {
+        x: f32,
+        y: f32,
+        radius_x: f32,
+        radius_y: f32,
+        rotation: f32,
+        start_angle: f32,
+        end_angle: f32,
+        anticlockwise: bool,
+    },
+    SvgArc {
+        radius_x: f32,
+        radius_y: f32,
+        rotation: f32,
+        large_arc: bool,
+        sweep: bool,
+        x: f32,
+        y: f32,
+    },
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum FillRule {
@@ -26,36 +79,33 @@ pub struct CanvasId(pub u64);
 #[derive(Debug, Deserialize, Serialize)]
 pub enum CanvasMsg {
     Canvas2d(Canvas2dMsg, CanvasId),
-    FromLayout(FromLayoutMsg, CanvasId),
     FromScript(FromScriptMsg, CanvasId),
     Recreate(Option<Size2D<u64>>, CanvasId),
     Close(CanvasId),
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct CanvasImageData {
-    pub image_key: ImageKey,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub enum Canvas2dMsg {
     Arc(Point2D<f32>, f32, f32, f32, bool),
     ArcTo(Point2D<f32>, Point2D<f32>, f32),
-    DrawImage(IpcSharedMemory, Size2D<f64>, Rect<f64>, Rect<f64>, bool),
+    DrawImage(IpcSnapshot, Rect<f64>, Rect<f64>, bool),
     DrawEmptyImage(Size2D<f64>, Rect<f64>, Rect<f64>),
     DrawImageInOther(CanvasId, Size2D<f64>, Rect<f64>, Rect<f64>, bool),
     BeginPath,
     BezierCurveTo(Point2D<f32>, Point2D<f32>, Point2D<f32>),
     ClearRect(Rect<f32>),
     Clip,
+    ClipPath(Vec<PathSegment>),
     ClosePath,
     Ellipse(Point2D<f32>, f32, f32, f32, f32, f32, bool),
     Fill(FillOrStrokeStyle),
+    FillPath(FillOrStrokeStyle, Vec<PathSegment>),
     FillText(String, f64, f64, Option<f64>, FillOrStrokeStyle, bool),
     FillRect(Rect<f32>, FillOrStrokeStyle),
-    GetImageData(Rect<u64>, Size2D<u64>, IpcBytesSender),
+    GetImageData(Rect<u64>, Size2D<u64>, IpcSender<IpcSnapshot>),
     GetTransform(IpcSender<Transform2D<f32>>),
-    IsPointInPath(f64, f64, FillRule, IpcSender<bool>),
+    IsPointInCurrentPath(f64, f64, FillRule, IpcSender<bool>),
+    IsPointInPath(Vec<PathSegment>, f64, f64, FillRule, IpcSender<bool>),
     LineTo(Point2D<f32>),
     MoveTo(Point2D<f32>),
     MeasureText(String, IpcSender<TextMetrics>),
@@ -66,10 +116,13 @@ pub enum Canvas2dMsg {
     SaveContext,
     StrokeRect(Rect<f32>, FillOrStrokeStyle),
     Stroke(FillOrStrokeStyle),
+    StrokePath(FillOrStrokeStyle, Vec<PathSegment>),
     SetLineWidth(f32),
     SetLineCap(LineCapStyle),
     SetLineJoin(LineJoinStyle),
     SetMiterLimit(f32),
+    SetLineDash(Vec<f32>),
+    SetLineDashOffset(f32),
     SetGlobalAlpha(f32),
     SetGlobalComposition(CompositionOrBlending),
     SetTransform(Transform2D<f32>),
@@ -80,16 +133,12 @@ pub enum Canvas2dMsg {
     SetFont(FontStyleStruct),
     SetTextAlign(TextAlign),
     SetTextBaseline(TextBaseline),
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub enum FromLayoutMsg {
-    SendData(IpcSender<CanvasImageData>),
+    UpdateImage(IpcSender<()>),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum FromScriptMsg {
-    SendPixels(IpcSender<IpcSharedMemory>),
+    SendPixels(IpcSender<IpcSnapshot>),
 }
 
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]

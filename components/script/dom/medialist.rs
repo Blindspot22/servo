@@ -9,18 +9,19 @@ use style::media_queries::{MediaList as StyleMediaList, MediaQuery};
 use style::parser::ParserContext;
 use style::shared_lock::{Locked, SharedRwLock};
 use style::stylesheets::{CssRuleType, Origin, UrlExtraData};
-use style_traits::{ParsingMode, ToCss};
+use style_traits::{ParseError, ParsingMode, ToCss};
 
 use crate::dom::bindings::codegen::Bindings::MediaListBinding::MediaListMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::Window_Binding::WindowMethods;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
+use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::cssstylesheet::CSSStyleSheet;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct MediaList {
+pub(crate) struct MediaList {
     reflector_: Reflector,
     parent_stylesheet: Dom<CSSStyleSheet>,
     #[ignore_malloc_size_of = "Arc"]
@@ -29,8 +30,8 @@ pub struct MediaList {
 }
 
 impl MediaList {
-    #[allow(crown::unrooted_must_root)]
-    pub fn new_inherited(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new_inherited(
         parent_stylesheet: &CSSStyleSheet,
         media_queries: Arc<Locked<StyleMediaList>>,
     ) -> MediaList {
@@ -41,45 +42,56 @@ impl MediaList {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         window: &Window,
         parent_stylesheet: &CSSStyleSheet,
         media_queries: Arc<Locked<StyleMediaList>>,
+        can_gc: CanGc,
     ) -> DomRoot<MediaList> {
         reflect_dom_object(
             Box::new(MediaList::new_inherited(parent_stylesheet, media_queries)),
             window,
+            can_gc,
         )
     }
 
     fn shared_lock(&self) -> &SharedRwLock {
         &self.parent_stylesheet.style_stylesheet().shared_lock
     }
-}
 
-impl MediaListMethods for MediaList {
-    /// <https://drafts.csswg.org/cssom/#dom-medialist-mediatext>
-    fn MediaText(&self) -> DOMString {
-        let guard = self.shared_lock().read();
-        DOMString::from(self.media_queries.read_with(&guard).to_css_string())
+    /// <https://drafts.csswg.org/cssom/#parse-a-media-query-list>
+    pub(crate) fn parse_media_list(value: &str, window: &Window) -> StyleMediaList {
+        if value.is_empty() {
+            return StyleMediaList::empty();
+        }
+        let mut input = ParserInput::new(value);
+        let mut parser = Parser::new(&mut input);
+        let url_data = UrlExtraData(window.get_url().get_arc());
+        let quirks_mode = window.Document().quirks_mode();
+        // FIXME(emilio): This looks somewhat fishy, since we use the context
+        // only to parse the media query list, CssRuleType::Media doesn't make
+        // much sense.
+        let context = ParserContext::new(
+            Origin::Author,
+            &url_data,
+            Some(CssRuleType::Media),
+            ParsingMode::DEFAULT,
+            quirks_mode,
+            /* namespaces = */ Default::default(),
+            window.css_error_reporter(),
+            None,
+        );
+        StyleMediaList::parse(&context, &mut parser)
     }
 
-    /// <https://drafts.csswg.org/cssom/#dom-medialist-mediatext>
-    fn SetMediaText(&self, value: DOMString) {
-        let mut guard = self.shared_lock().write();
-        let media_queries = self.media_queries.write_with(&mut guard);
-        // Step 2
-        if value.is_empty() {
-            // Step 1
-            *media_queries = StyleMediaList::empty();
-            return;
-        }
-        // Step 3
-        let mut input = ParserInput::new(&value);
+    /// <https://drafts.csswg.org/cssom/#parse-a-media-query>
+    pub(crate) fn parse_media_query<'i>(
+        value: &'i str,
+        window: &Window,
+    ) -> Result<MediaQuery, ParseError<'i>> {
+        let mut input = ParserInput::new(value);
         let mut parser = Parser::new(&mut input);
-        let global = self.global();
-        let window = global.as_window();
         let url_data = UrlExtraData(window.get_url().get_arc());
         let quirks_mode = window.Document().quirks_mode();
         let context = ParserContext::new(
@@ -92,7 +104,28 @@ impl MediaListMethods for MediaList {
             window.css_error_reporter(),
             None,
         );
-        *media_queries = StyleMediaList::parse(&context, &mut parser);
+        MediaQuery::parse(&context, &mut parser)
+    }
+
+    pub(crate) fn clone_media_list(&self) -> StyleMediaList {
+        let guard = self.shared_lock().read();
+        self.media_queries.read_with(&guard).clone()
+    }
+}
+
+impl MediaListMethods<crate::DomTypeHolder> for MediaList {
+    /// <https://drafts.csswg.org/cssom/#dom-medialist-mediatext>
+    fn MediaText(&self) -> DOMString {
+        let guard = self.shared_lock().read();
+        DOMString::from(self.media_queries.read_with(&guard).to_css_string())
+    }
+
+    /// <https://drafts.csswg.org/cssom/#dom-medialist-mediatext>
+    fn SetMediaText(&self, value: DOMString) {
+        let global = self.global();
+        let mut guard = self.shared_lock().write();
+        let media_queries = self.media_queries.write_with(&mut guard);
+        *media_queries = Self::parse_media_list(&value, global.as_window());
     }
 
     // https://drafts.csswg.org/cssom/#dom-medialist-length
@@ -119,23 +152,8 @@ impl MediaListMethods for MediaList {
     /// <https://drafts.csswg.org/cssom/#dom-medialist-appendmedium>
     fn AppendMedium(&self, medium: DOMString) {
         // Step 1
-        let mut input = ParserInput::new(&medium);
-        let mut parser = Parser::new(&mut input);
         let global = self.global();
-        let win = global.as_window();
-        let url_data = UrlExtraData(win.get_url().get_arc());
-        let quirks_mode = win.Document().quirks_mode();
-        let context = ParserContext::new(
-            Origin::Author,
-            &url_data,
-            Some(CssRuleType::Media),
-            ParsingMode::DEFAULT,
-            quirks_mode,
-            /* namespaces = */ Default::default(),
-            win.css_error_reporter(),
-            None,
-        );
-        let m = MediaQuery::parse(&context, &mut parser);
+        let m = Self::parse_media_query(&medium, global.as_window());
         // Step 2
         if m.is_err() {
             return;
@@ -158,23 +176,8 @@ impl MediaListMethods for MediaList {
     /// <https://drafts.csswg.org/cssom/#dom-medialist-deletemedium>
     fn DeleteMedium(&self, medium: DOMString) {
         // Step 1
-        let mut input = ParserInput::new(&medium);
-        let mut parser = Parser::new(&mut input);
         let global = self.global();
-        let win = global.as_window();
-        let url_data = UrlExtraData(win.get_url().get_arc());
-        let quirks_mode = win.Document().quirks_mode();
-        let context = ParserContext::new(
-            Origin::Author,
-            &url_data,
-            Some(CssRuleType::Media),
-            ParsingMode::DEFAULT,
-            quirks_mode,
-            /* namespaces = */ Default::default(),
-            win.css_error_reporter(),
-            None,
-        );
-        let m = MediaQuery::parse(&context, &mut parser);
+        let m = Self::parse_media_query(&medium, global.as_window());
         // Step 2
         if m.is_err() {
             return;

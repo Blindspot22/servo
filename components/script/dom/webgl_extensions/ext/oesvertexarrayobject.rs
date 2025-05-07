@@ -9,13 +9,14 @@ use super::{WebGLExtension, WebGLExtensionSpec, WebGLExtensions};
 use crate::dom::bindings::codegen::Bindings::OESVertexArrayObjectBinding::{
     OESVertexArrayObjectConstants, OESVertexArrayObjectMethods,
 };
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
+use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::webglrenderingcontext::WebGLRenderingContext;
 use crate::dom::webglvertexarrayobjectoes::WebGLVertexArrayObjectOES;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct OESVertexArrayObject {
+pub(crate) struct OESVertexArrayObject {
     reflector_: Reflector,
     ctx: Dom<WebGLRenderingContext>,
 }
@@ -29,7 +30,7 @@ impl OESVertexArrayObject {
     }
 }
 
-impl OESVertexArrayObjectMethods for OESVertexArrayObject {
+impl OESVertexArrayObjectMethods<crate::DomTypeHolder> for OESVertexArrayObject {
     // https://www.khronos.org/registry/webgl/extensions/OES_vertex_array_object/
     fn CreateVertexArrayOES(&self) -> Option<DomRoot<WebGLVertexArrayObjectOES>> {
         self.ctx.create_vertex_array()
@@ -53,10 +54,11 @@ impl OESVertexArrayObjectMethods for OESVertexArrayObject {
 
 impl WebGLExtension for OESVertexArrayObject {
     type Extension = OESVertexArrayObject;
-    fn new(ctx: &WebGLRenderingContext) -> DomRoot<OESVertexArrayObject> {
+    fn new(ctx: &WebGLRenderingContext, can_gc: CanGc) -> DomRoot<OESVertexArrayObject> {
         reflect_dom_object(
             Box::new(OESVertexArrayObject::new_inherited(ctx)),
             &*ctx.global(),
+            can_gc,
         )
     }
 

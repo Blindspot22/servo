@@ -5,19 +5,20 @@
 use std::cell::Cell;
 
 use dom_struct::dom_struct;
+use script_bindings::codegen::InheritTypes::{
+    AudioNodeTypeId, AudioScheduledSourceNodeTypeId, EventTargetTypeId,
+};
 use servo_media::audio::graph::NodeId;
 use servo_media::audio::node::{
     AudioNodeInit, AudioNodeMessage, ChannelCountMode as ServoMediaChannelCountMode, ChannelInfo,
     ChannelInterpretation as ServoMediaChannelInterpretation,
 };
 
+use crate::conversions::Convert;
 use crate::dom::audioparam::AudioParam;
 use crate::dom::baseaudiocontext::BaseAudioContext;
 use crate::dom::bindings::codegen::Bindings::AudioNodeBinding::{
     AudioNodeMethods, AudioNodeOptions, ChannelCountMode, ChannelInterpretation,
-};
-use crate::dom::bindings::codegen::InheritTypes::{
-    AudioNodeTypeId, AudioScheduledSourceNodeTypeId, EventTargetTypeId,
 };
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::Castable;
@@ -27,10 +28,10 @@ use crate::dom::eventtarget::EventTarget;
 // 32 is the minimum required by the spec for createBuffer() and the deprecated
 // createScriptProcessor() and matches what is used by Blink and Gecko.
 // The limit protects against large memory allocations.
-pub const MAX_CHANNEL_COUNT: u32 = 32;
+pub(crate) const MAX_CHANNEL_COUNT: u32 = 32;
 
 #[dom_struct]
-pub struct AudioNode {
+pub(crate) struct AudioNode {
     eventtarget: EventTarget,
     #[ignore_malloc_size_of = "servo_media"]
     #[no_trace]
@@ -44,7 +45,7 @@ pub struct AudioNode {
 }
 
 impl AudioNode {
-    pub fn new_inherited(
+    pub(crate) fn new_inherited(
         node_type: AudioNodeInit,
         context: &BaseAudioContext,
         options: UnwrappedAudioNodeOptions,
@@ -56,8 +57,8 @@ impl AudioNode {
         }
         let ch = ChannelInfo {
             count: options.count as u8,
-            mode: options.mode.into(),
-            interpretation: options.interpretation.into(),
+            mode: options.mode.convert(),
+            interpretation: options.interpretation.convert(),
             context_channel_count: context.channel_count() as u8,
         };
         let node_id = context
@@ -74,7 +75,7 @@ impl AudioNode {
         ))
     }
 
-    pub fn new_inherited_for_id(
+    pub(crate) fn new_inherited_for_id(
         node_id: NodeId,
         context: &BaseAudioContext,
         options: UnwrappedAudioNodeOptions,
@@ -93,7 +94,7 @@ impl AudioNode {
         }
     }
 
-    pub fn message(&self, message: AudioNodeMessage) {
+    pub(crate) fn message(&self, message: AudioNodeMessage) {
         self.context
             .audio_context_impl()
             .lock()
@@ -101,12 +102,12 @@ impl AudioNode {
             .message_node(self.node_id, message);
     }
 
-    pub fn node_id(&self) -> NodeId {
+    pub(crate) fn node_id(&self) -> NodeId {
         self.node_id
     }
 }
 
-impl AudioNodeMethods for AudioNode {
+impl AudioNodeMethods<crate::DomTypeHolder> for AudioNode {
     // https://webaudio.github.io/web-audio-api/#dom-audionode-connect
     fn Connect(
         &self,
@@ -339,7 +340,7 @@ impl AudioNodeMethods for AudioNode {
         };
 
         self.channel_count_mode.set(value);
-        self.message(AudioNodeMessage::SetChannelMode(value.into()));
+        self.message(AudioNodeMessage::SetChannelMode(value.convert()));
         Ok(())
     }
 
@@ -362,14 +363,14 @@ impl AudioNodeMethods for AudioNode {
         };
 
         self.channel_interpretation.set(value);
-        self.message(AudioNodeMessage::SetChannelInterpretation(value.into()));
+        self.message(AudioNodeMessage::SetChannelInterpretation(value.convert()));
         Ok(())
     }
 }
 
-impl From<ChannelCountMode> for ServoMediaChannelCountMode {
-    fn from(mode: ChannelCountMode) -> Self {
-        match mode {
+impl Convert<ServoMediaChannelCountMode> for ChannelCountMode {
+    fn convert(self) -> ServoMediaChannelCountMode {
+        match self {
             ChannelCountMode::Max => ServoMediaChannelCountMode::Max,
             ChannelCountMode::Clamped_max => ServoMediaChannelCountMode::ClampedMax,
             ChannelCountMode::Explicit => ServoMediaChannelCountMode::Explicit,
@@ -377,17 +378,26 @@ impl From<ChannelCountMode> for ServoMediaChannelCountMode {
     }
 }
 
-impl From<ChannelInterpretation> for ServoMediaChannelInterpretation {
-    fn from(interpretation: ChannelInterpretation) -> Self {
-        match interpretation {
+impl Convert<ServoMediaChannelInterpretation> for ChannelInterpretation {
+    fn convert(self) -> ServoMediaChannelInterpretation {
+        match self {
             ChannelInterpretation::Discrete => ServoMediaChannelInterpretation::Discrete,
             ChannelInterpretation::Speakers => ServoMediaChannelInterpretation::Speakers,
         }
     }
 }
 
-impl AudioNodeOptions {
-    pub fn unwrap_or(
+pub(crate) trait AudioNodeOptionsHelper {
+    fn unwrap_or(
+        &self,
+        count: u32,
+        mode: ChannelCountMode,
+        interpretation: ChannelInterpretation,
+    ) -> UnwrappedAudioNodeOptions;
+}
+
+impl AudioNodeOptionsHelper for AudioNodeOptions {
+    fn unwrap_or(
         &self,
         count: u32,
         mode: ChannelCountMode,
@@ -403,10 +413,10 @@ impl AudioNodeOptions {
 
 /// Each node has a set of defaults, so this lets us work with them
 /// easily without having to deal with the Options
-pub struct UnwrappedAudioNodeOptions {
-    pub count: u32,
-    pub mode: ChannelCountMode,
-    pub interpretation: ChannelInterpretation,
+pub(crate) struct UnwrappedAudioNodeOptions {
+    pub(crate) count: u32,
+    pub(crate) mode: ChannelCountMode,
+    pub(crate) interpretation: ChannelInterpretation,
 }
 
 impl Default for UnwrappedAudioNodeOptions {

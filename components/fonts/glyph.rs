@@ -353,7 +353,7 @@ pub enum GlyphInfo<'a> {
     Detail(&'a GlyphStore, ByteIndex, u16),
 }
 
-impl<'a> GlyphInfo<'a> {
+impl GlyphInfo<'_> {
     pub fn id(self) -> GlyphId {
         match self {
             GlyphInfo::Simple(store, entry_i) => store.entry_buffer[entry_i.to_usize()].id(),
@@ -606,7 +606,7 @@ impl GlyphStore {
     pub fn iter_glyphs_for_byte_range(
         &self,
         range: &Range<ByteIndex>,
-    ) -> impl Iterator<Item = GlyphInfo> {
+    ) -> impl Iterator<Item = GlyphInfo> + use<'_> {
         if range.begin() >= self.len() {
             panic!("iter_glyphs_for_range: range.begin beyond length!");
         }
@@ -741,9 +741,10 @@ impl fmt::Debug for GlyphStore {
 }
 
 /// A single series of glyphs within a text run.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct GlyphRun {
     /// The glyphs.
+    #[conditional_malloc_size_of]
     pub glyph_store: Arc<GlyphStore>,
     /// The byte range of characters in the containing run.
     pub range: Range<ByteIndex>,

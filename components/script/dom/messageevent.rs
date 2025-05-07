@@ -5,8 +5,8 @@
 use dom_struct::dom_struct;
 use js::jsapi::Heap;
 use js::jsval::JSVal;
-use js::rust::{HandleObject, HandleValue};
-use servo_atoms::Atom;
+use js::rust::{HandleObject, HandleValue, MutableHandleValue};
+use stylo_atoms::Atom;
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::EventBinding::EventMethods;
@@ -14,12 +14,12 @@ use crate::dom::bindings::codegen::Bindings::MessageEventBinding;
 use crate::dom::bindings::codegen::Bindings::MessageEventBinding::MessageEventMethods;
 use crate::dom::bindings::codegen::UnionTypes::WindowProxyOrMessagePortOrServiceWorker;
 use crate::dom::bindings::error::Fallible;
+use crate::dom::bindings::frozenarray::CachedFrozenArray;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::reflect_dom_object_with_proto;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::trace::RootedTraceableBox;
-use crate::dom::bindings::utils::to_frozen_array;
 use crate::dom::event::Event;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
@@ -28,7 +28,7 @@ use crate::dom::serviceworker::ServiceWorker;
 use crate::dom::windowproxy::WindowProxy;
 use crate::script_runtime::{CanGc, JSContext};
 
-#[crown::unrooted_must_root_lint::must_root]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 #[derive(JSTraceable, MallocSizeOf)]
 enum SrcObject {
     WindowProxy(Dom<WindowProxy>),
@@ -37,7 +37,7 @@ enum SrcObject {
 }
 
 impl From<&WindowProxyOrMessagePortOrServiceWorker> for SrcObject {
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn from(src_object: &WindowProxyOrMessagePortOrServiceWorker) -> SrcObject {
         match src_object {
             WindowProxyOrMessagePortOrServiceWorker::WindowProxy(blob) => {
@@ -55,7 +55,7 @@ impl From<&WindowProxyOrMessagePortOrServiceWorker> for SrcObject {
 
 #[dom_struct]
 #[allow(non_snake_case)]
-pub struct MessageEvent {
+pub(crate) struct MessageEvent {
     event: Event,
     #[ignore_malloc_size_of = "mozjs"]
     data: Heap<JSVal>,
@@ -64,12 +64,12 @@ pub struct MessageEvent {
     lastEventId: DomRefCell<DOMString>,
     ports: DomRefCell<Vec<Dom<MessagePort>>>,
     #[ignore_malloc_size_of = "mozjs"]
-    frozen_ports: DomRefCell<Option<Heap<JSVal>>>,
+    frozen_ports: CachedFrozenArray,
 }
 
 #[allow(non_snake_case)]
 impl MessageEvent {
-    pub fn new_inherited(
+    pub(crate) fn new_inherited(
         origin: DOMString,
         source: Option<&WindowProxyOrMessagePortOrServiceWorker>,
         lastEventId: DOMString,
@@ -87,12 +87,12 @@ impl MessageEvent {
                     .map(|port| Dom::from_ref(&*port))
                     .collect(),
             ),
-            frozen_ports: DomRefCell::new(None),
+            frozen_ports: CachedFrozenArray::new(),
         }
     }
 
-    pub fn new_uninitialized(global: &GlobalScope) -> DomRoot<MessageEvent> {
-        Self::new_uninitialized_with_proto(global, None, CanGc::note())
+    pub(crate) fn new_uninitialized(global: &GlobalScope, can_gc: CanGc) -> DomRoot<MessageEvent> {
+        Self::new_uninitialized_with_proto(global, None, can_gc)
     }
 
     fn new_uninitialized_with_proto(
@@ -136,7 +136,7 @@ impl MessageEvent {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         global: &GlobalScope,
         type_: Atom,
         bubbles: bool,
@@ -146,6 +146,7 @@ impl MessageEvent {
         source: Option<&WindowProxyOrMessagePortOrServiceWorker>,
         lastEventId: DOMString,
         ports: Vec<DomRoot<MessagePort>>,
+        can_gc: CanGc,
     ) -> DomRoot<MessageEvent> {
         Self::new_with_proto(
             global,
@@ -158,7 +159,7 @@ impl MessageEvent {
             source,
             lastEventId,
             ports,
-            CanGc::note(),
+            can_gc,
         )
     }
 
@@ -193,13 +194,14 @@ impl MessageEvent {
         ev
     }
 
-    pub fn dispatch_jsval(
+    pub(crate) fn dispatch_jsval(
         target: &EventTarget,
         scope: &GlobalScope,
         message: HandleValue,
         origin: Option<&str>,
         source: Option<&WindowProxy>,
         ports: Vec<DomRoot<MessagePort>>,
+        can_gc: CanGc,
     ) {
         let messageevent = MessageEvent::new(
             scope,
@@ -215,11 +217,12 @@ impl MessageEvent {
                 .as_ref(),
             DOMString::new(),
             ports,
+            can_gc,
         );
-        messageevent.upcast::<Event>().fire(target);
+        messageevent.upcast::<Event>().fire(target, can_gc);
     }
 
-    pub fn dispatch_error(target: &EventTarget, scope: &GlobalScope) {
+    pub(crate) fn dispatch_error(target: &EventTarget, scope: &GlobalScope, can_gc: CanGc) {
         let init = MessageEventBinding::MessageEventInit::empty();
         let messageevent = MessageEvent::new(
             scope,
@@ -231,12 +234,13 @@ impl MessageEvent {
             init.source.as_ref(),
             init.lastEventId.clone(),
             init.ports.clone(),
+            can_gc,
         );
-        messageevent.upcast::<Event>().fire(target);
+        messageevent.upcast::<Event>().fire(target, can_gc);
     }
 }
 
-impl MessageEventMethods for MessageEvent {
+impl MessageEventMethods<crate::DomTypeHolder> for MessageEvent {
     /// <https://html.spec.whatwg.org/multipage/#messageevent>
     fn Constructor(
         global: &GlobalScope,
@@ -262,8 +266,8 @@ impl MessageEventMethods for MessageEvent {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-messageevent-data>
-    fn Data(&self, _cx: JSContext) -> JSVal {
-        self.data.get()
+    fn Data(&self, _cx: JSContext, mut retval: MutableHandleValue) {
+        retval.set(self.data.get())
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-messageevent-origin>
@@ -298,28 +302,19 @@ impl MessageEventMethods for MessageEvent {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-messageevent-ports>
-    fn Ports(&self, cx: JSContext) -> JSVal {
-        if let Some(ports) = &*self.frozen_ports.borrow() {
-            return ports.get();
-        }
-
-        let ports: Vec<DomRoot<MessagePort>> = self
-            .ports
-            .borrow()
-            .iter()
-            .map(|port| DomRoot::from_ref(&**port))
-            .collect();
-        let frozen_ports = to_frozen_array(ports.as_slice(), cx);
-
-        // Safety: need to create the Heap value in its final memory location before setting it.
-        *self.frozen_ports.borrow_mut() = Some(Heap::default());
-        self.frozen_ports
-            .borrow()
-            .as_ref()
-            .unwrap()
-            .set(frozen_ports);
-
-        frozen_ports
+    fn Ports(&self, cx: JSContext, can_gc: CanGc, retval: MutableHandleValue) {
+        self.frozen_ports.get_or_init(
+            || {
+                self.ports
+                    .borrow()
+                    .iter()
+                    .map(|port| DomRoot::from_ref(&**port))
+                    .collect()
+            },
+            cx,
+            retval,
+            can_gc,
+        );
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-messageevent-initmessageevent>
@@ -344,7 +339,7 @@ impl MessageEventMethods for MessageEvent {
             .into_iter()
             .map(|port| Dom::from_ref(&*port))
             .collect();
-        *self.frozen_ports.borrow_mut() = None;
+        self.frozen_ports.clear();
         self.event
             .init_event(Atom::from(type_), bubbles, cancelable);
     }

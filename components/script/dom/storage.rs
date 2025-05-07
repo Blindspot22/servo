@@ -2,28 +2,28 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use constellation_traits::ScriptToConstellationMessage;
 use dom_struct::dom_struct;
 use ipc_channel::ipc::IpcSender;
-use net_traits::storage_thread::{StorageThreadMsg, StorageType};
 use net_traits::IpcSend;
+use net_traits::storage_thread::{StorageThreadMsg, StorageType};
 use profile_traits::ipc;
-use script_traits::ScriptMsg;
 use servo_url::ServoUrl;
 
 use crate::dom::bindings::codegen::Bindings::StorageBinding::StorageMethods;
 use crate::dom::bindings::error::{Error, ErrorResult};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
+use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::storageevent::StorageEvent;
 use crate::dom::window::Window;
-use crate::task_source::TaskSource;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct Storage {
+pub(crate) struct Storage {
     reflector_: Reflector,
     #[no_trace]
     storage_type: StorageType,
@@ -37,8 +37,16 @@ impl Storage {
         }
     }
 
-    pub fn new(global: &Window, storage_type: StorageType) -> DomRoot<Storage> {
-        reflect_dom_object(Box::new(Storage::new_inherited(storage_type)), global)
+    pub(crate) fn new(
+        global: &Window,
+        storage_type: StorageType,
+        can_gc: CanGc,
+    ) -> DomRoot<Storage> {
+        reflect_dom_object(
+            Box::new(Storage::new_inherited(storage_type)),
+            global,
+            can_gc,
+        )
     }
 
     fn get_url(&self) -> ServoUrl {
@@ -50,7 +58,7 @@ impl Storage {
     }
 }
 
-impl StorageMethods for Storage {
+impl StorageMethods<crate::DomTypeHolder> for Storage {
     // https://html.spec.whatwg.org/multipage/#dom-storage-length
     fn Length(&self) -> u32 {
         let (sender, receiver) = ipc::channel(self.global().time_profiler_chan().clone()).unwrap();
@@ -187,7 +195,9 @@ impl Storage {
     ) {
         let storage = self.storage_type;
         let url = self.get_url();
-        let msg = ScriptMsg::BroadcastStorageEvent(storage, url, key, old_value, new_value);
+        let msg = ScriptToConstellationMessage::BroadcastStorageEvent(
+            storage, url, key, old_value, new_value,
+        );
         self.global()
             .script_to_constellation_chan()
             .send(msg)
@@ -195,7 +205,7 @@ impl Storage {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#send-a-storage-notification>
-    pub fn queue_storage_event(
+    pub(crate) fn queue_storage_event(
         &self,
         url: ServoUrl,
         key: Option<String>,
@@ -204,29 +214,24 @@ impl Storage {
     ) {
         let global = self.global();
         let this = Trusted::new(self);
-        global
-            .as_window()
-            .task_manager()
-            .dom_manipulation_task_source()
-            .queue(
-                task!(send_storage_notification: move || {
-                    let this = this.root();
-                    let global = this.global();
-                    let event = StorageEvent::new(
-                        global.as_window(),
-                        atom!("storage"),
-                        EventBubbles::DoesNotBubble,
-                        EventCancelable::NotCancelable,
-                        key.map(DOMString::from),
-                        old_value.map(DOMString::from),
-                        new_value.map(DOMString::from),
-                        DOMString::from(url.into_string()),
-                        Some(&this),
-                    );
-                    event.upcast::<Event>().fire(global.upcast());
-                }),
-                global.upcast(),
-            )
-            .unwrap();
+        global.task_manager().dom_manipulation_task_source().queue(
+            task!(send_storage_notification: move || {
+                let this = this.root();
+                let global = this.global();
+                let event = StorageEvent::new(
+                    global.as_window(),
+                    atom!("storage"),
+                    EventBubbles::DoesNotBubble,
+                    EventCancelable::NotCancelable,
+                    key.map(DOMString::from),
+                    old_value.map(DOMString::from),
+                    new_value.map(DOMString::from),
+                    DOMString::from(url.into_string()),
+                    Some(&this),
+                    CanGc::note()
+                );
+                event.upcast::<Event>().fire(global.upcast(), CanGc::note());
+            }),
+        );
     }
 }

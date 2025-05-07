@@ -9,7 +9,7 @@ use crate::dom::bindings::codegen::Bindings::DOMPointBinding::{DOMPointInit, DOM
 use crate::dom::bindings::codegen::Bindings::DOMQuadBinding::{DOMQuadInit, DOMQuadMethods};
 use crate::dom::bindings::codegen::Bindings::DOMRectReadOnlyBinding::DOMRectInit;
 use crate::dom::bindings::error::Fallible;
-use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomObject, Reflector};
+use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object_with_proto};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::dompoint::DOMPoint;
 use crate::dom::domrect::DOMRect;
@@ -18,7 +18,7 @@ use crate::script_runtime::CanGc;
 
 /// <https://drafts.fxtf.org/geometry/#DOMQuad>
 #[dom_struct]
-pub struct DOMQuad {
+pub(crate) struct DOMQuad {
     reflector_: Reflector,
     p1: Dom<DOMPoint>,
     p2: Dom<DOMPoint>,
@@ -37,14 +37,15 @@ impl DOMQuad {
         }
     }
 
-    pub fn new(
+    pub(crate) fn new(
         global: &GlobalScope,
         p1: &DOMPoint,
         p2: &DOMPoint,
         p3: &DOMPoint,
         p4: &DOMPoint,
+        can_gc: CanGc,
     ) -> DomRoot<DOMQuad> {
-        Self::new_with_proto(global, None, p1, p2, p3, p4, CanGc::note())
+        Self::new_with_proto(global, None, p1, p2, p3, p4, can_gc)
     }
 
     fn new_with_proto(
@@ -65,7 +66,7 @@ impl DOMQuad {
     }
 }
 
-impl DOMQuadMethods for DOMQuad {
+impl DOMQuadMethods<crate::DomTypeHolder> for DOMQuad {
     // https://drafts.fxtf.org/geometry/#dom-domquad-domquad
     fn Constructor(
         global: &GlobalScope,
@@ -79,39 +80,42 @@ impl DOMQuadMethods for DOMQuad {
         Ok(DOMQuad::new_with_proto(
             global,
             proto,
-            &DOMPoint::new_from_init(global, p1),
-            &DOMPoint::new_from_init(global, p2),
-            &DOMPoint::new_from_init(global, p3),
-            &DOMPoint::new_from_init(global, p4),
+            &DOMPoint::new_from_init(global, p1, can_gc),
+            &DOMPoint::new_from_init(global, p2, can_gc),
+            &DOMPoint::new_from_init(global, p3, can_gc),
+            &DOMPoint::new_from_init(global, p4, can_gc),
             can_gc,
         ))
     }
 
     // https://drafts.fxtf.org/geometry/#dom-domquad-fromrect
-    fn FromRect(global: &GlobalScope, other: &DOMRectInit) -> DomRoot<DOMQuad> {
+    fn FromRect(global: &GlobalScope, other: &DOMRectInit, can_gc: CanGc) -> DomRoot<DOMQuad> {
         DOMQuad::new(
             global,
-            &DOMPoint::new(global, other.x, other.y, 0f64, 1f64),
-            &DOMPoint::new(global, other.x + other.width, other.y, 0f64, 1f64),
+            &DOMPoint::new(global, other.x, other.y, 0f64, 1f64, can_gc),
+            &DOMPoint::new(global, other.x + other.width, other.y, 0f64, 1f64, can_gc),
             &DOMPoint::new(
                 global,
                 other.x + other.width,
                 other.y + other.height,
                 0f64,
                 1f64,
+                can_gc,
             ),
-            &DOMPoint::new(global, other.x, other.y + other.height, 0f64, 1f64),
+            &DOMPoint::new(global, other.x, other.y + other.height, 0f64, 1f64, can_gc),
+            can_gc,
         )
     }
 
     // https://drafts.fxtf.org/geometry/#dom-domquad-fromquad
-    fn FromQuad(global: &GlobalScope, other: &DOMQuadInit) -> DomRoot<DOMQuad> {
+    fn FromQuad(global: &GlobalScope, other: &DOMQuadInit, can_gc: CanGc) -> DomRoot<DOMQuad> {
         DOMQuad::new(
             global,
-            &DOMPoint::new_from_init(global, &other.p1),
-            &DOMPoint::new_from_init(global, &other.p2),
-            &DOMPoint::new_from_init(global, &other.p3),
-            &DOMPoint::new_from_init(global, &other.p4),
+            &DOMPoint::new_from_init(global, &other.p1, can_gc),
+            &DOMPoint::new_from_init(global, &other.p2, can_gc),
+            &DOMPoint::new_from_init(global, &other.p3, can_gc),
+            &DOMPoint::new_from_init(global, &other.p4, can_gc),
+            can_gc,
         )
     }
 
@@ -136,7 +140,7 @@ impl DOMQuadMethods for DOMQuad {
     }
 
     // https://drafts.fxtf.org/geometry/#dom-domquad-getbounds
-    fn GetBounds(&self) -> DomRoot<DOMRect> {
+    fn GetBounds(&self, can_gc: CanGc) -> DomRoot<DOMRect> {
         // https://drafts.fxtf.org/geometry/#nan-safe-minimum
         let nan_safe_minimum = |a: f64, b: f64| {
             if a.is_nan() || b.is_nan() {
@@ -195,7 +199,7 @@ impl DOMQuadMethods for DOMQuad {
             top,
             right - left,
             bottom - top,
-            CanGc::note(),
+            can_gc,
         )
     }
 }

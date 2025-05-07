@@ -138,11 +138,11 @@ class MachCommands(CommandBase):
                 if rv:
                     return rv
 
-            if sys.platform == "win32":
+            if "windows" in target_triple:
                 if not copy_windows_dlls_to_build_directory(built_binary, self.target):
                     status = 1
 
-            elif sys.platform == "darwin":
+            elif "darwin" in target_triple:
                 servo_bin_dir = os.path.dirname(built_binary)
                 assert os.path.exists(servo_bin_dir)
 
@@ -175,7 +175,7 @@ class MachCommands(CommandBase):
         return status
 
     @Command('clean',
-             description='Clean the target/ and python/_venv[version]/ directories',
+             description='Clean the target/ and Python virtual environment directories',
              category='build')
     @CommandArgument('--manifest-path',
                      default=None,
@@ -188,8 +188,7 @@ class MachCommands(CommandBase):
     def clean(self, manifest_path=None, params=[], verbose=False):
         self.ensure_bootstrapped()
 
-        virtualenv_fname = '_venv%d.%d' % (sys.version_info[0], sys.version_info[1])
-        virtualenv_path = path.join(self.get_top_dir(), 'python', virtualenv_fname)
+        virtualenv_path = path.join(self.get_top_dir(), '.venv')
         if path.exists(virtualenv_path):
             print('Removing virtualenv directory: %s' % virtualenv_path)
             shutil.rmtree(virtualenv_path)

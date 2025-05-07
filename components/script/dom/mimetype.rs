@@ -11,11 +11,11 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::plugin::Plugin;
 
 #[dom_struct]
-pub struct MimeType {
+pub(crate) struct MimeType {
     reflector_: Reflector,
 }
 
-impl MimeTypeMethods for MimeType {
+impl MimeTypeMethods<crate::DomTypeHolder> for MimeType {
     // https://html.spec.whatwg.org/multipage/#dom-mimetype-type
     fn Type(&self) -> DOMString {
         unreachable!()

@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
-use html5ever::{local_name, namespace_url, ns, LocalName, Prefix};
+use html5ever::{LocalName, Prefix, local_name, ns};
 use js::rust::HandleObject;
 
 use crate::dom::bindings::cell::DomRefCell;
@@ -15,10 +15,11 @@ use crate::dom::document::Document;
 use crate::dom::element::Element;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::htmlelement::HTMLElement;
-use crate::dom::node::{window_from_node, Node};
+use crate::dom::node::{Node, NodeTraits};
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct HTMLDialogElement {
+pub(crate) struct HTMLDialogElement {
     htmlelement: HTMLElement,
     return_value: DomRefCell<DOMString>,
 }
@@ -35,12 +36,13 @@ impl HTMLDialogElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLDialogElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLDialogElement::new_inherited(
@@ -48,11 +50,12 @@ impl HTMLDialogElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 }
 
-impl HTMLDialogElementMethods for HTMLDialogElement {
+impl HTMLDialogElementMethods<crate::DomTypeHolder> for HTMLDialogElement {
     // https://html.spec.whatwg.org/multipage/#dom-dialog-open
     make_bool_getter!(Open, "open");
 
@@ -71,7 +74,7 @@ impl HTMLDialogElementMethods for HTMLDialogElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-dialog-show>
-    fn Show(&self) {
+    fn Show(&self, can_gc: CanGc) {
         let element = self.upcast::<Element>();
 
         // Step 1 TODO: Check is modal flag is false
@@ -82,7 +85,7 @@ impl HTMLDialogElementMethods for HTMLDialogElement {
         // TODO: Step 2 If this has an open attribute, then throw an "InvalidStateError" DOMException.
 
         // Step 3
-        element.set_bool_attribute(&local_name!("open"), true);
+        element.set_bool_attribute(&local_name!("open"), true, can_gc);
 
         // TODO: Step 4 Set this's previously focused element to the focused element.
 
@@ -96,14 +99,13 @@ impl HTMLDialogElementMethods for HTMLDialogElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-dialog-close
-    fn Close(&self, return_value: Option<DOMString>) {
+    fn Close(&self, return_value: Option<DOMString>, can_gc: CanGc) {
         let element = self.upcast::<Element>();
         let target = self.upcast::<EventTarget>();
-        let win = window_from_node(self);
 
         // Step 1 & 2
         if element
-            .remove_attribute(&ns!(), &local_name!("open"))
+            .remove_attribute(&ns!(), &local_name!("open"), can_gc)
             .is_none()
         {
             return;
@@ -117,8 +119,9 @@ impl HTMLDialogElementMethods for HTMLDialogElement {
         // TODO: Step 4 implement pending dialog stack removal
 
         // Step 5
-        win.task_manager()
+        self.owner_global()
+            .task_manager()
             .dom_manipulation_task_source()
-            .queue_simple_event(target, atom!("close"), &win);
+            .queue_simple_event(target, atom!("close"));
     }
 }

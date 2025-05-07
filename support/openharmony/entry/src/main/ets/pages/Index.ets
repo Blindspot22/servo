@@ -17,6 +17,7 @@ interface InitOpts {
   deviceType: string,
   osFullName: string,
   resourceDir: string,
+  cacheDir: string,
   displayDensity: number,
   commandlineArgs: string,
 }
@@ -67,6 +68,13 @@ struct Index {
   @LocalStorageProp('CommandlineArgs') CommandlineArgs: string = ""
   @State urlToLoad: string = this.InitialURI
 
+  // Called when the user swipes from the right or left edge to the middle
+  // Default behavior is bringing the app to the background.
+  onBackPress(): boolean | void {
+    this.xComponentContext?.goBack()
+    return true;
+  }
+
   build() {
     Column() {
       Row() {
@@ -76,7 +84,7 @@ struct Index {
           .width('12%')
           .fontSize(12)
           .onClick(()=>{
-            this.xComponentContext?.goBack()
+            this.onBackPress()
           })
         Button('⇨').backgroundColor(Color.White)
           .fontColor(Color.Black)
@@ -102,13 +110,16 @@ struct Index {
         .onLoad((xComponentContext) => {
           this.xComponentContext = xComponentContext as ServoXComponentInterface;
           let resource_dir: string = this.context.resourceDir;
-          console.debug("Resources are located at %{public}s", resource_dir);
+          let cache_dir: string = this.context.cacheDir;
+          console.debug("resourceDir: ", resource_dir);
+          console.debug("cacheDir: ", cache_dir);
           let init_options: InitOpts = {
             url: this.urlToLoad,
             deviceType: get_device_type(),
             osFullName: deviceInfo.osFullName,
             displayDensity: get_density(),
             resourceDir: resource_dir,
+            cacheDir: cache_dir,
             commandlineArgs: this.CommandlineArgs
           }
           this.xComponentContext.initServo(init_options)

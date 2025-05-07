@@ -8,19 +8,19 @@
 //! active_workers map
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
 use base::id::{PipelineNamespace, ServiceWorkerId, ServiceWorkerRegistrationId};
-use crossbeam_channel::{select, unbounded, Receiver, RecvError, Sender};
-use ipc_channel::ipc::{self, IpcSender};
-use ipc_channel::router::ROUTER;
-use net_traits::{CoreResourceMsg, CustomResponseMediator};
-use script_traits::{
+use constellation_traits::{
     DOMMessage, Job, JobError, JobResult, JobResultValue, JobType, SWManagerMsg, SWManagerSenders,
     ScopeThings, ServiceWorkerManagerFactory, ServiceWorkerMsg,
 };
+use crossbeam_channel::{Receiver, RecvError, Sender, select, unbounded};
+use ipc_channel::ipc::{self, IpcSender};
+use ipc_channel::router::ROUTER;
+use net_traits::{CoreResourceMsg, CustomResponseMediator};
 use servo_config::pref;
 use servo_url::{ImmutableOrigin, ServoUrl};
 
@@ -29,7 +29,7 @@ use crate::dom::serviceworkerglobalscope::{
     ServiceWorkerControlMsg, ServiceWorkerGlobalScope, ServiceWorkerScriptMsg,
 };
 use crate::dom::serviceworkerregistration::longest_prefix_match;
-use crate::script_runtime::{CanGc, ThreadSafeJSContext};
+use crate::script_runtime::ThreadSafeJSContext;
 
 enum Message {
     FromResource(CustomResponseMediator),
@@ -38,13 +38,13 @@ enum Message {
 
 /// <https://w3c.github.io/ServiceWorker/#dfn-service-worker>
 #[derive(Clone)]
-struct ServiceWorker {
+pub(crate) struct ServiceWorker {
     /// A unique identifer.
-    pub id: ServiceWorkerId,
+    pub(crate) id: ServiceWorkerId,
     /// <https://w3c.github.io/ServiceWorker/#dfn-script-url>
-    pub script_url: ServoUrl,
+    pub(crate) script_url: ServoUrl,
     /// A sender to the running service worker scope.
-    pub sender: Sender<ServiceWorkerScriptMsg>,
+    pub(crate) sender: Sender<ServiceWorkerScriptMsg>,
 }
 
 impl ServiceWorker {
@@ -64,7 +64,10 @@ impl ServiceWorker {
     fn forward_dom_message(&self, msg: DOMMessage) {
         let DOMMessage { origin, data } = msg;
         let _ = self.sender.send(ServiceWorkerScriptMsg::CommonWorker(
-            WorkerScriptMsg::DOMMessage { origin, data },
+            WorkerScriptMsg::DOMMessage {
+                origin,
+                data: Box::new(data),
+            },
         ));
     }
 
@@ -140,7 +143,7 @@ struct ServiceWorkerRegistration {
 }
 
 impl ServiceWorkerRegistration {
-    pub fn new() -> ServiceWorkerRegistration {
+    pub(crate) fn new() -> ServiceWorkerRegistration {
         ServiceWorkerRegistration {
             id: ServiceWorkerRegistrationId::new(),
             active_worker: None,
@@ -241,7 +244,7 @@ impl ServiceWorkerManager {
         }
     }
 
-    pub fn get_matching_scope(&self, load_url: &ServoUrl) -> Option<ServoUrl> {
+    pub(crate) fn get_matching_scope(&self, load_url: &ServoUrl) -> Option<ServoUrl> {
         for scope in self.registrations.keys() {
             if longest_prefix_match(scope, load_url) {
                 return Some(scope.clone());
@@ -250,12 +253,10 @@ impl ServiceWorkerManager {
         None
     }
 
-    fn handle_message(&mut self, can_gc: CanGc) {
+    fn handle_message(&mut self) {
         while let Ok(message) = self.receive_message() {
             let should_continue = match message {
-                Message::FromConstellation(msg) => {
-                    self.handle_message_from_constellation(*msg, can_gc)
-                },
+                Message::FromConstellation(msg) => self.handle_message_from_constellation(*msg),
                 Message::FromResource(msg) => self.handle_message_from_resource(msg),
             };
             if !should_continue {
@@ -290,7 +291,7 @@ impl ServiceWorkerManager {
         }
     }
 
-    fn handle_message_from_constellation(&mut self, msg: ServiceWorkerMsg, can_gc: CanGc) -> bool {
+    fn handle_message_from_constellation(&mut self, msg: ServiceWorkerMsg) -> bool {
         match msg {
             ServiceWorkerMsg::Timeout(_scope) => {
                 // TODO: https://w3c.github.io/ServiceWorker/#terminate-service-worker
@@ -307,7 +308,7 @@ impl ServiceWorkerManager {
                     self.handle_register_job(job);
                 },
                 JobType::Update => {
-                    self.handle_update_job(job, can_gc);
+                    self.handle_update_job(job);
                 },
                 JobType::Unregister => {
                     // TODO: https://w3c.github.io/ServiceWorker/#unregister-algorithm
@@ -320,7 +321,7 @@ impl ServiceWorkerManager {
 
     /// <https://w3c.github.io/ServiceWorker/#register-algorithm>
     fn handle_register_job(&mut self, mut job: Job) {
-        if !job.script_url.is_origin_trustworthy() {
+        if !job.script_url.origin().is_potentially_trustworthy() {
             // Step 1.1
             let _ = job
                 .client
@@ -382,7 +383,7 @@ impl ServiceWorkerManager {
     }
 
     /// <https://w3c.github.io/ServiceWorker/#update>
-    fn handle_update_job(&mut self, job: Job, can_gc: CanGc) {
+    fn handle_update_job(&mut self, job: Job) {
         // Step 1: Get registation
         if let Some(registration) = self.registrations.get_mut(&job.scope_url) {
             // Step 3.
@@ -405,12 +406,8 @@ impl ServiceWorkerManager {
 
             // Very roughly steps 5 to 18.
             // TODO: implement all steps precisely.
-            let (new_worker, join_handle, control_sender, context, closing) = update_serviceworker(
-                self.own_sender.clone(),
-                job.scope_url.clone(),
-                scope_things,
-                can_gc,
-            );
+            let (new_worker, join_handle, control_sender, context, closing) =
+                update_serviceworker(self.own_sender.clone(), job.scope_url.clone(), scope_things);
 
             // Since we've just started the worker thread, ensure we can shut it down later.
             registration.note_worker_thread(join_handle, control_sender, context, closing);
@@ -449,7 +446,6 @@ fn update_serviceworker(
     own_sender: IpcSender<ServiceWorkerMsg>,
     scope_url: ServoUrl,
     scope_things: ScopeThings,
-    can_gc: CanGc,
 ) -> (
     ServiceWorker,
     JoinHandle<()>,
@@ -475,7 +471,6 @@ fn update_serviceworker(
         control_receiver,
         context_sender,
         closing.clone(),
-        can_gc,
     );
 
     let context = context_receiver
@@ -512,7 +507,7 @@ impl ServiceWorkerManagerFactory for ServiceWorkerManager {
                 resource_port,
                 constellation_sender,
             )
-            .handle_message(CanGc::note())
+            .handle_message()
         };
         if thread::Builder::new()
             .name("SvcWorkerManager".to_owned())
@@ -524,6 +519,6 @@ impl ServiceWorkerManagerFactory for ServiceWorkerManager {
     }
 }
 
-pub fn serviceworker_enabled() -> bool {
-    pref!(dom.serviceworker.enabled)
+pub(crate) fn serviceworker_enabled() -> bool {
+    pref!(dom_serviceworker_enabled)
 }

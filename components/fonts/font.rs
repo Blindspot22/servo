@@ -61,6 +61,15 @@ static TEXT_SHAPING_PERFORMANCE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 // resources needed by the graphics layer to draw glyphs.
 
 pub trait PlatformFontMethods: Sized {
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "PlatformFontMethods::new_from_template",
+            skip_all,
+            fields(servo_profiling = true),
+            level = "trace",
+        )
+    )]
     fn new_from_template(
         template: FontTemplateRef,
         pt_size: Option<Au>,
@@ -543,10 +552,10 @@ impl Font {
         self.handle.typographic_bounds(glyph_id)
     }
 
-    #[allow(unsafe_code)]
-    pub fn get_baseline(&self) -> Option<FontBaseline> {
+    /// Get the [`FontBaseline`] for this font.
+    pub fn baseline(&self) -> Option<FontBaseline> {
         let this = self as *const Font;
-        unsafe { self.shaper.get_or_init(|| Shaper::new(this)).get_baseline() }
+        self.shaper.get_or_init(|| Shaper::new(this)).baseline()
     }
 }
 
@@ -559,8 +568,6 @@ pub type FontRef = Arc<Font>;
 pub struct FontGroup {
     descriptor: FontDescriptor,
     families: SmallVec<[FontGroupFamily; 8]>,
-    #[ignore_malloc_size_of = "This measured in the FontContext font cache."]
-    last_matching_fallback: Option<FontRef>,
 }
 
 impl FontGroup {
@@ -575,7 +582,6 @@ impl FontGroup {
         FontGroup {
             descriptor,
             families,
-            last_matching_fallback: None,
         }
     }
 
@@ -588,6 +594,7 @@ impl FontGroup {
         font_context: &FontContext,
         codepoint: char,
         next_codepoint: Option<char>,
+        first_fallback: Option<FontRef>,
     ) -> Option<FontRef> {
         // Tab characters are converted into spaces when rendering.
         // TODO: We should not render a tab character. Instead they should be converted into tab stops
@@ -612,10 +619,10 @@ impl FontGroup {
             // Do not select this font if it goes against our emoji preference.
             match options.presentation_preference {
                 EmojiPresentationPreference::Text if font.has_color_bitmap_or_colr_table() => {
-                    return false
+                    return false;
                 },
                 EmojiPresentationPreference::Emoji if !font.has_color_bitmap_or_colr_table() => {
-                    return false
+                    return false;
                 },
                 _ => {},
             }
@@ -633,11 +640,11 @@ impl FontGroup {
             return font_or_synthesized_small_caps(font);
         }
 
-        if let Some(ref last_matching_fallback) = self.last_matching_fallback {
-            if char_in_template(last_matching_fallback.template.clone()) &&
-                font_has_glyph_and_presentation(last_matching_fallback)
+        if let Some(ref first_fallback) = first_fallback {
+            if char_in_template(first_fallback.template.clone()) &&
+                font_has_glyph_and_presentation(first_fallback)
             {
-                return font_or_synthesized_small_caps(last_matching_fallback.clone());
+                return font_or_synthesized_small_caps(first_fallback.clone());
             }
         }
 
@@ -647,7 +654,6 @@ impl FontGroup {
             char_in_template,
             font_has_glyph_and_presentation,
         ) {
-            self.last_matching_fallback = Some(font.clone());
             return font_or_synthesized_small_caps(font);
         }
 

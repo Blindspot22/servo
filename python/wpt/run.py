@@ -18,7 +18,7 @@ from typing import List, NamedTuple, Optional, Union
 import mozlog
 import mozlog.formatters
 
-from . import SERVO_ROOT, WPT_PATH, WPT_TOOLS_PATH, update_args_for_legacy_layout
+from . import SERVO_ROOT, WPT_PATH, WPT_TOOLS_PATH
 from .grouping_formatter import (
     ServoFormatter, ServoHandler,
     UnexpectedResult, UnexpectedSubtestResult
@@ -28,9 +28,9 @@ from wptrunner import wptrunner
 
 
 CERTS_PATH = os.path.join(WPT_TOOLS_PATH, "certs")
-TRACKER_API = "https://build.servo.org/intermittent-tracker"
+TRACKER_API = "https://intermittent-tracker.servo.org"
 TRACKER_API_ENV_VAR = "INTERMITTENT_TRACKER_API"
-TRACKER_DASHBOARD_SECRET_ENV_VAR = "INTERMITTENT_TRACKER_DASHBOARD_SECRET"
+TRACKER_DASHBOARD_SECRET_ENV_VAR = "INTERMITTENT_TRACKER_DASHBOARD_SECRET_PROD"
 TRACKER_DASHBOARD_MAXIMUM_OUTPUT_LENGTH = 1024
 
 
@@ -40,11 +40,7 @@ def set_if_none(args: dict, key: str, value):
 
 
 def run_tests(default_binary_path: str, **kwargs):
-    legacy_layout = kwargs.pop("legacy_layout")
-    message = f"Running WPT tests with {default_binary_path}"
-    if legacy_layout:
-        message += " (legacy layout)"
-    print(message)
+    print(f"Running WPT tests with {default_binary_path}")
 
     # By default, Rayon selects the number of worker threads based on the
     # available CPU count. This doesn't work very well when running tests on CI,
@@ -54,6 +50,11 @@ def run_tests(default_binary_path: str, **kwargs):
     os.environ["RAYON_RS_NUM_CPUS"] = "2"
     os.environ["RUST_BACKTRACE"] = "1"
     os.environ["HOST_FILE"] = os.path.join(SERVO_ROOT, "tests", "wpt", "hosts")
+
+    # The pytest framework used in the webdriver conformance tests dumps the
+    # environment variables when unexpected results occur, and this variable
+    # makes CI logs unreadable.
+    github_context = os.environ.pop("GITHUB_CONTEXT", None)
 
     set_if_none(kwargs, "product", "servo")
     set_if_none(kwargs, "config", os.path.join(WPT_PATH, "config.ini"))
@@ -87,13 +88,11 @@ def run_tests(default_binary_path: str, **kwargs):
     kwargs.setdefault("binary_args", [])
     if prefs:
         kwargs["binary_args"] += ["--pref=" + pref for pref in prefs]
-    if legacy_layout:
-        kwargs["binary_args"].append("--legacy-layout")
 
     if not kwargs.get("no_default_test_types"):
         test_types = {
             "servo": ["testharness", "reftest", "wdspec", "crashtest"],
-            "servodriver": ["testharness", "reftest"],
+            "servodriver": ["testharness", "reftest", "wdspec", "crashtest"],
         }
         product = kwargs.get("product") or "servo"
         kwargs["test_types"] = test_types[product]
@@ -103,9 +102,6 @@ def run_tests(default_binary_path: str, **kwargs):
     raw_log_outputs = kwargs.get("log_raw", [])
 
     wptcommandline.check_args(kwargs)
-
-    if legacy_layout:
-        update_args_for_legacy_layout(kwargs)
 
     mozlog.commandline.log_formatters["servo"] = (
         ServoFormatter,
@@ -150,6 +146,9 @@ def run_tests(default_binary_path: str, **kwargs):
         kwargs["include"] = unexpected_results_tests
         kwargs["pause_after_test"] = False
         wptrunner.run_tests(**kwargs)
+
+        if github_context:
+            os.environ["GITHUB_CONTEXT"] = github_context
 
         # Use the second run to mark tests from the first run as flaky, but
         # discard the results otherwise.
@@ -285,9 +284,9 @@ def filter_intermittents(
     unexpected_results: List[UnexpectedResult],
     output_path: str
 ) -> bool:
-    print(f"Filtering {len(unexpected_results)} "
-          "unexpected results for known intermittents")
     dashboard = TrackerDashboardFilter()
+    print(f"Filtering {len(unexpected_results)} "
+          f"unexpected results for known intermittents via <{dashboard.url}>")
     dashboard.report_failures(unexpected_results)
 
     def add_result(output, text, results: List[UnexpectedResult], filter_func) -> None:

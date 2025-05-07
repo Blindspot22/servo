@@ -3,25 +3,27 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::Cell;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use content_security_policy as csp;
 use dom_struct::dom_struct;
 use euclid::default::Size2D;
-use html5ever::{local_name, LocalName, Prefix};
+use html5ever::{LocalName, Prefix, local_name, ns};
 use ipc_channel::ipc;
-use ipc_channel::router::ROUTER;
 use js::rust::HandleObject;
 use net_traits::image_cache::{
-    ImageCache, ImageCacheResult, ImageOrMetadataAvailable, ImageResponse, PendingImageId,
-    UsePlaceholder,
+    ImageCache, ImageCacheResult, ImageOrMetadataAvailable, ImageResponder, ImageResponse,
+    PendingImageId, UsePlaceholder,
 };
-use net_traits::request::{CredentialsMode, Destination, RequestBuilder};
+use net_traits::request::{CredentialsMode, Destination, RequestBuilder, RequestId};
 use net_traits::{
-    CoreResourceMsg, FetchChannels, FetchMetadata, FetchResponseListener, FetchResponseMsg,
-    NetworkError, ResourceFetchTiming, ResourceTimingType,
+    FetchMetadata, FetchResponseListener, FetchResponseMsg, NetworkError, ResourceFetchTiming,
+    ResourceTimingType,
 };
+use script_layout_interface::{HTMLMediaData, MediaMetadata};
 use servo_media::player::video::VideoFrame;
 use servo_url::ServoUrl;
+use style::attr::{AttrValue, LengthOrPercentageOrAuto};
 
 use crate::document_loader::{LoadBlocker, LoadType};
 use crate::dom::attr::Attr;
@@ -29,35 +31,29 @@ use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::HTMLVideoElementBinding::HTMLVideoElementMethods;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
-use crate::dom::bindings::reflector::DomObject;
-use crate::dom::bindings::root::DomRoot;
+use crate::dom::bindings::reflector::DomGlobal;
+use crate::dom::bindings::root::{DomRoot, LayoutDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
-use crate::dom::element::{AttributeMutation, Element};
+use crate::dom::element::{AttributeMutation, Element, LayoutElementHelpers};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::htmlmediaelement::{HTMLMediaElement, ReadyState};
-use crate::dom::node::{document_from_node, window_from_node, Node};
+use crate::dom::node::{Node, NodeTraits};
 use crate::dom::performanceresourcetiming::InitiatorType;
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::fetch::FetchCanceller;
-use crate::image_listener::{generate_cache_listener_for_element, ImageCacheListener};
-use crate::network_listener::{self, NetworkListener, PreInvoke, ResourceTimingListener};
+use crate::network_listener::{self, PreInvoke, ResourceTimingListener};
 use crate::script_runtime::CanGc;
 
-const DEFAULT_WIDTH: u32 = 300;
-const DEFAULT_HEIGHT: u32 = 150;
-
 #[dom_struct]
-pub struct HTMLVideoElement {
+pub(crate) struct HTMLVideoElement {
     htmlmediaelement: HTMLMediaElement,
     /// <https://html.spec.whatwg.org/multipage/#dom-video-videowidth>
-    video_width: Cell<u32>,
+    video_width: Cell<Option<u32>>,
     /// <https://html.spec.whatwg.org/multipage/#dom-video-videoheight>
-    video_height: Cell<u32>,
+    video_height: Cell<Option<u32>>,
     /// Incremented whenever tasks associated with this element are cancelled.
     generation_id: Cell<u32>,
-    /// Poster frame fetch request canceller.
-    poster_frame_canceller: DomRefCell<FetchCanceller>,
     /// Load event blocker. Will block the load event while the poster frame
     /// is being fetched.
     load_blocker: DomRefCell<Option<LoadBlocker>>,
@@ -65,6 +61,8 @@ pub struct HTMLVideoElement {
     #[ignore_malloc_size_of = "VideoFrame"]
     #[no_trace]
     last_frame: DomRefCell<Option<VideoFrame>>,
+    /// Indicates if it has already sent a resize event for a given size
+    sent_resize: Cell<Option<(u32, u32)>>,
 }
 
 impl HTMLVideoElement {
@@ -75,21 +73,22 @@ impl HTMLVideoElement {
     ) -> HTMLVideoElement {
         HTMLVideoElement {
             htmlmediaelement: HTMLMediaElement::new_inherited(local_name, prefix, document),
-            video_width: Cell::new(DEFAULT_WIDTH),
-            video_height: Cell::new(DEFAULT_HEIGHT),
+            video_width: Cell::new(None),
+            video_height: Cell::new(None),
             generation_id: Cell::new(0),
-            poster_frame_canceller: DomRefCell::new(Default::default()),
             load_blocker: Default::default(),
             last_frame: Default::default(),
+            sent_resize: Cell::new(None),
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLVideoElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLVideoElement::new_inherited(
@@ -97,26 +96,46 @@ impl HTMLVideoElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 
-    pub fn get_video_width(&self) -> u32 {
+    pub(crate) fn get_video_width(&self) -> Option<u32> {
         self.video_width.get()
     }
 
-    pub fn set_video_width(&self, width: u32) {
-        self.video_width.set(width);
-    }
-
-    pub fn get_video_height(&self) -> u32 {
+    pub(crate) fn get_video_height(&self) -> Option<u32> {
         self.video_height.get()
     }
 
-    pub fn set_video_height(&self, height: u32) {
+    /// <https://html.spec.whatwg.org/multipage#event-media-resize>
+    pub(crate) fn resize(&self, width: Option<u32>, height: Option<u32>) -> Option<(u32, u32)> {
+        self.video_width.set(width);
         self.video_height.set(height);
+
+        let width = width?;
+        let height = height?;
+        if self.sent_resize.get() == Some((width, height)) {
+            return None;
+        }
+
+        let sent_resize = if self.htmlmediaelement.get_ready_state() == ReadyState::HaveNothing {
+            None
+        } else {
+            self.owner_global()
+                .task_manager()
+                .media_element_task_source()
+                .queue_simple_event(self.upcast(), atom!("resize"));
+            Some((width, height))
+        };
+
+        self.sent_resize.set(sent_resize);
+        sent_resize
     }
 
-    pub fn get_current_frame_data(&self) -> Option<(Option<ipc::IpcSharedMemory>, Size2D<u32>)> {
+    pub(crate) fn get_current_frame_data(
+        &self,
+    ) -> Option<(Option<ipc::IpcSharedMemory>, Size2D<u32>)> {
         let frame = self.htmlmediaelement.get_current_frame();
         if frame.is_some() {
             *self.last_frame.borrow_mut() = frame;
@@ -140,7 +159,6 @@ impl HTMLVideoElement {
     /// <https://html.spec.whatwg.org/multipage/#poster-frame>
     fn fetch_poster_frame(&self, poster_url: &str, can_gc: CanGc) {
         // Step 1.
-        let cancel_receiver = self.poster_frame_canceller.borrow_mut().initialize();
         self.generation_id.set(self.generation_id.get() + 1);
 
         // Step 2.
@@ -149,7 +167,7 @@ impl HTMLVideoElement {
         }
 
         // Step 3.
-        let poster_url = match document_from_node(self).url().join(poster_url) {
+        let poster_url = match self.owner_document().url().join(poster_url) {
             Ok(url) => url,
             Err(_) => return,
         };
@@ -157,100 +175,113 @@ impl HTMLVideoElement {
         // Step 4.
         // We use the image cache for poster frames so we save as much
         // network activity as possible.
-        let window = window_from_node(self);
+        let window = self.owner_window();
         let image_cache = window.image_cache();
-        let sender = generate_cache_listener_for_element(self);
-        let cache_result = image_cache.track_image(
+        let cache_result = image_cache.get_cached_image_status(
             poster_url.clone(),
             window.origin().immutable().clone(),
             None,
-            sender,
             UsePlaceholder::No,
         );
 
-        match cache_result {
+        let id = match cache_result {
             ImageCacheResult::Available(ImageOrMetadataAvailable::ImageAvailable {
                 image,
                 url,
                 ..
             }) => {
                 self.process_image_response(ImageResponse::Loaded(image, url), can_gc);
+                return;
             },
+            ImageCacheResult::Available(ImageOrMetadataAvailable::MetadataAvailable(_, id)) => id,
             ImageCacheResult::ReadyForRequest(id) => {
-                self.do_fetch_poster_frame(poster_url, id, cancel_receiver, can_gc)
+                self.do_fetch_poster_frame(poster_url, id, can_gc);
+                id
             },
-            _ => (),
-        }
+            ImageCacheResult::LoadError => {
+                self.process_image_response(ImageResponse::None, can_gc);
+                return;
+            },
+            ImageCacheResult::Pending(id) => id,
+        };
+
+        let trusted_node = Trusted::new(self);
+        let generation = self.generation_id();
+        let sender = window.register_image_cache_listener(id, move |response| {
+            let element = trusted_node.root();
+
+            // Ignore any image response for a previous request that has been discarded.
+            if generation != element.generation_id() {
+                return;
+            }
+            element.process_image_response(response.response, CanGc::note());
+        });
+
+        image_cache.add_listener(ImageResponder::new(sender, window.pipeline_id(), id));
     }
 
     /// <https://html.spec.whatwg.org/multipage/#poster-frame>
-    fn do_fetch_poster_frame(
-        &self,
-        poster_url: ServoUrl,
-        id: PendingImageId,
-        cancel_receiver: ipc::IpcReceiver<()>,
-        can_gc: CanGc,
-    ) {
+    fn do_fetch_poster_frame(&self, poster_url: ServoUrl, id: PendingImageId, can_gc: CanGc) {
         // Continuation of step 4.
-        let document = document_from_node(self);
-        let request = RequestBuilder::new(poster_url.clone(), document.global().get_referrer())
-            .destination(Destination::Image)
-            .credentials_mode(CredentialsMode::Include)
-            .use_url_credentials(true)
-            .origin(document.origin().immutable().clone())
-            .pipeline_id(Some(document.global().pipeline_id()));
-
+        let document = self.owner_document();
+        let request = RequestBuilder::new(
+            Some(document.webview_id()),
+            poster_url.clone(),
+            document.global().get_referrer(),
+        )
+        .destination(Destination::Image)
+        .credentials_mode(CredentialsMode::Include)
+        .use_url_credentials(true)
+        .origin(document.origin().immutable().clone())
+        .pipeline_id(Some(document.global().pipeline_id()))
+        .insecure_requests_policy(document.insecure_requests_policy())
+        .has_trustworthy_ancestor_origin(document.has_trustworthy_ancestor_origin())
+        .policy_container(document.policy_container().to_owned());
         // Step 5.
         // This delay must be independent from the ones created by HTMLMediaElement during
         // its media load algorithm, otherwise a code like
         // <video poster="poster.png"></video>
         // (which triggers no media load algorithm unless a explicit call to .load() is done)
         // will block the document's load event forever.
-        let mut blocker = self.load_blocker.borrow_mut();
-        LoadBlocker::terminate(&mut blocker, can_gc);
-        *blocker = Some(LoadBlocker::new(
-            &document_from_node(self),
+        let blocker = &self.load_blocker;
+        LoadBlocker::terminate(blocker, can_gc);
+        *blocker.borrow_mut() = Some(LoadBlocker::new(
+            &self.owner_document(),
             LoadType::Image(poster_url.clone()),
         ));
 
-        let window = window_from_node(self);
-        let context = Arc::new(Mutex::new(PosterFrameFetchContext::new(
-            self, poster_url, id,
-        )));
+        let context = PosterFrameFetchContext::new(self, poster_url, id, request.id);
+        self.owner_document().fetch_background(request, context);
+    }
 
-        let (action_sender, action_receiver) = ipc::channel().unwrap();
-        let (task_source, canceller) = window
-            .task_manager()
-            .networking_task_source_with_canceller();
-        let listener = NetworkListener {
-            context,
-            task_source,
-            canceller: Some(canceller),
-        };
-        ROUTER.add_route(
-            action_receiver.to_opaque(),
-            Box::new(move |message| {
-                listener.notify_fetch(message.to().unwrap());
-            }),
-        );
-        let global = self.global();
-        global
-            .core_resource_thread()
-            .send(CoreResourceMsg::Fetch(
-                request,
-                FetchChannels::ResponseMsg(action_sender, Some(cancel_receiver)),
-            ))
-            .unwrap();
+    fn generation_id(&self) -> u32 {
+        self.generation_id.get()
+    }
+
+    fn process_image_response(&self, response: ImageResponse, can_gc: CanGc) {
+        match response {
+            ImageResponse::Loaded(image, url) => {
+                debug!("Loaded poster image for video element: {:?}", url);
+                self.htmlmediaelement.process_poster_image_loaded(image);
+                LoadBlocker::terminate(&self.load_blocker, can_gc);
+            },
+            ImageResponse::MetadataLoaded(..) => {},
+            // The image cache may have loaded a placeholder for an invalid poster url
+            ImageResponse::PlaceholderLoaded(..) | ImageResponse::None => {
+                // A failed load should unblock the document load.
+                LoadBlocker::terminate(&self.load_blocker, can_gc);
+            },
+        }
     }
 }
 
-impl HTMLVideoElementMethods for HTMLVideoElement {
+impl HTMLVideoElementMethods<crate::DomTypeHolder> for HTMLVideoElement {
     // https://html.spec.whatwg.org/multipage/#dom-video-videowidth
     fn VideoWidth(&self) -> u32 {
         if self.htmlmediaelement.get_ready_state() == ReadyState::HaveNothing {
             return 0;
         }
-        self.video_width.get()
+        self.video_width.get().unwrap_or(0)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-video-videoheight
@@ -258,7 +289,7 @@ impl HTMLVideoElementMethods for HTMLVideoElement {
         if self.htmlmediaelement.get_ready_state() == ReadyState::HaveNothing {
             return 0;
         }
-        self.video_height.get()
+        self.video_height.get().unwrap_or(0)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-video-poster
@@ -277,35 +308,30 @@ impl VirtualMethods for HTMLVideoElement {
         Some(self.upcast::<HTMLMediaElement>() as &dyn VirtualMethods)
     }
 
-    fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation) {
-        self.super_type().unwrap().attribute_mutated(attr, mutation);
+    fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation, can_gc: CanGc) {
+        self.super_type()
+            .unwrap()
+            .attribute_mutated(attr, mutation, can_gc);
 
-        if let Some(new_value) = mutation.new_value(attr) {
-            if attr.local_name() == &local_name!("poster") {
-                self.fetch_poster_frame(&new_value, CanGc::note());
+        if attr.local_name() == &local_name!("poster") {
+            if let Some(new_value) = mutation.new_value(attr) {
+                self.fetch_poster_frame(&new_value, CanGc::note())
+            } else {
+                self.htmlmediaelement.clear_current_frame_data();
+                self.htmlmediaelement.set_show_poster(false);
             }
-        }
-    }
-}
-
-impl ImageCacheListener for HTMLVideoElement {
-    fn generation_id(&self) -> u32 {
-        self.generation_id.get()
+        };
     }
 
-    fn process_image_response(&self, response: ImageResponse, can_gc: CanGc) {
-        match response {
-            ImageResponse::Loaded(image, url) => {
-                debug!("Loaded poster image for video element: {:?}", url);
-                self.htmlmediaelement.process_poster_image_loaded(image);
-                LoadBlocker::terminate(&mut self.load_blocker.borrow_mut(), can_gc);
+    fn parse_plain_attribute(&self, name: &LocalName, value: DOMString) -> AttrValue {
+        match name {
+            &local_name!("width") | &local_name!("height") => {
+                AttrValue::from_dimension(value.into())
             },
-            ImageResponse::MetadataLoaded(..) => {},
-            // The image cache may have loaded a placeholder for an invalid poster url
-            ImageResponse::PlaceholderLoaded(..) | ImageResponse::None => {
-                // A failed load should unblock the document load.
-                LoadBlocker::terminate(&mut self.load_blocker.borrow_mut(), can_gc);
-            },
+            _ => self
+                .super_type()
+                .unwrap()
+                .parse_plain_attribute(name, value),
         }
     }
 }
@@ -323,15 +349,26 @@ struct PosterFrameFetchContext {
     resource_timing: ResourceFetchTiming,
     /// Url for the resource
     url: ServoUrl,
+    /// A [`FetchCanceller`] for this request.
+    fetch_canceller: FetchCanceller,
 }
 
 impl FetchResponseListener for PosterFrameFetchContext {
-    fn process_request_body(&mut self) {}
-    fn process_request_eof(&mut self) {}
+    fn process_request_body(&mut self, _: RequestId) {}
 
-    fn process_response(&mut self, metadata: Result<FetchMetadata, NetworkError>) {
-        self.image_cache
-            .notify_pending_response(self.id, FetchResponseMsg::ProcessResponse(metadata.clone()));
+    fn process_request_eof(&mut self, _: RequestId) {
+        self.fetch_canceller.ignore()
+    }
+
+    fn process_response(
+        &mut self,
+        request_id: RequestId,
+        metadata: Result<FetchMetadata, NetworkError>,
+    ) {
+        self.image_cache.notify_pending_response(
+            self.id,
+            FetchResponseMsg::ProcessResponse(request_id, metadata.clone()),
+        );
 
         let metadata = metadata.ok().map(|meta| match meta {
             FetchMetadata::Unfiltered(m) => m,
@@ -344,27 +381,31 @@ impl FetchResponseListener for PosterFrameFetchContext {
 
         if !status_is_ok {
             self.cancelled = true;
-            self.elem
-                .root()
-                .poster_frame_canceller
-                .borrow_mut()
-                .cancel();
+            self.fetch_canceller.cancel();
         }
     }
 
-    fn process_response_chunk(&mut self, payload: Vec<u8>) {
+    fn process_response_chunk(&mut self, request_id: RequestId, payload: Vec<u8>) {
         if self.cancelled {
             // An error was received previously, skip processing the payload.
             return;
         }
 
-        self.image_cache
-            .notify_pending_response(self.id, FetchResponseMsg::ProcessResponseChunk(payload));
+        self.image_cache.notify_pending_response(
+            self.id,
+            FetchResponseMsg::ProcessResponseChunk(request_id, payload),
+        );
     }
 
-    fn process_response_eof(&mut self, response: Result<ResourceFetchTiming, NetworkError>) {
-        self.image_cache
-            .notify_pending_response(self.id, FetchResponseMsg::ProcessResponseEOF(response));
+    fn process_response_eof(
+        &mut self,
+        request_id: RequestId,
+        response: Result<ResourceFetchTiming, NetworkError>,
+    ) {
+        self.image_cache.notify_pending_response(
+            self.id,
+            FetchResponseMsg::ProcessResponseEOF(request_id, response),
+        );
     }
 
     fn resource_timing_mut(&mut self) -> &mut ResourceFetchTiming {
@@ -376,7 +417,12 @@ impl FetchResponseListener for PosterFrameFetchContext {
     }
 
     fn submit_resource_timing(&mut self) {
-        network_listener::submit_timing(self)
+        network_listener::submit_timing(self, CanGc::note())
+    }
+
+    fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<csp::Violation>) {
+        let global = &self.resource_timing_global();
+        global.report_csp_violations(violations);
     }
 }
 
@@ -393,7 +439,7 @@ impl ResourceTimingListener for PosterFrameFetchContext {
     }
 
     fn resource_timing_global(&self) -> DomRoot<GlobalScope> {
-        document_from_node(&*self.elem.root()).global()
+        self.elem.root().owner_document().global()
     }
 }
 
@@ -404,8 +450,13 @@ impl PreInvoke for PosterFrameFetchContext {
 }
 
 impl PosterFrameFetchContext {
-    fn new(elem: &HTMLVideoElement, url: ServoUrl, id: PendingImageId) -> PosterFrameFetchContext {
-        let window = window_from_node(elem);
+    fn new(
+        elem: &HTMLVideoElement,
+        url: ServoUrl,
+        id: PendingImageId,
+        request_id: RequestId,
+    ) -> PosterFrameFetchContext {
+        let window = elem.owner_window();
         PosterFrameFetchContext {
             image_cache: window.image_cache(),
             elem: Trusted::new(elem),
@@ -413,6 +464,59 @@ impl PosterFrameFetchContext {
             cancelled: false,
             resource_timing: ResourceFetchTiming::new(ResourceTimingType::Resource),
             url,
+            fetch_canceller: FetchCanceller::new(request_id),
         }
+    }
+}
+
+pub(crate) trait LayoutHTMLVideoElementHelpers {
+    fn data(self) -> HTMLMediaData;
+    fn get_width(self) -> LengthOrPercentageOrAuto;
+    fn get_height(self) -> LengthOrPercentageOrAuto;
+}
+
+impl LayoutDom<'_, HTMLVideoElement> {
+    fn width_attr(self) -> Option<LengthOrPercentageOrAuto> {
+        self.upcast::<Element>()
+            .get_attr_for_layout(&ns!(), &local_name!("width"))
+            .map(AttrValue::as_dimension)
+            .cloned()
+    }
+
+    fn height_attr(self) -> Option<LengthOrPercentageOrAuto> {
+        self.upcast::<Element>()
+            .get_attr_for_layout(&ns!(), &local_name!("height"))
+            .map(AttrValue::as_dimension)
+            .cloned()
+    }
+}
+
+impl LayoutHTMLVideoElementHelpers for LayoutDom<'_, HTMLVideoElement> {
+    fn data(self) -> HTMLMediaData {
+        let video = self.unsafe_get();
+
+        // Get the current frame being rendered.
+        let current_frame = video.htmlmediaelement.get_current_frame_data();
+
+        // This value represents the natural width and height of the video.
+        // It may exist even if there is no current frame (for example, after the
+        // metadata of the video is loaded).
+        let metadata = video
+            .get_video_width()
+            .zip(video.get_video_height())
+            .map(|(width, height)| MediaMetadata { width, height });
+
+        HTMLMediaData {
+            current_frame,
+            metadata,
+        }
+    }
+
+    fn get_width(self) -> LengthOrPercentageOrAuto {
+        self.width_attr().unwrap_or(LengthOrPercentageOrAuto::Auto)
+    }
+
+    fn get_height(self) -> LengthOrPercentageOrAuto {
+        self.height_attr().unwrap_or(LengthOrPercentageOrAuto::Auto)
     }
 }

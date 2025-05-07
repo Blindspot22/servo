@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
-use html5ever::{local_name, namespace_url, ns, LocalName, Prefix};
+use html5ever::{LocalName, Prefix, local_name, ns};
 use js::rust::HandleObject;
 use style::attr::{AttrValue, LengthOrPercentageOrAuto};
 
@@ -18,11 +18,10 @@ use crate::dom::element::LayoutElementHelpers;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::node::Node;
 use crate::dom::virtualmethods::VirtualMethods;
-
-const DEFAULT_SPAN: u32 = 1;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct HTMLTableColElement {
+pub(crate) struct HTMLTableColElement {
     htmlelement: HTMLElement,
 }
 
@@ -37,12 +36,13 @@ impl HTMLTableColElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLTableColElement> {
         let n = Node::reflect_node_with_proto(
             Box::new(HTMLTableColElement::new_inherited(
@@ -50,6 +50,7 @@ impl HTMLTableColElement {
             )),
             document,
             proto,
+            can_gc,
         );
 
         n.upcast::<Node>().set_weird_parser_insertion_mode();
@@ -57,14 +58,16 @@ impl HTMLTableColElement {
     }
 }
 
-impl HTMLTableColElementMethods for HTMLTableColElement {
+impl HTMLTableColElementMethods<crate::DomTypeHolder> for HTMLTableColElement {
     // <https://html.spec.whatwg.org/multipage/#attr-col-span>
-    make_uint_getter!(Span, "span", DEFAULT_SPAN);
+    make_uint_getter!(Span, "span", 1);
     // <https://html.spec.whatwg.org/multipage/#attr-col-span>
-    make_uint_setter!(SetSpan, "span", DEFAULT_SPAN);
+    // > The span IDL attribute must reflect the content attribute of the same name. It is clamped
+    // > to the range [1, 1000], and its default value is 1.
+    make_clamped_uint_setter!(SetSpan, "span", 1, 1000, 1);
 }
 
-pub trait HTMLTableColElementLayoutHelpers<'dom> {
+pub(crate) trait HTMLTableColElementLayoutHelpers<'dom> {
     fn get_span(self) -> Option<u32>;
     fn get_width(self) -> LengthOrPercentageOrAuto;
 }
@@ -93,11 +96,12 @@ impl VirtualMethods for HTMLTableColElement {
     fn parse_plain_attribute(&self, local_name: &LocalName, value: DOMString) -> AttrValue {
         match *local_name {
             local_name!("span") => {
-                let mut attr = AttrValue::from_u32(value.into(), DEFAULT_SPAN);
+                let mut attr = AttrValue::from_u32(value.into(), 1);
                 if let AttrValue::UInt(_, ref mut val) = attr {
-                    if *val == 0 {
-                        *val = 1;
-                    }
+                    // From <https://html.spec.whatwg.org/multipage/#attr-col-span>:
+                    // > The span IDL attribute must reflect the content attribute of the same name.
+                    // > It is clamped to the range [1, 1000], and its default value is 1.
+                    *val = (*val).clamp(1, 1000);
                 }
                 attr
             },

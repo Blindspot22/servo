@@ -2,21 +2,33 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    not(target_os = "android"),
+    not(target_env = "ohos")
+))]
 use base::text::{UnicodeBlock, UnicodeBlockMethod};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    not(target_os = "android"),
+    not(target_env = "ohos")
+))]
 use unicode_script::Script;
 
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    not(target_os = "android"),
+    not(target_env = "ohos")
+))]
+use crate::FallbackFontSelectionOptions;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub use crate::platform::freetype::{font, font_list, LocalFontIdentifier};
+pub use crate::platform::freetype::{LocalFontIdentifier, font, font_list};
 #[cfg(target_os = "macos")]
 pub use crate::platform::macos::{
     core_text_font_cache, font, font_list, font_list::LocalFontIdentifier,
 };
 #[cfg(target_os = "windows")]
 pub use crate::platform::windows::{font, font_list, font_list::LocalFontIdentifier};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::FallbackFontSelectionOptions;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod freetype;
@@ -34,7 +46,11 @@ mod windows {
     pub mod font_list;
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    not(target_os = "android"),
+    not(target_env = "ohos")
+))]
 pub(crate) fn add_noto_fallback_families(
     options: FallbackFontSelectionOptions,
     families: &mut Vec<&'static str>,

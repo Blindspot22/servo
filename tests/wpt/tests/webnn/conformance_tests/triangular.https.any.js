@@ -1,5 +1,5 @@
 // META: title=test WebNN API triangular operation
-// META: global=window,dedicatedworker
+// META: global=window
 // META: variant=?cpu
 // META: variant=?gpu
 // META: variant=?npu
@@ -779,7 +779,7 @@ const triangularTests = [
 if (navigator.ml) {
   triangularTests.forEach((test) => {
     webnn_conformance_test(
-        buildGraphAndCompute, getTriangularPrecisionTolerance, test);
+        buildAndExecuteGraph, getTriangularPrecisionTolerance, test);
   });
 } else {
   test(() => assert_implements(navigator.ml, 'missing navigator.ml'));

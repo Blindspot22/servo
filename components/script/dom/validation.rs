@@ -12,9 +12,10 @@ use crate::dom::htmldatalistelement::HTMLDataListElement;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::node::Node;
 use crate::dom::validitystate::{ValidationFlags, ValidityState};
+use crate::script_runtime::CanGc;
 
 /// Trait for elements with constraint validation support
-pub trait Validatable {
+pub(crate) trait Validatable {
     fn as_element(&self) -> &Element;
 
     /// <https://html.spec.whatwg.org/multipage/#dom-cva-validity>
@@ -24,7 +25,11 @@ pub trait Validatable {
     fn is_instance_validatable(&self) -> bool;
 
     // Check if element satisfies its constraints, excluding custom errors
-    fn perform_validation(&self, _validate_flags: ValidationFlags) -> ValidationFlags {
+    fn perform_validation(
+        &self,
+        _validate_flags: ValidationFlags,
+        _can_gc: CanGc,
+    ) -> ValidationFlags {
         ValidationFlags::empty()
     }
 
@@ -34,11 +39,11 @@ pub trait Validatable {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#check-validity-steps>
-    fn check_validity(&self) -> bool {
+    fn check_validity(&self, can_gc: CanGc) -> bool {
         if self.is_instance_validatable() && !self.satisfies_constraints() {
             self.as_element()
                 .upcast::<EventTarget>()
-                .fire_cancelable_event(atom!("invalid"));
+                .fire_cancelable_event(atom!("invalid"), can_gc);
             false
         } else {
             true
@@ -46,7 +51,7 @@ pub trait Validatable {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#report-validity-steps>
-    fn report_validity(&self) -> bool {
+    fn report_validity(&self, can_gc: CanGc) -> bool {
         // Step 1.
         if !self.is_instance_validatable() {
             return true;
@@ -60,7 +65,7 @@ pub trait Validatable {
         let event = self
             .as_element()
             .upcast::<EventTarget>()
-            .fire_cancelable_event(atom!("invalid"));
+            .fire_cancelable_event(atom!("invalid"), can_gc);
 
         // Step 1.2.
         if !event.DefaultPrevented() {
@@ -70,7 +75,7 @@ pub trait Validatable {
                 validation_message_for_flags(&self.validity_state(), flags)
             );
             if let Some(html_elem) = self.as_element().downcast::<HTMLElement>() {
-                html_elem.Focus();
+                html_elem.Focus(can_gc);
             }
         }
 
@@ -90,7 +95,7 @@ pub trait Validatable {
 }
 
 /// <https://html.spec.whatwg.org/multipage/#the-datalist-element%3Abarred-from-constraint-validation>
-pub fn is_barred_by_datalist_ancestor(elem: &Node) -> bool {
+pub(crate) fn is_barred_by_datalist_ancestor(elem: &Node) -> bool {
     elem.upcast::<Node>()
         .ancestors()
         .any(|node| node.is::<HTMLDataListElement>())

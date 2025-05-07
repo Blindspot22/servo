@@ -2,22 +2,28 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use canvas_traits::canvas::{Canvas2dMsg, CanvasId, CanvasMsg};
+use canvas_traits::canvas::{Canvas2dMsg, CanvasId, CanvasMsg, FromScriptMsg};
 use dom_struct::dom_struct;
-use euclid::default::{Point2D, Rect, Size2D};
-use ipc_channel::ipc::IpcSender;
+use euclid::default::Size2D;
+use profile_traits::ipc;
+use script_bindings::inheritance::Castable;
 use servo_url::ServoUrl;
+use snapshot::Snapshot;
+use webrender_api::ImageKey;
 
+use crate::canvas_context::{CanvasContext, CanvasHelpers, LayoutCanvasRenderingContextHelpers};
 use crate::canvas_state::CanvasState;
 use crate::dom::bindings::codegen::Bindings::CanvasRenderingContext2DBinding::{
     CanvasDirection, CanvasFillRule, CanvasImageSource, CanvasLineCap, CanvasLineJoin,
     CanvasRenderingContext2DMethods, CanvasTextAlign, CanvasTextBaseline,
 };
-use crate::dom::bindings::codegen::UnionTypes::StringOrCanvasGradientOrCanvasPattern;
+use crate::dom::bindings::codegen::UnionTypes::{
+    HTMLCanvasElementOrOffscreenCanvas, StringOrCanvasGradientOrCanvasPattern,
+};
 use crate::dom::bindings::error::{ErrorResult, Fallible};
 use crate::dom::bindings::num::Finite;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
-use crate::dom::bindings::root::{Dom, DomRoot, LayoutDom};
+use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object};
+use crate::dom::bindings::root::{DomRoot, LayoutDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::canvasgradient::CanvasGradient;
 use crate::dom::canvaspattern::CanvasPattern;
@@ -25,28 +31,28 @@ use crate::dom::dommatrix::DOMMatrix;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::htmlcanvaselement::HTMLCanvasElement;
 use crate::dom::imagedata::ImageData;
+use crate::dom::node::{Node, NodeDamage, NodeTraits};
+use crate::dom::path2d::Path2D;
 use crate::dom::textmetrics::TextMetrics;
 use crate::script_runtime::CanGc;
 
 // https://html.spec.whatwg.org/multipage/#canvasrenderingcontext2d
 #[dom_struct]
-pub struct CanvasRenderingContext2D {
+pub(crate) struct CanvasRenderingContext2D {
     reflector_: Reflector,
-    /// For rendering contexts created by an HTML canvas element, this is Some,
-    /// for ones created by a paint worklet, this is None.
-    canvas: Option<Dom<HTMLCanvasElement>>,
+    canvas: HTMLCanvasElementOrOffscreenCanvas,
     canvas_state: CanvasState,
 }
 
 impl CanvasRenderingContext2D {
-    pub fn new_inherited(
+    pub(crate) fn new_inherited(
         global: &GlobalScope,
-        canvas: Option<&HTMLCanvasElement>,
+        canvas: HTMLCanvasElementOrOffscreenCanvas,
         size: Size2D<u32>,
     ) -> CanvasRenderingContext2D {
         CanvasRenderingContext2D {
             reflector_: Reflector::new(),
-            canvas: canvas.map(Dom::from_ref),
+            canvas,
             canvas_state: CanvasState::new(
                 global,
                 Size2D::new(size.width as u64, size.height as u64),
@@ -54,29 +60,18 @@ impl CanvasRenderingContext2D {
         }
     }
 
-    pub fn new(
+    pub(crate) fn new(
         global: &GlobalScope,
         canvas: &HTMLCanvasElement,
         size: Size2D<u32>,
+        can_gc: CanGc,
     ) -> DomRoot<CanvasRenderingContext2D> {
         let boxed = Box::new(CanvasRenderingContext2D::new_inherited(
             global,
-            Some(canvas),
+            HTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(DomRoot::from_ref(canvas)),
             size,
         ));
-        reflect_dom_object(boxed, global)
-    }
-
-    // https://html.spec.whatwg.org/multipage/#concept-canvas-set-bitmap-dimensions
-    pub fn set_bitmap_dimensions(&self, size: Size2D<u32>) {
-        self.reset_to_initial_state();
-        self.canvas_state
-            .get_ipc_renderer()
-            .send(CanvasMsg::Recreate(
-                Some(size.to_u64()),
-                self.canvas_state.get_canvas_id(),
-            ))
-            .unwrap();
+        reflect_dom_object(boxed, global, can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#reset-the-rendering-context-to-its-default-state
@@ -84,64 +79,76 @@ impl CanvasRenderingContext2D {
         self.canvas_state.reset_to_initial_state();
     }
 
-    pub fn set_canvas_bitmap_dimensions(&self, size: Size2D<u64>) {
+    /// <https://html.spec.whatwg.org/multipage/#concept-canvas-set-bitmap-dimensions>
+    pub(crate) fn set_canvas_bitmap_dimensions(&self, size: Size2D<u64>) {
         self.canvas_state.set_bitmap_dimensions(size);
     }
 
-    pub fn mark_as_dirty(&self) {
-        self.canvas_state.mark_as_dirty(self.canvas.as_deref())
-    }
-
-    pub fn take_missing_image_urls(&self) -> Vec<ServoUrl> {
+    pub(crate) fn take_missing_image_urls(&self) -> Vec<ServoUrl> {
         std::mem::take(&mut self.canvas_state.get_missing_image_urls().borrow_mut())
     }
 
-    pub fn get_canvas_id(&self) -> CanvasId {
+    pub(crate) fn get_canvas_id(&self) -> CanvasId {
         self.canvas_state.get_canvas_id()
     }
 
-    pub fn send_canvas_2d_msg(&self, msg: Canvas2dMsg) {
+    pub(crate) fn send_canvas_2d_msg(&self, msg: Canvas2dMsg) {
         self.canvas_state.send_canvas_2d_msg(msg)
     }
+}
 
-    // TODO: Remove this
-    pub fn get_ipc_renderer(&self) -> IpcSender<CanvasMsg> {
-        self.canvas_state.get_ipc_renderer().clone()
+impl LayoutCanvasRenderingContextHelpers for LayoutDom<'_, CanvasRenderingContext2D> {
+    fn canvas_data_source(self) -> Option<ImageKey> {
+        let canvas_state = &self.unsafe_get().canvas_state;
+
+        if canvas_state.is_paintable() {
+            Some(canvas_state.image_key())
+        } else {
+            None
+        }
+    }
+}
+
+impl CanvasContext for CanvasRenderingContext2D {
+    type ID = CanvasId;
+
+    fn context_id(&self) -> Self::ID {
+        self.canvas_state.get_canvas_id()
     }
 
-    pub fn origin_is_clean(&self) -> bool {
+    fn canvas(&self) -> HTMLCanvasElementOrOffscreenCanvas {
+        self.canvas.clone()
+    }
+
+    fn update_rendering(&self) {
+        self.canvas_state.update_rendering();
+    }
+
+    fn resize(&self) {
+        self.set_canvas_bitmap_dimensions(self.size().cast())
+    }
+
+    fn get_image_data(&self) -> Option<Snapshot> {
+        if !self.canvas_state.is_paintable() {
+            return None;
+        }
+
+        let (sender, receiver) = ipc::channel(self.global().time_profiler_chan().clone()).unwrap();
+        let msg = CanvasMsg::FromScript(FromScriptMsg::SendPixels(sender), self.get_canvas_id());
+        self.canvas_state.get_ipc_renderer().send(msg).unwrap();
+
+        Some(receiver.recv().unwrap().to_owned())
+    }
+
+    fn origin_is_clean(&self) -> bool {
         self.canvas_state.origin_is_clean()
     }
 
-    pub fn get_rect(&self, rect: Rect<u32>) -> Vec<u8> {
-        let rect = Rect::new(
-            Point2D::new(rect.origin.x as u64, rect.origin.y as u64),
-            Size2D::new(rect.size.width as u64, rect.size.height as u64),
-        );
-        self.canvas_state.get_rect(
-            self.canvas
-                .as_ref()
-                .map_or(Size2D::zero(), |c| c.get_size().to_u64()),
-            rect,
-        )
-    }
-}
-
-pub trait LayoutCanvasRenderingContext2DHelpers {
-    fn get_ipc_renderer(self) -> IpcSender<CanvasMsg>;
-    fn get_canvas_id(self) -> CanvasId;
-}
-
-impl LayoutCanvasRenderingContext2DHelpers for LayoutDom<'_, CanvasRenderingContext2D> {
-    fn get_ipc_renderer(self) -> IpcSender<CanvasMsg> {
-        (self.unsafe_get()).canvas_state.get_ipc_renderer().clone()
-    }
-
-    fn get_canvas_id(self) -> CanvasId {
-        // FIXME(nox): This relies on the fact that CanvasState::get_canvas_id
-        // does nothing fancy but it would be easier to trust a
-        // LayoutDom<_>-like type that would wrap the &CanvasState.
-        self.unsafe_get().canvas_state.get_canvas_id()
+    fn mark_as_dirty(&self) {
+        if let Some(canvas) = self.canvas.canvas() {
+            canvas.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
+            canvas.owner_document().add_dirty_2d_canvas(self);
+        }
     }
 }
 
@@ -154,12 +161,13 @@ impl LayoutCanvasRenderingContext2DHelpers for LayoutDom<'_, CanvasRenderingCont
 //  Restricted values are guarded in glue code. Therefore we need not add a guard.
 //
 // FIXME: this behavior should might be generated by some annotattions to idl.
-impl CanvasRenderingContext2DMethods for CanvasRenderingContext2D {
+impl CanvasRenderingContext2DMethods<crate::DomTypeHolder> for CanvasRenderingContext2D {
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-canvas
     fn Canvas(&self) -> DomRoot<HTMLCanvasElement> {
-        // This method is not called from a paint worklet rendering context,
-        // so it's OK to panic if self.canvas is None.
-        DomRoot::from_ref(self.canvas.as_ref().expect("No canvas."))
+        match &self.canvas {
+            HTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(canvas) => canvas.clone(),
+            _ => panic!("Should not be called from offscreen canvas"),
+        }
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-save
@@ -167,7 +175,7 @@ impl CanvasRenderingContext2DMethods for CanvasRenderingContext2D {
         self.canvas_state.save()
     }
 
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-restore
     fn Restore(&self) {
         self.canvas_state.restore()
@@ -267,9 +275,21 @@ impl CanvasRenderingContext2DMethods for CanvasRenderingContext2D {
         self.mark_as_dirty();
     }
 
+    // https://html.spec.whatwg.org/multipage/#dom-context-2d-fill
+    fn Fill_(&self, path: &Path2D, fill_rule: CanvasFillRule) {
+        self.canvas_state.fill_(path.segments(), fill_rule);
+        self.mark_as_dirty();
+    }
+
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-stroke
     fn Stroke(&self) {
         self.canvas_state.stroke();
+        self.mark_as_dirty();
+    }
+
+    // https://html.spec.whatwg.org/multipage/#dom-context-2d-stroke
+    fn Stroke_(&self, path: &Path2D) {
+        self.canvas_state.stroke_(path.segments());
         self.mark_as_dirty();
     }
 
@@ -278,23 +298,34 @@ impl CanvasRenderingContext2DMethods for CanvasRenderingContext2D {
         self.canvas_state.clip(fill_rule)
     }
 
+    // https://html.spec.whatwg.org/multipage/#dom-context-2d-clip
+    fn Clip_(&self, path: &Path2D, fill_rule: CanvasFillRule) {
+        self.canvas_state.clip_(path.segments(), fill_rule)
+    }
+
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-ispointinpath
     fn IsPointInPath(&self, x: f64, y: f64, fill_rule: CanvasFillRule) -> bool {
         self.canvas_state
             .is_point_in_path(&self.global(), x, y, fill_rule)
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-context-2d-filltext
-    fn FillText(&self, text: DOMString, x: f64, y: f64, max_width: Option<f64>) {
+    // https://html.spec.whatwg.org/multipage/#dom-context-2d-ispointinpath
+    fn IsPointInPath_(&self, path: &Path2D, x: f64, y: f64, fill_rule: CanvasFillRule) -> bool {
         self.canvas_state
-            .fill_text(self.canvas.as_deref(), text, x, y, max_width);
+            .is_point_in_path_(&self.global(), path.segments(), x, y, fill_rule)
+    }
+
+    // https://html.spec.whatwg.org/multipage/#dom-context-2d-filltext
+    fn FillText(&self, text: DOMString, x: f64, y: f64, max_width: Option<f64>, can_gc: CanGc) {
+        self.canvas_state
+            .fill_text(self.canvas.canvas(), text, x, y, max_width, can_gc);
         self.mark_as_dirty();
     }
 
     // https://html.spec.whatwg.org/multipage/#textmetrics
-    fn MeasureText(&self, text: DOMString) -> DomRoot<TextMetrics> {
+    fn MeasureText(&self, text: DOMString, can_gc: CanGc) -> DomRoot<TextMetrics> {
         self.canvas_state
-            .measure_text(&self.global(), self.canvas.as_deref(), text)
+            .measure_text(&self.global(), self.canvas.canvas(), text, can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-font
@@ -303,8 +334,9 @@ impl CanvasRenderingContext2DMethods for CanvasRenderingContext2D {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-font
-    fn SetFont(&self, value: DOMString) {
-        self.canvas_state.set_font(self.canvas.as_deref(), value)
+    fn SetFont(&self, value: DOMString, can_gc: CanGc) {
+        self.canvas_state
+            .set_font(self.canvas.canvas(), value, can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-textalign
@@ -340,7 +372,7 @@ impl CanvasRenderingContext2DMethods for CanvasRenderingContext2D {
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-drawimage
     fn DrawImage(&self, image: CanvasImageSource, dx: f64, dy: f64) -> ErrorResult {
         self.canvas_state
-            .draw_image(self.canvas.as_deref(), image, dx, dy)
+            .draw_image(self.canvas.canvas(), image, dx, dy)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-drawimage
@@ -353,7 +385,7 @@ impl CanvasRenderingContext2DMethods for CanvasRenderingContext2D {
         dh: f64,
     ) -> ErrorResult {
         self.canvas_state
-            .draw_image_(self.canvas.as_deref(), image, dx, dy, dw, dh)
+            .draw_image_(self.canvas.canvas(), image, dx, dy, dw, dh)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-drawimage
@@ -369,18 +401,8 @@ impl CanvasRenderingContext2DMethods for CanvasRenderingContext2D {
         dw: f64,
         dh: f64,
     ) -> ErrorResult {
-        self.canvas_state.draw_image__(
-            self.canvas.as_deref(),
-            image,
-            sx,
-            sy,
-            sw,
-            sh,
-            dx,
-            dy,
-            dw,
-            dh,
-        )
+        self.canvas_state
+            .draw_image__(self.canvas.canvas(), image, sx, sy, sw, sh, dx, dy, dw, dh)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-moveto
@@ -451,9 +473,9 @@ impl CanvasRenderingContext2DMethods for CanvasRenderingContext2D {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-strokestyle
-    fn SetStrokeStyle(&self, value: StringOrCanvasGradientOrCanvasPattern) {
+    fn SetStrokeStyle(&self, value: StringOrCanvasGradientOrCanvasPattern, can_gc: CanGc) {
         self.canvas_state
-            .set_stroke_style(self.canvas.as_deref(), value)
+            .set_stroke_style(self.canvas.canvas(), value, can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-strokestyle
@@ -462,9 +484,9 @@ impl CanvasRenderingContext2DMethods for CanvasRenderingContext2D {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-strokestyle
-    fn SetFillStyle(&self, value: StringOrCanvasGradientOrCanvasPattern) {
+    fn SetFillStyle(&self, value: StringOrCanvasGradientOrCanvasPattern, can_gc: CanGc) {
         self.canvas_state
-            .set_fill_style(self.canvas.as_deref(), value)
+            .set_fill_style(self.canvas.canvas(), value, can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-createimagedata
@@ -492,29 +514,14 @@ impl CanvasRenderingContext2DMethods for CanvasRenderingContext2D {
         sh: i32,
         can_gc: CanGc,
     ) -> Fallible<DomRoot<ImageData>> {
-        self.canvas_state.get_image_data(
-            self.canvas
-                .as_ref()
-                .map_or(Size2D::zero(), |c| c.get_size().to_u64()),
-            &self.global(),
-            sx,
-            sy,
-            sw,
-            sh,
-            can_gc,
-        )
+        self.canvas_state
+            .get_image_data(self.canvas.size(), &self.global(), sx, sy, sw, sh, can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-putimagedata
     fn PutImageData(&self, imagedata: &ImageData, dx: i32, dy: i32) {
-        self.canvas_state.put_image_data(
-            self.canvas
-                .as_ref()
-                .map_or(Size2D::zero(), |c| c.get_size().to_u64()),
-            imagedata,
-            dx,
-            dy,
-        )
+        self.canvas_state
+            .put_image_data(self.canvas.size(), imagedata, dx, dy)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-putimagedata
@@ -530,9 +537,7 @@ impl CanvasRenderingContext2DMethods for CanvasRenderingContext2D {
         dirty_height: i32,
     ) {
         self.canvas_state.put_image_data_(
-            self.canvas
-                .as_ref()
-                .map_or(Size2D::zero(), |c| c.get_size().to_u64()),
+            self.canvas.size(),
             imagedata,
             dx,
             dy,
@@ -551,9 +556,10 @@ impl CanvasRenderingContext2DMethods for CanvasRenderingContext2D {
         y0: Finite<f64>,
         x1: Finite<f64>,
         y1: Finite<f64>,
+        can_gc: CanGc,
     ) -> DomRoot<CanvasGradient> {
         self.canvas_state
-            .create_linear_gradient(&self.global(), x0, y0, x1, y1)
+            .create_linear_gradient(&self.global(), x0, y0, x1, y1, can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-createradialgradient
@@ -565,9 +571,10 @@ impl CanvasRenderingContext2DMethods for CanvasRenderingContext2D {
         x1: Finite<f64>,
         y1: Finite<f64>,
         r1: Finite<f64>,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<CanvasGradient>> {
         self.canvas_state
-            .create_radial_gradient(&self.global(), x0, y0, r0, x1, y1, r1)
+            .create_radial_gradient(&self.global(), x0, y0, r0, x1, y1, r1, can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-createpattern
@@ -575,9 +582,10 @@ impl CanvasRenderingContext2DMethods for CanvasRenderingContext2D {
         &self,
         image: CanvasImageSource,
         repetition: DOMString,
+        can_gc: CanGc,
     ) -> Fallible<Option<DomRoot<CanvasPattern>>> {
         self.canvas_state
-            .create_pattern(&self.global(), image, repetition)
+            .create_pattern(&self.global(), image, repetition, can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-linewidth
@@ -620,6 +628,26 @@ impl CanvasRenderingContext2DMethods for CanvasRenderingContext2D {
         self.canvas_state.set_miter_limit(limit)
     }
 
+    /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-setlinedash>
+    fn SetLineDash(&self, segments: Vec<f64>) {
+        self.canvas_state.set_line_dash(segments);
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-getlinedash>
+    fn GetLineDash(&self) -> Vec<f64> {
+        self.canvas_state.line_dash()
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-linedashoffset>
+    fn LineDashOffset(&self) -> f64 {
+        self.canvas_state.line_dash_offset()
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-linedashoffset>
+    fn SetLineDashOffset(&self, offset: f64) {
+        self.canvas_state.set_line_dash_offset(offset);
+    }
+
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-shadowoffsetx
     fn ShadowOffsetX(&self) -> f64 {
         self.canvas_state.shadow_offset_x()
@@ -656,9 +684,9 @@ impl CanvasRenderingContext2DMethods for CanvasRenderingContext2D {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-shadowcolor
-    fn SetShadowColor(&self, value: DOMString) {
+    fn SetShadowColor(&self, value: DOMString, can_gc: CanGc) {
         self.canvas_state
-            .set_shadow_color(self.canvas.as_deref(), value)
+            .set_shadow_color(self.canvas.canvas(), value, can_gc)
     }
 }
 
