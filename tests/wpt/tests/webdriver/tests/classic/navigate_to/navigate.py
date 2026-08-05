@@ -4,13 +4,9 @@ import pytest
 from webdriver import error
 from webdriver.transport import Response
 
-from tests.support.asserts import assert_error, assert_success
+from tests.support.classic.asserts import assert_error, assert_success
 
-
-def navigate_to(session, url):
-    return session.transport.send(
-        "POST", "session/{session_id}/url".format(**vars(session)),
-        {"url": url})
+from . import navigate_to
 
 
 def test_null_parameter_value(session, http):
@@ -37,6 +33,17 @@ def test_no_browsing_context(session, closed_frame, inline):
     assert_success(response)
 
     assert session.url == doc
+
+
+def test_timeout_page_load_null(session, inline):
+    page = inline("<div id=foo>")
+
+    session.timeouts.page_load = None
+
+    navigate_to(session, page)
+
+    session.url == page
+    assert session.url == page
 
 
 @pytest.mark.parametrize("protocol,parameters", [

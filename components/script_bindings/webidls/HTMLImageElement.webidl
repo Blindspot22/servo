@@ -13,6 +13,7 @@ interface HTMLImageElement : HTMLElement {
            attribute USVString src;
   [CEReactions]
            attribute USVString srcset;
+  [CEReactions] attribute DOMString sizes;
   [CEReactions]
            attribute DOMString? crossOrigin;
   [CEReactions]
@@ -48,7 +49,7 @@ partial interface HTMLImageElement {
   [CEReactions]
            attribute unsigned long vspace;
   [CEReactions]
-           attribute DOMString longDesc;
+  attribute USVString longDesc;
 
   [CEReactions]
   attribute [LegacyNullToEmptyString] DOMString border;

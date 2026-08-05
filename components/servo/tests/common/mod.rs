@@ -2,69 +2,37 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::Error;
-use compositing_traits::rendering_context::{RenderingContext, SoftwareRenderingContext};
 use dpi::PhysicalSize;
 use embedder_traits::EventLoopWaker;
-use servo::{Servo, ServoBuilder};
-
-macro_rules! run_api_tests {
-    ($($test_function:ident), +) => {
-        let mut failed = false;
-
-        // Be sure that `servo_test` is dropped before exiting early.
-        {
-            let servo_test = ServoTest::new();
-            $(
-                common::run_test($test_function, stringify!($test_function), &servo_test, &mut failed);
-            )+
-        }
-
-        if failed {
-            std::process::exit(1);
-        }
-    }
-}
-
-pub(crate) use run_api_tests;
-
-pub(crate) fn run_test(
-    test_function: fn(&ServoTest) -> Result<(), Error>,
-    test_name: &str,
-    servo_test: &ServoTest,
-    failed: &mut bool,
-) {
-    match test_function(servo_test) {
-        Ok(_) => println!("    ✅ {test_name}"),
-        Err(error) => {
-            *failed = true;
-            println!("    ❌ {test_name}");
-            println!("{}", format!("\n{error:?}").replace("\n", "\n        "));
-        },
-    }
-}
+use paint_api::rendering_context::{RenderingContext, SoftwareRenderingContext};
+use servo::{
+    ConsoleLogLevel, EmbedderControl, InputEvent, JSValue, JavaScriptEvaluationError, LoadStatus,
+    MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Preferences, Servo,
+    ServoBuilder, SimpleDialog, WebView, WebViewDelegate,
+};
+use webrender_api::units::DevicePoint;
 
 pub struct ServoTest {
-    servo: Servo,
-}
-
-impl Drop for ServoTest {
-    fn drop(&mut self) {
-        self.servo.start_shutting_down();
-        while self.servo.spin_event_loop() {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        self.servo.deinit();
-    }
+    pub servo: Servo,
+    pub rendering_context: Rc<dyn RenderingContext>,
 }
 
 impl ServoTest {
+    #[allow(dead_code)] // Used by some tests and not others
     pub(crate) fn new() -> Self {
+        Self::new_with_builder(|builder| builder)
+    }
+
+    pub(crate) fn new_with_builder<F>(customize: F) -> Self
+    where
+        F: FnOnce(ServoBuilder) -> ServoBuilder,
+    {
         let rendering_context = Rc::new(
             SoftwareRenderingContext::new(PhysicalSize {
                 width: 500,
@@ -87,10 +55,19 @@ impl ServoTest {
         }
 
         let user_event_triggered = Arc::new(AtomicBool::new(false));
-        let servo = ServoBuilder::new(rendering_context.clone())
-            .event_loop_waker(Box::new(EventLoopWakerImpl(user_event_triggered)))
-            .build();
-        Self { servo }
+        // Set the proxy to null as the tests will all be on localhost, hence, proxy might interfere.
+        let mut preferences = Preferences::default();
+        preferences.network_http_proxy_uri = String::new();
+        preferences.network_https_proxy_uri = String::new();
+
+        let builder = ServoBuilder::default()
+            .preferences(preferences)
+            .event_loop_waker(Box::new(EventLoopWakerImpl(user_event_triggered)));
+        let builder = customize(builder);
+        Self {
+            servo: builder.build(),
+            rendering_context,
+        }
     }
 
     pub fn servo(&self) -> &Servo {
@@ -100,25 +77,164 @@ impl ServoTest {
     /// Spin the Servo event loop until one of:
     ///  - The given callback returns `Ok(false)`.
     ///  - The given callback returns an `Error`, in which case the `Error` will be returned.
-    ///  - Servo has indicated that shut down is complete and we cannot spin the event loop
-    ///    any longer.
-    // The dead code exception here is because not all test suites that use `common` also
-    // use `spin()`.
-    #[allow(dead_code)]
-    pub fn spin(&self, callback: impl Fn() -> Result<bool, Error> + 'static) -> Result<(), Error> {
-        let mut keep_going = true;
-        while keep_going {
+    pub fn spin(&self, callback: impl Fn() -> bool + 'static) {
+        while callback() {
+            self.servo.spin_event_loop();
             std::thread::sleep(Duration::from_millis(1));
-            if !self.servo.spin_event_loop() {
-                return Ok(());
-            }
-            let result = callback();
-            match result {
-                Ok(result) => keep_going = result,
-                Err(error) => return Err(error),
-            }
         }
-
-        Ok(())
     }
+}
+
+#[derive(Default)]
+pub(crate) struct WebViewDelegateImpl {
+    pub(crate) url_changed: Cell<bool>,
+    pub(crate) cursor_changed: Cell<bool>,
+    pub(crate) new_frame_ready: Cell<bool>,
+    pub(crate) load_status_changed: Cell<bool>,
+    pub(crate) controls_shown: RefCell<Vec<EmbedderControl>>,
+    pub(crate) active_dialog: RefCell<Option<SimpleDialog>>,
+    pub(crate) number_of_controls_shown: Cell<usize>,
+    pub(crate) number_of_controls_hidden: Cell<usize>,
+    pub(crate) last_accesskit_tree_updates: RefCell<Vec<accesskit::TreeUpdate>>,
+    pub(crate) console_messages: RefCell<Vec<(ConsoleLogLevel, String)>>,
+}
+
+#[allow(dead_code)] // Used by some tests and not others
+impl WebViewDelegateImpl {
+    pub(crate) fn reset(&self) {
+        self.url_changed.set(false);
+        self.cursor_changed.set(false);
+        self.new_frame_ready.set(false);
+        self.controls_shown.borrow_mut().clear();
+        self.number_of_controls_shown.set(0);
+        self.number_of_controls_hidden.set(0);
+        self.last_accesskit_tree_updates.borrow_mut().clear();
+        self.console_messages.borrow_mut().clear();
+    }
+}
+
+impl WebViewDelegate for WebViewDelegateImpl {
+    fn notify_url_changed(&self, _webview: servo::WebView, _url: url::Url) {
+        self.url_changed.set(true);
+    }
+
+    fn notify_cursor_changed(&self, _webview: WebView, _: servo::Cursor) {
+        self.cursor_changed.set(true);
+    }
+
+    fn notify_new_frame_ready(&self, webview: WebView) {
+        self.new_frame_ready.set(true);
+        webview.paint();
+    }
+
+    fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {
+        if status == LoadStatus::Complete {
+            self.load_status_changed.set(true);
+        }
+    }
+
+    fn show_embedder_control(&self, _: WebView, embedder_control: EmbedderControl) {
+        if let EmbedderControl::SimpleDialog(simple_dialog) = embedder_control {
+            let previous_dialog = self.active_dialog.borrow_mut().replace(simple_dialog);
+            assert!(previous_dialog.is_none());
+            return;
+        }
+        // Even if not used, controls must be stored so that they do not automatically reply
+        // when dropped.
+        self.controls_shown.borrow_mut().push(embedder_control);
+
+        self.number_of_controls_shown
+            .set(self.number_of_controls_shown.get() + 1);
+    }
+
+    fn hide_embedder_control(&self, _webview: WebView, _control_id: servo::EmbedderControlId) {
+        self.number_of_controls_hidden
+            .set(self.number_of_controls_hidden.get() + 1);
+    }
+
+    fn notify_accessibility_tree_update(
+        &self,
+        _webview: WebView,
+        tree_update: accesskit::TreeUpdate,
+    ) {
+        self.last_accesskit_tree_updates
+            .borrow_mut()
+            .push(tree_update);
+    }
+
+    fn show_console_message(&self, _webview: WebView, level: ConsoleLogLevel, message: String) {
+        self.console_messages.borrow_mut().push((level, message));
+    }
+}
+
+// Used by some unit tests only. Since they compile into different binaries,
+// it will be flagged as unused for certain unit tests.
+#[allow(dead_code)]
+pub(crate) fn click_at_point(webview: &WebView, point: DevicePoint) {
+    let point = point.into();
+    webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point)));
+    webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+        MouseButtonAction::Down,
+        MouseButton::Left,
+        point,
+    )));
+    webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+        MouseButtonAction::Up,
+        MouseButton::Left,
+        point,
+    )));
+}
+
+// Used by some unit tests only. Since they compile into different binaries,
+// it will be flagged as unused for certain unit tests.
+#[allow(dead_code)]
+pub(crate) fn evaluate_javascript(
+    servo_test: &ServoTest,
+    webview: WebView,
+    script: impl ToString,
+) -> Result<JSValue, JavaScriptEvaluationError> {
+    let load_webview = webview.clone();
+    let _ = servo_test.spin(move || load_webview.load_status() != LoadStatus::Complete);
+
+    let saved_result = Rc::new(RefCell::new(None));
+    let callback_result = saved_result.clone();
+    webview.evaluate_javascript(script, move |result| {
+        *callback_result.borrow_mut() = Some(result)
+    });
+
+    let spin_result = saved_result.clone();
+    let _ = servo_test.spin(move || spin_result.borrow().is_none());
+
+    (*saved_result.borrow())
+        .clone()
+        .expect("Should have waited until value available")
+}
+
+// Used by some unit tests only. Since they compile into different binaries,
+// it will be flagged as unused for certain unit tests.
+#[allow(dead_code)]
+pub(crate) fn show_webview_and_wait_for_rendering_to_be_ready(
+    servo_test: &ServoTest,
+    webview: &WebView,
+    delegate: &Rc<WebViewDelegateImpl>,
+) {
+    let load_webview = webview.clone();
+    servo_test.spin(move || load_webview.load_status() != LoadStatus::Complete);
+
+    delegate.reset();
+
+    // Trigger a change to the display of the document, so that we get at least one
+    // new frame after load is complete.
+    let _ = evaluate_javascript(
+        &servo_test,
+        webview.clone(),
+        "requestAnimationFrame(() => { \
+           document.body.style.background = 'red'; \
+           document.body.style.background = 'green'; \
+        });",
+    );
+
+    // Wait for at least one frame after the load completes.
+    let captured_delegate = delegate.clone();
+    servo_test.spin(move || !captured_delegate.new_frame_ready.get());
 }

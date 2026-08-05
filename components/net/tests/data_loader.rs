@@ -7,9 +7,11 @@ use std::ops::Deref;
 use headers::{ContentType, HeaderMapExt};
 use hyper_serde::Serde;
 use mime::{self, Mime};
+use net_traits::blob_url_store::UrlWithBlobClaim;
 use net_traits::request::Referrer;
 use net_traits::response::ResponseBody;
 use net_traits::{FetchMetadata, FilteredMetadata, NetworkError};
+use servo_base::id::TEST_WEBVIEW_ID;
 use servo_url::ServoUrl;
 
 use crate::fetch;
@@ -23,10 +25,11 @@ fn assert_parse(
 ) {
     use net_traits::request::RequestBuilder;
 
-    let url = ServoUrl::parse(url).unwrap();
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let url = UrlWithBlobClaim::new(ServoUrl::parse(url).unwrap(), None);
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
         .pipeline_id(None)
+        .policy_container(Default::default())
         .build();
 
     let response = fetch(request, None);
@@ -49,7 +52,7 @@ fn assert_parse(
             assert_eq!(metadata.content_type.map(Serde::into_inner), content_type);
             assert_eq!(metadata.charset.as_ref().map(String::deref), charset);
 
-            let resp_body = response.body.lock().unwrap();
+            let resp_body = response.body.lock();
             match *resp_body {
                 ResponseBody::Done(ref val) => {
                     assert_eq!(val, &data);
@@ -61,7 +64,7 @@ fn assert_parse(
             assert!(response.is_network_error());
             assert_eq!(
                 response.metadata().err(),
-                Some(NetworkError::Internal(
+                Some(NetworkError::ResourceLoadError(
                     "Decoding data URL failed".to_owned()
                 ))
             );

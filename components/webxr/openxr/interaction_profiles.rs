@@ -47,6 +47,7 @@ pub enum InteractionProfileType {
 
 #[derive(Clone, Copy, Debug)]
 pub struct InteractionProfile<'a> {
+    #[expect(dead_code)]
     pub profile_type: InteractionProfileType,
     /// The interaction profile path
     pub path: &'static str,
@@ -385,14 +386,14 @@ pub static INTERACTION_PROFILES: [InteractionProfile; 22] = [
     FB_HAND_TRACKING_AIM_PROFILE,
 ];
 
-pub fn get_profiles_from_path(path: String) -> &'static [&'static str] {
+pub(super) fn get_profiles_from_path(path: String) -> &'static [&'static str] {
     INTERACTION_PROFILES
         .iter()
         .find(|profile| profile.path == path)
         .map_or(&[], |profile| profile.profiles)
 }
 
-pub fn get_supported_interaction_profiles(
+pub(super) fn get_supported_interaction_profiles(
     supported_extensions: &ExtensionSet,
     enabled_extensions: &mut ExtensionSet,
 ) -> Vec<&'static str> {

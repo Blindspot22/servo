@@ -490,12 +490,6 @@ combine('case', keysOf(kLayoutCases)).
 beginSubcases().
 combine('aspace', ['storage', 'uniform', 'function', 'private', 'workgroup'])
 ).
-beforeAllSubcases((t) => {
-  const testcase = kLayoutCases[t.params.case];
-  if (testcase.f16) {
-    t.selectDeviceOrSkipTestCase('shader-f16');
-  }
-}).
 fn((t) => {
   const testcase = kLayoutCases[t.params.case];
   const decls = testcase.decls !== undefined ? testcase.decls : '';
@@ -531,11 +525,15 @@ ${decls}
   }
   code += `}\n`;
 
+  // If the `uniform_buffer_standard_layout` feature is supported, the `uniform` address space has
+  // the same layout constraints as `storage`.
+  const ubo_std_layout = t.hasLanguageFeature('uniform_buffer_standard_layout');
+
   const is_interface = t.params.aspace === 'uniform' || t.params.aspace === 'storage';
   const supports_atomic = t.params.aspace === 'storage' || t.params.aspace === 'workgroup';
   const expect =
   testcase.validity === true ||
-  testcase.validity === 'non-uniform' && t.params.aspace !== 'uniform' ||
+  testcase.validity === 'non-uniform' && (t.params.aspace !== 'uniform' || ubo_std_layout) ||
   testcase.validity === 'non-interface' && !is_interface ||
   testcase.validity === 'storage' && t.params.aspace === 'storage' ||
   testcase.validity === 'atomic' && supports_atomic;

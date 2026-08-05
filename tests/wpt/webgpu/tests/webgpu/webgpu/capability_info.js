@@ -3,6 +3,7 @@
 **/ // MAINTENANCE_TODO: The generated Typedoc for this file is hard to navigate because it's
 // alphabetized. Consider using namespaces or renames to fix this?
 
+import { globalTestConfig } from '../common/framework/test_config.js';
 import {
   keysOf,
   makeTable,
@@ -11,7 +12,12 @@ import {
 
 '../common/util/data_tables.js';
 import { assertTypeTrue } from '../common/util/types.js';
-import { unreachable } from '../common/util/util.js';
+import {
+  assert,
+  combinationsOfOneOrTwoUsages,
+  hasFeature,
+  unreachable } from
+'../common/util/util.js';
 
 import { GPUConst, kMaxUnsignedLongValue, kMaxUnsignedLongLongValue } from './constants.js';
 
@@ -70,6 +76,10 @@ export const kAllBufferUsageBits = kBufferUsages.reduce(
   (previousSet, currentUsage) => previousSet | currentUsage,
   0
 );
+
+/** An arbitrary invalid buffer usage bit. */
+export const kSomeBogusBufferUsage = 0x4000_0000;
+assert((kSomeBogusBufferUsage & kAllBufferUsageBits) === 0);
 
 // Errors
 
@@ -200,18 +210,62 @@ export const kTextureUsageCopyInfo =
 /** List of all GPUTextureUsage copy values. */
 export const kTextureUsageCopy = keysOf(kTextureUsageCopyInfo);
 
+
 /** Per-GPUTextureUsage info. */
-export const kTextureUsageInfo =
+const kTextureUsageInfo =
+
+
+
+
 
 {
-  [GPUConst.TextureUsage.COPY_SRC]: {},
-  [GPUConst.TextureUsage.COPY_DST]: {},
-  [GPUConst.TextureUsage.TEXTURE_BINDING]: {},
-  [GPUConst.TextureUsage.STORAGE_BINDING]: {},
-  [GPUConst.TextureUsage.RENDER_ATTACHMENT]: {}
+  [GPUConst.TextureUsage.COPY_SRC]: { typeErrorForConfigure: false },
+  [GPUConst.TextureUsage.COPY_DST]: { typeErrorForConfigure: false },
+  [GPUConst.TextureUsage.TEXTURE_BINDING]: { typeErrorForConfigure: false },
+  [GPUConst.TextureUsage.STORAGE_BINDING]: { typeErrorForConfigure: false },
+  [GPUConst.TextureUsage.RENDER_ATTACHMENT]: { typeErrorForConfigure: false },
+  [GPUConst.TextureUsage.TRANSIENT_ATTACHMENT]: { typeErrorForConfigure: true }
 };
 /** List of all GPUTextureUsage values. */
 export const kTextureUsages = numericKeysOf(kTextureUsageInfo);
+/** Bitmask of all known texture usages. */
+export const kAllTextureUsages = kTextureUsages.reduce((acc, usage) => acc | usage, 0);
+
+/** An arbitrary invalid texture usage bit. */
+export const kSomeBogusTextureUsage = 0x4000_0000;
+assert((kSomeBogusTextureUsage & kAllTextureUsages) === 0);
+
+/**
+ * Check usage is valid for createTexture(): is non-zero, has only defined bits,
+ * and follows rules for TRANSIENT_ATTACHMENT.
+ */
+export function isValidTextureUsageCombination(usage) {
+  if (usage === 0) return false;
+
+  if (usage & GPUConst.TextureUsage.TRANSIENT_ATTACHMENT) {
+    return (
+      usage === (
+      GPUConst.TextureUsage.TRANSIENT_ATTACHMENT | GPUConst.TextureUsage.RENDER_ATTACHMENT));
+
+  }
+
+  return (usage & ~kAllTextureUsages) === 0;
+}
+
+/** Check if usage contains a bit that is supposed to cause configure() to TypeError. */
+export function usageIsTypeErrorForConfigure(usage) {
+  for (const bit of kTextureUsages) {
+    if ((usage & bit) !== 0 && kTextureUsageInfo[bit].typeErrorForConfigure) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** List of all combinations of 1-2 known texture usages, that are valid for createTexture(). */
+export const kValidCombinationsOfOneOrTwoTextureUsages = combinationsOfOneOrTwoUsages(
+  kTextureUsages
+).filter(isValidTextureUsageCombination);
 
 // Texture View
 
@@ -273,23 +327,32 @@ makeTable(
   ['bytesPerComponent', 'type', 'componentCount', 'byteSize', 'wgslType'],
   [,,,,], {
     // 8 bit components
+    'uint8': [1, 'uint', 1, 1, 'u32'],
     'uint8x2': [1, 'uint', 2, 2, 'vec2<u32>'],
     'uint8x4': [1, 'uint', 4, 4, 'vec4<u32>'],
+    'sint8': [1, 'sint', 1, 1, 'i32'],
     'sint8x2': [1, 'sint', 2, 2, 'vec2<i32>'],
     'sint8x4': [1, 'sint', 4, 4, 'vec4<i32>'],
+    'unorm8': [1, 'unorm', 1, 1, 'f32'],
     'unorm8x2': [1, 'unorm', 2, 2, 'vec2<f32>'],
     'unorm8x4': [1, 'unorm', 4, 4, 'vec4<f32>'],
+    'snorm8': [1, 'snorm', 1, 1, 'f32'],
     'snorm8x2': [1, 'snorm', 2, 2, 'vec2<f32>'],
     'snorm8x4': [1, 'snorm', 4, 4, 'vec4<f32>'],
     // 16 bit components
+    'uint16': [2, 'uint', 1, 2, 'u32'],
     'uint16x2': [2, 'uint', 2, 4, 'vec2<u32>'],
     'uint16x4': [2, 'uint', 4, 8, 'vec4<u32>'],
+    'sint16': [2, 'sint', 1, 2, 'i32'],
     'sint16x2': [2, 'sint', 2, 4, 'vec2<i32>'],
     'sint16x4': [2, 'sint', 4, 8, 'vec4<i32>'],
+    'unorm16': [2, 'unorm', 1, 2, 'f32'],
     'unorm16x2': [2, 'unorm', 2, 4, 'vec2<f32>'],
     'unorm16x4': [2, 'unorm', 4, 8, 'vec4<f32>'],
+    'snorm16': [2, 'snorm', 1, 2, 'f32'],
     'snorm16x2': [2, 'snorm', 2, 4, 'vec2<f32>'],
     'snorm16x4': [2, 'snorm', 4, 8, 'vec4<f32>'],
+    'float16': [2, 'float', 1, 2, 'f32'],
     'float16x2': [2, 'float', 2, 4, 'vec2<f32>'],
     'float16x4': [2, 'float', 4, 8, 'vec4<f32>'],
     // 32 bit components
@@ -306,7 +369,8 @@ makeTable(
     'sint32x3': [4, 'sint', 3, 12, 'vec3<i32>'],
     'sint32x4': [4, 'sint', 4, 16, 'vec4<i32>'],
     // 32 bit packed
-    'unorm10-10-10-2': ['packed', 'unorm', 4, 4, 'vec4<f32>']
+    'unorm10-10-10-2': ['packed', 'unorm', 4, 4, 'vec4<f32>'],
+    'unorm8x4-bgra': ['packed', 'unorm', 4, 4, 'vec4<f32>']
   });
 /** List of all GPUVertexFormat values. */
 export const kVertexFormats = keysOf(kVertexFormatInfo);
@@ -382,13 +446,13 @@ export const kPerStageBindingLimits =
 
 
 {
-  'uniformBuf': { class: 'uniformBuf', maxLimit: 'maxUniformBuffersPerShaderStage' },
-  'storageBuf': { class: 'storageBuf', maxLimit: 'maxStorageBuffersPerShaderStage' },
-  'sampler': { class: 'sampler', maxLimit: 'maxSamplersPerShaderStage' },
-  'sampledTex': { class: 'sampledTex', maxLimit: 'maxSampledTexturesPerShaderStage' },
-  'readonlyStorageTex': { class: 'readonlyStorageTex', maxLimit: 'maxStorageTexturesPerShaderStage' },
-  'writeonlyStorageTex': { class: 'writeonlyStorageTex', maxLimit: 'maxStorageTexturesPerShaderStage' },
-  'readwriteStorageTex': { class: 'readwriteStorageTex', maxLimit: 'maxStorageTexturesPerShaderStage' }
+  'uniformBuf': { class: 'uniformBuf', maxLimits: { COMPUTE: 'maxUniformBuffersPerShaderStage', FRAGMENT: 'maxUniformBuffersPerShaderStage', VERTEX: 'maxUniformBuffersPerShaderStage' } },
+  'storageBuf': { class: 'storageBuf', maxLimits: { COMPUTE: 'maxStorageBuffersPerShaderStage', FRAGMENT: 'maxStorageBuffersInFragmentStage', VERTEX: 'maxStorageBuffersInVertexStage' } },
+  'sampler': { class: 'sampler', maxLimits: { COMPUTE: 'maxSamplersPerShaderStage', FRAGMENT: 'maxSamplersPerShaderStage', VERTEX: 'maxSamplersPerShaderStage' } },
+  'sampledTex': { class: 'sampledTex', maxLimits: { COMPUTE: 'maxSampledTexturesPerShaderStage', FRAGMENT: 'maxSampledTexturesPerShaderStage', VERTEX: 'maxSampledTexturesPerShaderStage' } },
+  'readonlyStorageTex': { class: 'readonlyStorageTex', maxLimits: { COMPUTE: 'maxStorageTexturesPerShaderStage', FRAGMENT: 'maxStorageTexturesInFragmentStage', VERTEX: 'maxStorageTexturesInVertexStage' } },
+  'writeonlyStorageTex': { class: 'writeonlyStorageTex', maxLimits: { COMPUTE: 'maxStorageTexturesPerShaderStage', FRAGMENT: 'maxStorageTexturesInFragmentStage', VERTEX: 'maxStorageTexturesInVertexStage' } },
+  'readwriteStorageTex': { class: 'readwriteStorageTex', maxLimits: { COMPUTE: 'maxStorageTexturesPerShaderStage', FRAGMENT: 'maxStorageTexturesInFragmentStage', VERTEX: 'maxStorageTexturesInVertexStage' } }
 };
 
 /**
@@ -493,24 +557,27 @@ export const kTextureSampleTypes = [
 
 assertTypeTrue();
 
-/** Binding type info (including class limits) for the specified GPUStorageTextureBindingLayout. */
+/** Binding type info (including class limits) for the specified GPUStorageTextureAccess. */
 export function storageTextureBindingTypeInfo(d) {
   switch (d.access) {
     case undefined:
     case 'write-only':
       return {
+        wgslAccess: 'write',
         usage: GPUConst.TextureUsage.STORAGE_BINDING,
         ...kBindingKind.writeonlyStorageTex,
         ...kValidStagesStorageWrite
       };
     case 'read-only':
       return {
+        wgslAccess: 'read',
         usage: GPUConst.TextureUsage.STORAGE_BINDING,
         ...kBindingKind.readonlyStorageTex,
         ...kValidStagesAll
       };
     case 'read-write':
       return {
+        wgslAccess: 'read_write',
         usage: GPUConst.TextureUsage.STORAGE_BINDING,
         ...kBindingKind.readwriteStorageTex,
         ...kValidStagesStorageWrite
@@ -579,16 +646,22 @@ export function textureBindingEntries(includeUndefined) {
  *
  * Note: Generates different `access` options, but not `format` or `viewDimension` options.
  */
-export function storageTextureBindingEntries() {
+export function storageTextureBindingEntries(format) {
   return [
-  { storageTexture: { access: 'write-only', format: 'r32float' } },
-  { storageTexture: { access: 'read-only', format: 'r32float' } },
-  { storageTexture: { access: 'read-write', format: 'r32float' } }];
+  { storageTexture: { access: 'write-only', format } },
+  { storageTexture: { access: 'read-only', format } },
+  { storageTexture: { access: 'read-write', format } }];
 
 }
 /** Generate a list of possible texture-or-storageTexture-typed BGLEntry values. */
-export function sampledAndStorageBindingEntries(includeUndefined) {
-  return [...textureBindingEntries(includeUndefined), ...storageTextureBindingEntries()];
+export function sampledAndStorageBindingEntries(
+includeUndefined,
+format = 'r32float')
+{
+  return [
+  ...textureBindingEntries(includeUndefined),
+  ...storageTextureBindingEntries(format)];
+
 }
 /**
  * Generate a list of possible BGLEntry values of every type, but not variants with different:
@@ -597,11 +670,14 @@ export function sampledAndStorageBindingEntries(includeUndefined) {
  * - texture.viewDimension
  * - storageTexture.viewDimension
  */
-export function allBindingEntries(includeUndefined) {
+export function allBindingEntries(
+includeUndefined,
+format = 'r32float')
+{
   return [
   ...bufferBindingEntries(includeUndefined),
   ...samplerBindingEntries(includeUndefined),
-  ...sampledAndStorageBindingEntries(includeUndefined)];
+  ...sampledAndStorageBindingEntries(includeUndefined, format)];
 
 }
 
@@ -707,7 +783,7 @@ const [kLimitInfoKeys, kLimitInfoDefaults, kLimitInfoData] =
 ['maximum',,, kMaxUnsignedLongValue], {
   'maxTextureDimension1D': [, 8192, 4096],
   'maxTextureDimension2D': [, 8192, 4096],
-  'maxTextureDimension3D': [, 2048, 1024],
+  'maxTextureDimension3D': [, 2048, 2048],
   'maxTextureArrayLayers': [, 256, 256],
 
   'maxBindGroups': [, 4, 4],
@@ -717,7 +793,11 @@ const [kLimitInfoKeys, kLimitInfoDefaults, kLimitInfoData] =
   'maxDynamicStorageBuffersPerPipelineLayout': [, 4, 4],
   'maxSampledTexturesPerShaderStage': [, 16, 16],
   'maxSamplersPerShaderStage': [, 16, 16],
-  'maxStorageBuffersPerShaderStage': [, 8, 4],
+  'maxStorageBuffersInFragmentStage': [, 8, 4],
+  'maxStorageBuffersInVertexStage': [, 8, 0],
+  'maxStorageBuffersPerShaderStage': [, 8, 8],
+  'maxStorageTexturesInFragmentStage': [, 4, 4],
+  'maxStorageTexturesInVertexStage': [, 4, 0],
   'maxStorageTexturesPerShaderStage': [, 4, 4],
   'maxUniformBuffersPerShaderStage': [, 12, 12],
 
@@ -741,13 +821,17 @@ const [kLimitInfoKeys, kLimitInfoDefaults, kLimitInfoData] =
   'maxComputeWorkgroupSizeY': [, 256, 128],
   'maxComputeWorkgroupSizeZ': [, 64, 64],
   'maxComputeWorkgroupsPerDimension': [, 65535, 65535]
+  // MAINTENANCE_TODO(4535): Consider allowing optional non-conforming limits. Currently they are not allowed.
+  // Any limit here is immediately required by all implementations.
+  // Also, consider having this table statically check that all limits listed in @webgpu/types exist in
+  // this table.
 }];
 
 /**
  * Feature levels corresponding to core WebGPU and WebGPU
  * in compatibility mode. They can be passed to
  * getDefaultLimits though if you have access to an adapter
- * it's preferred to use getDefaultLimitsForAdapter.
+ * it's preferred to use getDefaultLimits or getDefaultLimitsForCTS
  */
 export const kFeatureLevels = ['core', 'compatibility'];
 
@@ -783,17 +867,64 @@ export function getDefaultLimits(featureLevel) {
   return kLimitInfos[featureLevel];
 }
 
-export function getDefaultLimitsForAdapter(adapter) {
-  // MAINTENANCE_TODO: Remove casts when GPUAdapter IDL has isCompatibilityMode.
-  return getDefaultLimits(
-    adapter.isCompatibilityMode ?
-    'compatibility' :
-    'core'
-  );
+/**
+ * The CTS is generally designed to run in a single feature level.
+ * Use this function get the default limits for the CTS's feature level
+ * This is needed if you can not use the device limits as you have not yet
+ * created a device. An adapter can not tell you if it supports compatibility
+ * mode. The only way to know is to request a device without `core-features-and-limits`.
+ * If the device you get back doesn't have `core-features-and-limits` then it's
+ * a compatibility device.
+ */
+export function getDefaultLimitsForCTS() {
+  return getDefaultLimits(globalTestConfig.compatibility ? 'compatibility' : 'core');
 }
 
-/** List of all entries of GPUSupportedLimits. */
-export const kLimits = keysOf(kLimitInfoCore);
+export function getDefaultLimitsForDevice(device) {
+  const featureLevel = hasFeature(device.features, 'core-features-and-limits') ?
+  'core' :
+  'compatibility';
+  return getDefaultLimits(featureLevel);
+}
+
+const kEachStage = [
+GPUConst.ShaderStage.COMPUTE,
+GPUConst.ShaderStage.FRAGMENT,
+GPUConst.ShaderStage.VERTEX];
+
+function shaderStageFlagToStageName(stage) {
+  switch (stage) {
+    case GPUConst.ShaderStage.COMPUTE:
+      return 'COMPUTE';
+    case GPUConst.ShaderStage.FRAGMENT:
+      return 'FRAGMENT';
+    case GPUConst.ShaderStage.VERTEX:
+      return 'VERTEX';
+    default:
+      unreachable();
+  }
+}
+
+/**
+ * Get the limit of the number of things you can bind for
+ * a given BGLEntry given the specified visibility. This is
+ * the minimum across stages for the given visibility.
+ */
+export function getBindingLimitForBindingType(
+device,
+visibility,
+e)
+{
+  const info = bindingTypeInfo(e);
+  const maxLimits = info.perStageLimitClass.maxLimits;
+  const limits = kEachStage.
+  filter((stage) => stage & visibility).
+  map((stage) => device.limits[maxLimits[shaderStageFlagToStageName(stage)]]);
+  return limits.length > 0 ? Math.min(...limits) : 0;
+}
+
+/** List of all possible entries of GPUSupportedLimits. */
+export const kPossibleLimits = keysOf(kLimitInfoCore);
 
 /**
  * The number of color attachments to test.
@@ -832,7 +963,13 @@ export const kFeatureNameInfo =
   'float32-filterable': {},
   'float32-blendable': {},
   'clip-distances': {},
-  'dual-source-blending': {}
+  'dual-source-blending': {},
+  'subgroups': {},
+  'core-features-and-limits': {},
+  'texture-formats-tier1': {},
+  'texture-formats-tier2': {},
+  'primitive-index': {},
+  'texture-component-swizzle': {}
 };
 /** List of all GPUFeatureName values. */
 export const kFeatureNames = keysOf(kFeatureNameInfo);
@@ -842,4 +979,11 @@ export const kKnownWGSLLanguageFeatures = [
 'readonly_and_readwrite_storage_textures',
 'packed_4x8_integer_dot_product',
 'unrestricted_pointer_parameters',
-'pointer_composite_access'];
+'pointer_composite_access',
+'uniform_buffer_standard_layout',
+'texture_and_sampler_let',
+'subgroup_id',
+'subgroup_uniformity',
+'swizzle_assignment',
+'linear_indexing',
+'texture_formats_tier1'];

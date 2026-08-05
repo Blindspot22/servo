@@ -3,8 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use app_units::Au;
-use euclid::{Point2D, Size2D, Vector2D};
+use euclid::{Size2D, Vector2D};
 use style::computed_values::background_attachment::SingleComputedValue as BackgroundAttachment;
+use style::computed_values::background_blend_mode::SingleComputedValue as BackgroundBlendMode;
 use style::computed_values::background_clip::single_value::T as Clip;
 use style::computed_values::background_origin::single_value::T as Origin;
 use style::properties::ComputedValues;
@@ -15,8 +16,8 @@ use style::values::specified::background::{
 };
 use webrender_api::{self as wr, units};
 use wr::ClipChainId;
-use wr::units::LayoutSize;
 
+use crate::display_list::{DisplayListBuilder, TraversalState};
 use crate::replaced::NaturalSizes;
 
 pub(super) struct BackgroundLayer {
@@ -25,6 +26,7 @@ pub(super) struct BackgroundLayer {
     pub tile_size: units::LayoutSize,
     pub tile_spacing: units::LayoutSize,
     pub repeat: bool,
+    pub blend_mode: BackgroundBlendMode,
 }
 
 #[derive(Debug)]
@@ -35,7 +37,7 @@ struct Layout1DResult {
     tile_spacing: f32,
 }
 
-fn get_cyclic<T>(values: &[T], layer_index: usize) -> &T {
+pub(crate) fn get_cyclic<T>(values: &[T], layer_index: usize) -> &T {
     &values[layer_index % values.len()]
 }
 
@@ -66,21 +68,21 @@ impl<'a> BackgroundPainter<'a> {
         if &BackgroundAttachment::Fixed ==
             get_cyclic(&background.background_attachment.0, layer_index)
         {
-            let viewport_size = builder.display_list.compositor_info.viewport_size;
-            return units::LayoutRect::from_origin_and_size(Point2D::origin(), viewport_size);
+            return builder.paint_info.viewport_details.layout_size().into();
         }
 
         match get_cyclic(&background.background_clip.0, layer_index) {
             Clip::ContentBox => *fragment_builder.content_rect(),
             Clip::PaddingBox => *fragment_builder.padding_rect(),
-            Clip::BorderBox => fragment_builder.border_rect,
+            Clip::BorderBox | Clip::BorderArea => fragment_builder.border_rect,
         }
     }
 
     fn clip(
         &self,
         fragment_builder: &'a super::BuilderForBoxFragment,
-        builder: &mut super::DisplayListBuilder,
+        builder: &mut DisplayListBuilder,
+        state: &TraversalState,
         layer_index: usize,
     ) -> Option<ClipChainId> {
         if self.painting_area_override.is_some() {
@@ -88,7 +90,7 @@ impl<'a> BackgroundPainter<'a> {
         }
 
         if self.positioning_area_override.is_some() {
-            return fragment_builder.border_edge_clip(builder, false);
+            return fragment_builder.border_edge_clip(builder, state, false);
         }
 
         // The 'backgound-clip' property maps directly to `clip_rect` in `CommonItemProperties`:
@@ -96,9 +98,16 @@ impl<'a> BackgroundPainter<'a> {
         let force_clip_creation = get_cyclic(&background.background_attachment.0, layer_index) ==
             &BackgroundAttachment::Fixed;
         match get_cyclic(&background.background_clip.0, layer_index) {
-            Clip::ContentBox => fragment_builder.content_edge_clip(builder, force_clip_creation),
-            Clip::PaddingBox => fragment_builder.padding_edge_clip(builder, force_clip_creation),
-            Clip::BorderBox => fragment_builder.border_edge_clip(builder, force_clip_creation),
+            Clip::ContentBox => {
+                fragment_builder.content_edge_clip(builder, state, force_clip_creation)
+            },
+            Clip::PaddingBox => {
+                fragment_builder.padding_edge_clip(builder, state, force_clip_creation)
+            },
+            Clip::BorderBox => {
+                fragment_builder.border_edge_clip(builder, state, force_clip_creation)
+            },
+            Clip::BorderArea => unreachable!("Should be disabled behind a pref"),
         }
     }
 
@@ -109,19 +118,20 @@ impl<'a> BackgroundPainter<'a> {
         &self,
         fragment_builder: &'a super::BuilderForBoxFragment,
         builder: &mut super::DisplayListBuilder,
+        state: &TraversalState,
         layer_index: usize,
         painting_area: units::LayoutRect,
     ) -> wr::CommonItemProperties {
-        let clip = self.clip(fragment_builder, builder, layer_index);
-        let style = &fragment_builder.fragment.style;
-        let mut common = builder.common_properties(painting_area, style);
+        let clip = self.clip(fragment_builder, builder, state, layer_index);
+        let style = fragment_builder.fragment.style();
+        let mut common = builder.common_properties(state, painting_area, style);
         if let Some(clip_chain_id) = clip {
             common.clip_chain_id = clip_chain_id;
         }
         if &BackgroundAttachment::Fixed ==
             get_cyclic(&style.get_background().background_attachment.0, layer_index)
         {
-            common.spatial_id = builder.current_reference_frame_scroll_node_id.spatial_id;
+            common.spatial_id = builder.spatial_id(builder.current_reference_frame_scroll_node_id);
         }
         common
     }
@@ -132,6 +142,7 @@ impl<'a> BackgroundPainter<'a> {
     pub(super) fn positioning_area(
         &self,
         fragment_builder: &'a super::BuilderForBoxFragment,
+        builder: &mut super::DisplayListBuilder,
         layer_index: usize,
     ) -> units::LayoutRect {
         if let Some(positioning_area_override) = self.positioning_area_override {
@@ -150,28 +161,23 @@ impl<'a> BackgroundPainter<'a> {
                 Origin::PaddingBox => *fragment_builder.padding_rect(),
                 Origin::BorderBox => fragment_builder.border_rect,
             },
-            BackgroundAttachment::Fixed => {
-                // This isn't the viewport size because that rects larger than the viewport might be
-                // transformed down into areas smaller than the viewport.
-                units::LayoutRect::from_origin_and_size(
-                    Point2D::origin(),
-                    LayoutSize::new(f32::MAX, f32::MAX),
-                )
-            },
+            BackgroundAttachment::Fixed => builder.paint_info.viewport_details.layout_size().into(),
         }
     }
 }
 
 pub(super) fn layout_layer(
-    fragment_builder: &mut super::BuilderForBoxFragment,
+    fragment_builder: &super::BuilderForBoxFragment,
     painter: &BackgroundPainter,
-    builder: &mut super::DisplayListBuilder,
+    builder: &mut DisplayListBuilder,
+    state: &TraversalState,
     layer_index: usize,
     natural_sizes: NaturalSizes,
 ) -> Option<BackgroundLayer> {
     let painting_area = painter.painting_area(fragment_builder, builder, layer_index);
-    let positioning_area = painter.positioning_area(fragment_builder, layer_index);
-    let common = painter.common_properties(fragment_builder, builder, layer_index, painting_area);
+    let positioning_area = painter.positioning_area(fragment_builder, builder, layer_index);
+    let common =
+        painter.common_properties(fragment_builder, builder, state, layer_index, painting_area);
 
     // https://drafts.csswg.org/css-backgrounds/#background-size
     enum ContainOrCover {
@@ -274,12 +280,14 @@ pub(super) fn layout_layer(
     );
     let tile_spacing = units::LayoutSize::new(result_x.tile_spacing, result_y.tile_spacing);
 
+    let blend_mode = *get_cyclic(&b.background_blend_mode.0, layer_index);
     Some(BackgroundLayer {
         common,
         bounds,
         tile_size,
         tile_spacing,
         repeat: result_x.repeat || result_y.repeat,
+        blend_mode,
     })
 }
 
@@ -294,8 +302,20 @@ fn layout_1d(
     positioning_area_size: f32,
 ) -> Layout1DResult {
     // https://drafts.csswg.org/css-backgrounds/#background-repeat
+    // > If background-repeat is round for one (or both) dimensions, there is a second step.
+    // > The UA must scale the image in that dimension (or both dimensions) so that it fits
+    // > a whole number of times in the background positioning area. In the case of the
+    // > width (height is analogous):
+    // >
+    // > | If X ≠ 0 is the width of the image after step one and W is the width of the
+    // > | background positioning area, then the rounded width X' = W / round(W / X) where
+    // > | round() is a function that returns the nearest natural number (integer greater than
+    // > | zero).
     if let Repeat::Round = repeat {
-        *tile_size = positioning_area_size / (positioning_area_size / *tile_size).round();
+        let round = |number: f32| number.round().max(1.0);
+        if positioning_area_size != 0.0 {
+            *tile_size = positioning_area_size / round(positioning_area_size / *tile_size);
+        }
     }
     // https://drafts.csswg.org/css-backgrounds/#background-position
     let mut position = position

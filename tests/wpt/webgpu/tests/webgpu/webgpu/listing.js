@@ -63,6 +63,14 @@ export const listing = [
       "api",
       "operation",
       "buffers",
+      "createBindGroup"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "operation",
+      "buffers",
       "map"
     ]
   },
@@ -144,6 +152,15 @@ export const listing = [
       "operation",
       "command_buffer",
       "programmable",
+      "immediate"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "operation",
+      "command_buffer",
+      "programmable",
       "state_tracking"
     ]
   },
@@ -170,8 +187,26 @@ export const listing = [
       "api",
       "operation",
       "command_buffer",
+      "queries",
+      "timestampQuery"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "operation",
+      "command_buffer",
       "render",
       "dynamic_state"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "operation",
+      "command_buffer",
+      "render",
+      "render_bundle"
     ]
   },
   {
@@ -212,6 +247,14 @@ export const listing = [
       "api",
       "operation",
       "device",
+      "all_limits_and_features"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "operation",
+      "device",
       "lost"
     ]
   },
@@ -220,6 +263,14 @@ export const listing = [
       "api",
       "operation",
       "labels"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "operation",
+      "limits",
+      "max_combined_limits"
     ]
   },
   {
@@ -285,6 +336,14 @@ export const listing = [
     "file": [
       "api",
       "operation",
+      "pipeline",
+      "pipeline_layout_created_with_null_bind_group_layout"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "operation",
       "queue",
       "writeBuffer"
     ]
@@ -334,6 +393,14 @@ export const listing = [
       "operation",
       "render_pass",
       "storeop2"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "operation",
+      "render_pass",
+      "transient_attachment"
     ]
   },
   {
@@ -501,7 +568,7 @@ export const listing = [
       "api",
       "operation",
       "sampling",
-      "lod_clamp"
+      "sampler_texture"
     ]
   },
   {
@@ -541,7 +608,7 @@ export const listing = [
       "api",
       "operation",
       "texture_view",
-      "read"
+      "texture_component_swizzle"
     ]
   },
   {
@@ -662,7 +729,34 @@ export const listing = [
       "validation",
       "capability_checks",
       "features",
+      "texture_component_swizzle"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "validation",
+      "capability_checks",
+      "features",
       "texture_formats"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "validation",
+      "capability_checks",
+      "features",
+      "texture_formats_tier1"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "validation",
+      "capability_checks",
+      "features",
+      "texture_formats_tier2"
     ]
   },
   {
@@ -672,7 +766,7 @@ export const listing = [
       "capability_checks",
       "limits"
     ],
-    "readme": "Test everything that shouldn't be valid without a higher-than-specified limit.\n\n- x= that limit {default, max supported (if different), lower than default (TODO: if allowed)}\n\nOne file for each limit name.\n\nTODO: implement\nTODO: Also test that \"alignment\" limits require a power of 2."
+    "readme": "Test everything that shouldn't be valid without a higher-than-specified limit.\n\nOne file for each limit name.\n\nTODO: Test that \"alignment\" limits require a power of 2."
   },
   {
     "file": [
@@ -842,7 +936,43 @@ export const listing = [
       "validation",
       "capability_checks",
       "limits",
+      "maxStorageBuffersInFragmentStage"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "validation",
+      "capability_checks",
+      "limits",
+      "maxStorageBuffersInVertexStage"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "validation",
+      "capability_checks",
+      "limits",
       "maxStorageBuffersPerShaderStage"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "validation",
+      "capability_checks",
+      "limits",
+      "maxStorageTexturesInFragmentStage"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "validation",
+      "capability_checks",
+      "limits",
+      "maxStorageTexturesInVertexStage"
     ]
   },
   {
@@ -1013,6 +1143,13 @@ export const listing = [
     "file": [
       "api",
       "validation",
+      "dispatch"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "validation",
       "encoding",
       "beginComputePass"
     ]
@@ -1116,6 +1253,16 @@ export const listing = [
       "encoding",
       "cmds",
       "render",
+      "indirect_multi_draw"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "validation",
+      "encoding",
+      "cmds",
+      "render",
       "setIndexBuffer"
     ]
   },
@@ -1172,6 +1319,15 @@ export const listing = [
       "api",
       "validation",
       "encoding",
+      "cmds",
+      "setImmediates"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "validation",
+      "encoding",
       "createRenderBundleEncoder"
     ]
   },
@@ -1198,6 +1354,15 @@ export const listing = [
       "encoding",
       "programmable",
       "pipeline_bind_group_compat"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "validation",
+      "encoding",
+      "programmable",
+      "pipeline_immediate"
     ]
   },
   {
@@ -1301,6 +1466,21 @@ export const listing = [
       "api",
       "validation",
       "layout_shader_compat"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "validation",
+      "non_filterable_texture"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "validation",
+      "pipeline",
+      "immediates"
     ]
   },
   {
@@ -1656,6 +1836,22 @@ export const listing = [
       "compat",
       "api",
       "validation",
+      "createBindGroupLayout_limits"
+    ]
+  },
+  {
+    "file": [
+      "compat",
+      "api",
+      "validation",
+      "createPipelineLayout"
+    ]
+  },
+  {
+    "file": [
+      "compat",
+      "api",
+      "validation",
       "encoding",
       "cmds",
       "copyTextureToBuffer"
@@ -1686,6 +1882,14 @@ export const listing = [
       "compat",
       "api",
       "validation",
+      "pipeline_creation"
+    ]
+  },
+  {
+    "file": [
+      "compat",
+      "api",
+      "validation",
       "render_pipeline",
       "depth_stencil_state"
     ]
@@ -1697,6 +1901,15 @@ export const listing = [
       "validation",
       "render_pipeline",
       "fragment_state"
+    ]
+  },
+  {
+    "file": [
+      "compat",
+      "api",
+      "validation",
+      "render_pipeline",
+      "in_stage_limits"
     ]
   },
   {
@@ -1757,6 +1970,12 @@ export const listing = [
     "file": [
       "idl",
       "constructable"
+    ]
+  },
+  {
+    "file": [
+      "idl",
+      "javascript"
     ]
   },
   {
@@ -3223,7 +3442,37 @@ export const listing = [
       "expression",
       "call",
       "builtin",
+      "subgroupElect"
+    ]
+  },
+  {
+    "file": [
+      "shader",
+      "execution",
+      "expression",
+      "call",
+      "builtin",
+      "subgroupMinMax"
+    ]
+  },
+  {
+    "file": [
+      "shader",
+      "execution",
+      "expression",
+      "call",
+      "builtin",
       "subgroupMul"
+    ]
+  },
+  {
+    "file": [
+      "shader",
+      "execution",
+      "expression",
+      "call",
+      "builtin",
+      "subgroupShuffle"
     ]
   },
   {
@@ -3394,6 +3643,16 @@ export const listing = [
       "call",
       "builtin",
       "textureStore"
+    ]
+  },
+  {
+    "file": [
+      "shader",
+      "execution",
+      "expression",
+      "call",
+      "builtin",
+      "texture_utils"
     ]
   },
   {
@@ -3848,6 +4107,13 @@ export const listing = [
     "file": [
       "shader",
       "execution",
+      "override"
+    ]
+  },
+  {
+    "file": [
+      "shader",
+      "execution",
       "padding"
     ]
   },
@@ -3963,6 +4229,14 @@ export const listing = [
     "file": [
       "shader",
       "execution",
+      "statement",
+      "swizzle_assignment"
+    ]
+  },
+  {
+    "file": [
+      "shader",
+      "execution",
       "value_init"
     ]
   },
@@ -3993,6 +4267,14 @@ export const listing = [
       "validation",
       "const_assert",
       "const_assert"
+    ]
+  },
+  {
+    "file": [
+      "shader",
+      "validation",
+      "decl",
+      "assignment_statement"
     ]
   },
   {
@@ -5777,6 +6059,14 @@ export const listing = [
       "shader",
       "validation",
       "statement",
+      "swizzle_assignment"
+    ]
+  },
+  {
+    "file": [
+      "shader",
+      "validation",
+      "statement",
       "while"
     ]
   },
@@ -5970,6 +6260,13 @@ export const listing = [
       "web_platform",
       "copyToTexture",
       "image"
+    ]
+  },
+  {
+    "file": [
+      "web_platform",
+      "copyToTexture",
+      "image_file"
     ]
   },
   {

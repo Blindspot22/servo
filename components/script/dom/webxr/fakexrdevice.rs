@@ -7,9 +7,11 @@ use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use euclid::{Point2D, Point3D, Rect, RigidTransform3D, Rotation3D, Size2D, Transform3D, Vector3D};
-use ipc_channel::ipc::IpcSender;
-use ipc_channel::router::ROUTER;
-use profile_traits::ipc;
+use js::context::JSContext;
+use js::realm::CurrentRealm;
+use profile_traits::generic_callback::GenericCallback as ProfileGenericCallback;
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use servo_base::generic_channel::GenericSender;
 use webxr_api::{
     EntityType, Handedness, InputId, InputSource, MockDeviceMsg, MockInputInit, MockRegion,
     MockViewInit, MockViewsInit, MockWorld, TargetRayMode, Triangle, Visibility,
@@ -29,26 +31,23 @@ use crate::dom::bindings::codegen::Bindings::XRSessionBinding::XRVisibilityState
 use crate::dom::bindings::codegen::Bindings::XRViewBinding::XREye;
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::refcounted::TrustedPromise;
-use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object};
+use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::fakexrinputcontroller::{FakeXRInputController, init_to_mock_buttons};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct FakeXRDevice {
     reflector: Reflector,
-    #[ignore_malloc_size_of = "defined in ipc-channel"]
     #[no_trace]
-    sender: IpcSender<MockDeviceMsg>,
-    #[ignore_malloc_size_of = "defined in webxr-api"]
+    sender: GenericSender<MockDeviceMsg>,
     #[no_trace]
     next_input_id: Cell<InputId>,
 }
 
 impl FakeXRDevice {
-    pub(crate) fn new_inherited(sender: IpcSender<MockDeviceMsg>) -> FakeXRDevice {
+    pub(crate) fn new_inherited(sender: GenericSender<MockDeviceMsg>) -> FakeXRDevice {
         FakeXRDevice {
             reflector: Reflector::new(),
             sender,
@@ -57,25 +56,21 @@ impl FakeXRDevice {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
-        sender: IpcSender<MockDeviceMsg>,
-        can_gc: CanGc,
+        sender: GenericSender<MockDeviceMsg>,
     ) -> DomRoot<FakeXRDevice> {
-        reflect_dom_object(
-            Box::new(FakeXRDevice::new_inherited(sender)),
-            global,
-            can_gc,
-        )
+        reflect_dom_object_with_cx(Box::new(FakeXRDevice::new_inherited(sender)), global, cx)
     }
 
-    pub(crate) fn disconnect(&self, sender: IpcSender<()>) {
+    pub(crate) fn disconnect(&self, sender: ProfileGenericCallback<()>) {
         let _ = self.sender.send(MockDeviceMsg::Disconnect(sender));
     }
 }
 
 pub(crate) fn view<Eye>(view: &FakeXRViewInit) -> Fallible<MockViewInit<Eye>> {
     if view.projectionMatrix.len() != 16 || view.viewOffset.position.len() != 3 {
-        return Err(Error::Type("Incorrectly sized array".into()));
+        return Err(Error::Type(c"Incorrectly sized array".into()));
     }
 
     let mut proj = [0.; 16];
@@ -117,11 +112,11 @@ pub(crate) fn get_views(views: &[FakeXRViewInit]) -> Fallible<MockViewsInit> {
             let (left, right) = match (views[0].eye, views[1].eye) {
                 (XREye::Left, XREye::Right) => (&views[0], &views[1]),
                 (XREye::Right, XREye::Left) => (&views[1], &views[0]),
-                _ => return Err(Error::NotSupported),
+                _ => return Err(Error::NotSupported(None)),
             };
             Ok(MockViewsInit::Stereo(view(left)?, view(right)?))
         },
-        _ => Err(Error::NotSupported),
+        _ => Err(Error::NotSupported(None)),
     }
 }
 
@@ -129,7 +124,7 @@ pub(crate) fn get_origin<T, U>(
     origin: &FakeXRRigidTransformInit,
 ) -> Fallible<RigidTransform3D<f32, T, U>> {
     if origin.position.len() != 3 || origin.orientation.len() != 4 {
-        return Err(Error::Type("Incorrectly sized array".into()));
+        return Err(Error::Type(c"Incorrectly sized array".into()));
     }
     let p = Vector3D::new(
         *origin.position[0],
@@ -162,7 +157,7 @@ pub(crate) fn get_world(world: &FakeXRWorldInit) -> Fallible<MockWorld> {
                 .map(|face| {
                     if face.vertices.len() != 3 {
                         return Err(Error::Type(
-                            "Incorrectly sized array for triangle list".into(),
+                            c"Incorrectly sized array for triangle list".into(),
                         ));
                     }
 
@@ -258,6 +253,7 @@ impl FakeXRDeviceMethods<crate::DomTypeHolder> for FakeXRDevice {
     /// <https://immersive-web.github.io/webxr-test-api/#dom-fakexrdevice-simulateinputsourceconnection>
     fn SimulateInputSourceConnection(
         &self,
+        cx: &mut JSContext,
         init: &FakeXRInputSourceInit,
     ) -> Fallible<DomRoot<FakeXRInputController>> {
         let id = self.next_input_id.get();
@@ -300,33 +296,30 @@ impl FakeXRDeviceMethods<crate::DomTypeHolder> for FakeXRDevice {
         let global = self.global();
         let _ = self.sender.send(MockDeviceMsg::AddInputSource(init));
 
-        let controller =
-            FakeXRInputController::new(&global, self.sender.clone(), id, CanGc::note());
+        let controller = FakeXRInputController::new(cx, &global, self.sender.clone(), id);
 
         Ok(controller)
     }
 
     /// <https://immersive-web.github.io/webxr-test-api/#dom-fakexrdevice-disconnect>
-    fn Disconnect(&self, can_gc: CanGc) -> Rc<Promise> {
+    fn Disconnect(&self, cx: &mut CurrentRealm) -> Rc<Promise> {
         let global = self.global();
-        let p = Promise::new(&global, can_gc);
+        let p = Promise::new_in_realm(cx);
         let mut trusted = Some(TrustedPromise::new(p.clone()));
         let task_source = global
             .task_manager()
             .dom_manipulation_task_source()
             .to_sendable();
-        let (sender, receiver) = ipc::channel(global.time_profiler_chan().clone()).unwrap();
 
-        ROUTER.add_typed_route(
-            receiver.to_ipc_receiver(),
-            Box::new(move |_| {
+        let callback =
+            ProfileGenericCallback::new(global.time_profiler_chan().clone(), move |_| {
                 let trusted = trusted
                     .take()
                     .expect("disconnect callback called multiple times");
                 task_source.queue(trusted.resolve_task(()));
-            }),
-        );
-        self.disconnect(sender);
+            })
+            .expect("Could not create callback");
+        self.disconnect(callback);
         p
     }
 
@@ -334,7 +327,7 @@ impl FakeXRDeviceMethods<crate::DomTypeHolder> for FakeXRDevice {
     fn SetBoundsGeometry(&self, bounds_coodinates: Vec<FakeXRBoundsPoint>) -> Fallible<()> {
         if bounds_coodinates.len() < 3 {
             return Err(Error::Type(
-                "Bounds geometry must contain at least 3 points".into(),
+                c"Bounds geometry must contain at least 3 points".into(),
             ));
         }
         let coords = bounds_coodinates

@@ -10,8 +10,7 @@ interface Navigator {
 Navigator includes NavigatorID;
 Navigator includes NavigatorLanguage;
 Navigator includes NavigatorOnLine;
-//Navigator includes NavigatorContentUtils;
-//Navigator includes NavigatorStorageUtils;
+Navigator includes NavigatorContentUtils;
 Navigator includes NavigatorPlugins;
 Navigator includes NavigatorCookies;
 Navigator includes NavigatorConcurrentHardware;
@@ -54,6 +53,7 @@ interface mixin NavigatorPlugins {
   [SameObject] readonly attribute PluginArray plugins;
   [SameObject] readonly attribute MimeTypeArray mimeTypes;
   boolean javaEnabled();
+  readonly attribute boolean pdfViewerEnabled;
 };
 
 // https://html.spec.whatwg.org/multipage/#navigatorcookies
@@ -67,11 +67,6 @@ partial interface Navigator {
   [Pref="dom_permissions_enabled"] readonly attribute Permissions permissions;
 };
 
-// https://w3c.github.io/gamepad/#navigator-interface-extension
-partial interface Navigator {
-  [Pref="dom_gamepad_enabled"] sequence<Gamepad?> getGamepads();
-};
-
 // https://html.spec.whatwg.org/multipage/#navigatorconcurrenthardware
 interface mixin NavigatorConcurrentHardware {
   readonly attribute unsigned long long hardwareConcurrency;
@@ -80,4 +75,15 @@ interface mixin NavigatorConcurrentHardware {
 // https://w3c.github.io/clipboard-apis/#navigator-interface
 partial interface Navigator {
   [SecureContext, SameObject, Pref="dom_async_clipboard_enabled"] readonly attribute Clipboard clipboard;
+};
+
+// https://w3c.github.io/beacon/#sendbeacon-method
+partial interface Navigator {
+  [Throws] boolean sendBeacon(USVString url, optional BodyInit? data = null);
+};
+
+// https://html.spec.whatwg.org/multipage/#custom-handlers
+interface mixin NavigatorContentUtils {
+  [Throws, SecureContext, Pref="dom_navigator_protocol_handlers_enabled"] undefined registerProtocolHandler(DOMString scheme, USVString url);
+  [Throws, SecureContext, Pref="dom_navigator_protocol_handlers_enabled"] undefined unregisterProtocolHandler(DOMString scheme, USVString url);
 };

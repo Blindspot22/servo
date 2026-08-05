@@ -5,12 +5,17 @@
   buildAndroid ? false
 }:
 with import (builtins.fetchTarball {
-  url = "https://github.com/NixOS/nixpkgs/archive/1e5b653dff12029333a6546c11e108ede13052eb.tar.gz";
+  # NixOS users: if servoshell crashes with an assertion failure in surfman’s x11/connection.rs,
+  # eglInitialize() may be failing, or you may be building with an incompatible version of glibc.
+  # Use your system nixpkgs here, change `llvmPackages` below if necessary, then do a clean build.
+  url = "https://github.com/NixOS/nixpkgs/archive/d233902339c02a9c334e7e593de68855ad26c4cb.tar.gz";
 }) {
   overlays = [
     (import (builtins.fetchTarball {
       # Bumped the channel in rust-toolchain.toml? Bump this commit too!
-      url = "https://github.com/oxalica/rust-overlay/archive/7c5892ad87b90d72668964975eebd4e174ff6204.tar.gz";
+      # Use the latest commit hash for the manifest associated with the relevant version number in
+      # https://github.com/oxalica/rust-overlay/tree/master/manifests
+      url = "https://github.com/oxalica/rust-overlay/archive/62e3b8aedabc240e5b0cc9fae003bc9edfebbc9b.tar.gz";
     }))
   ];
   config = {
@@ -28,11 +33,7 @@ let
       url = "https://github.com/NixOS/nixpkgs/archive/6adf48f53d819a7b6e15672817fa1e78e5f4e84f.tar.gz";
     }) {};
 
-    # We need clangStdenv with:
-    # - clang < 16 (#30587)
-    # - clang < 15 (#31059)
-    # - glibc 2.38 (#31054)
-    llvmPackages = llvmPackages_14;
+    llvmPackages = llvmPackages_20;
     stdenv = llvmPackages.stdenv;
 
     buildToolsVersion = "34.0.0";
@@ -45,7 +46,7 @@ let
       systemImageTypes = [ "google_apis" ];
       abiVersions = [ "x86" "armeabi-v7a" ];
       includeNDK = true;
-      ndkVersion = "26.2.11394342";
+      ndkVersion = "28.2.13676358";
       useGoogleAPIs = false;
       useGoogleTVAddOns = false;
       includeExtras = [
@@ -53,6 +54,19 @@ let
       ];
   };
   androidSdk = androidComposition.androidsdk;
+
+  # FHS wrappers for Python tools installed via venv (e.g ruff, pyrefly)
+  # These allow running dynamically linked binaries on NixOS without patching them.
+  # The wrappers provide an FHS environment at runtime.
+  mkVenvFhsWrapper =
+    name:
+    buildFHSEnv {
+      inherit name;
+      runScript = writeShellScript "${name}-fhs" ''
+        exec "${toString ./.}/.venv/bin/${name}" "$@"
+      '';
+    };
+
   # Required by ./mach build --android
   androidEnvironment = lib.optionalAttrs buildAndroid rec {
     ANDROID_SDK_ROOT = "${androidSdk}/libexec/android-sdk";
@@ -63,11 +77,14 @@ in
 stdenv.mkDerivation (androidEnvironment // {
   name = "servo-env";
 
+  # NOTE: tshark(1) for etc/devtools-parser.py can’t be installed here, because it requires
+  # CAP_NET_RAW and CAP_NET_ADMIN. Install Wireshark with your system package manager,
+  # or for NixOS, enable the option: `programs.wireshark.enable = true;`
   buildInputs = [
     # Native dependencies
     fontconfig freetype libunwind
-    xorg.libxcb
-    xorg.libX11
+    libxcb
+    libx11
 
     gst_all_1.gstreamer
     gst_all_1.gst-plugins-base
@@ -78,10 +95,10 @@ stdenv.mkDerivation (androidEnvironment // {
     rustup
     taplo
     cargo-deny
+    cargo-nextest
     llvmPackages.bintools # provides lld
 
     udev # Needed by libudev-sys for GamePad API.
-    wireshark-cli  # for `tshark` in etc/devtools_parser.py
 
     # Build utilities
     cmake dbus gcc git pkg-config which llvm perl yasm m4
@@ -89,7 +106,6 @@ stdenv.mkDerivation (androidEnvironment // {
     # Ensure the Python version is same as the one in `.python-version` file so
     # that `uv` will just symlink to the one in nix store. Otherwise `uv` will
     # download a pre-built binary that won't work on nix.
-    # FIXME: dbus python module needs to be installed into the virtual environment.
     python311
     uv
 
@@ -130,13 +146,13 @@ stdenv.mkDerivation (androidEnvironment // {
   # Provide libraries that aren’t linked against but somehow required
   LD_LIBRARY_PATH = lib.makeLibraryPath [
     # Fixes missing library errors
-    xorg.libXcursor xorg.libXrandr xorg.libXi libxkbcommon
+    wayland libxcursor libxrandr libxi libxkbcommon
 
     # [WARN  script::dom::gpu] Could not get GPUAdapter ("NotFound")
     # TLA Err: Error: Couldn't request WebGPU adapter.
     vulkan-loader
 
-    # $ cargo run -p libservo --example winit_minimal
+    # $ cargo run -p servo --example winit_minimal
     # Unable to load the libEGL shared object
     libGL
   ];
@@ -189,6 +205,15 @@ stdenv.mkDerivation (androidEnvironment // {
       # get patched in a way that makes them dependent on the Nix store.
       repo_root=$(git rev-parse --show-toplevel)
       export RUSTUP_HOME=$repo_root/.rustup
+    else
+      # On NixOS, export FHS wrapper paths so mach can prepend them to PATH at runtime
+      # This ensures the FHS-wrapped binaries take precedence over .venv/bin
+      export SERVO_NIX_BIN_DIR="${
+        lib.makeBinPath [
+          (mkVenvFhsWrapper "ruff")
+          (mkVenvFhsWrapper "pyrefly")
+        ]
+      }"
     fi
   '';
 })

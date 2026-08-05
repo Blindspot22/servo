@@ -5,15 +5,17 @@
 use std::cell::Cell;
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use js::gc::CustomAutoRooterGuard;
 use js::typedarray::Float32Array;
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
 use webxr_api::{Frame, LayerId, SubImages};
 
 use crate::dom::bindings::codegen::Bindings::XRFrameBinding::XRFrameMethods;
 use crate::dom::bindings::error::Error;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::num::Finite;
-use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object};
+use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::window::Window;
 use crate::dom::xrhittestresult::XRHitTestResult;
@@ -25,13 +27,11 @@ use crate::dom::xrreferencespace::XRReferenceSpace;
 use crate::dom::xrsession::{ApiPose, XRSession};
 use crate::dom::xrspace::XRSpace;
 use crate::dom::xrviewerpose::XRViewerPose;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct XRFrame {
     reflector_: Reflector,
     session: Dom<XRSession>,
-    #[ignore_malloc_size_of = "defined in webxr_api"]
     #[no_trace]
     data: Frame,
     active: Cell<bool>,
@@ -50,16 +50,12 @@ impl XRFrame {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         window: &Window,
         session: &XRSession,
         data: Frame,
-        can_gc: CanGc,
     ) -> DomRoot<XRFrame> {
-        reflect_dom_object(
-            Box::new(XRFrame::new_inherited(session, data)),
-            window,
-            can_gc,
-        )
+        reflect_dom_object_with_cx(Box::new(XRFrame::new_inherited(session, data)), window, cx)
     }
 
     /// <https://immersive-web.github.io/webxr/#xrframe-active>
@@ -101,15 +97,15 @@ impl XRFrameMethods<crate::DomTypeHolder> for XRFrame {
     /// <https://immersive-web.github.io/webxr/#dom-xrframe-getviewerpose>
     fn GetViewerPose(
         &self,
+        cx: &mut JSContext,
         reference: &XRReferenceSpace,
-        can_gc: CanGc,
     ) -> Result<Option<DomRoot<XRViewerPose>>, Error> {
         if self.session != reference.upcast::<XRSpace>().session() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         if !self.active.get() || !self.animation_frame.get() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         let to_base = if let Some(to_base) = reference.get_base_transform(&self.data) {
@@ -123,26 +119,26 @@ impl XRFrameMethods<crate::DomTypeHolder> for XRFrame {
             return Ok(None);
         };
         Ok(Some(XRViewerPose::new(
+            cx,
             self.global().as_window(),
             &self.session,
             to_base,
             viewer_pose,
-            can_gc,
         )))
     }
 
     /// <https://immersive-web.github.io/webxr/#dom-xrframe-getpose>
     fn GetPose(
         &self,
+        cx: &mut JSContext,
         space: &XRSpace,
         base_space: &XRSpace,
-        can_gc: CanGc,
     ) -> Result<Option<DomRoot<XRPose>>, Error> {
         if self.session != space.session() || self.session != base_space.session() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
         if !self.active.get() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
         let space = if let Some(space) = self.get_pose(space) {
             space
@@ -155,23 +151,23 @@ impl XRFrameMethods<crate::DomTypeHolder> for XRFrame {
             return Ok(None);
         };
         let pose = space.then(&base_space.inverse());
-        Ok(Some(XRPose::new(self.global().as_window(), pose, can_gc)))
+        Ok(Some(XRPose::new(cx, self.global().as_window(), pose)))
     }
 
     /// <https://immersive-web.github.io/webxr/#dom-xrframe-getpose>
     fn GetJointPose(
         &self,
+        cx: &mut JSContext,
         space: &XRJointSpace,
         base_space: &XRSpace,
-        can_gc: CanGc,
     ) -> Result<Option<DomRoot<XRJointPose>>, Error> {
         if self.session != space.upcast::<XRSpace>().session() ||
             self.session != base_space.session()
         {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
         if !self.active.get() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
         let joint_frame = if let Some(frame) = space.frame(&self.data) {
             frame
@@ -185,24 +181,27 @@ impl XRFrameMethods<crate::DomTypeHolder> for XRFrame {
         };
         let pose = joint_frame.pose.then(&base_space.inverse());
         Ok(Some(XRJointPose::new(
+            cx,
             self.global().as_window(),
             pose.cast_unit(),
             Some(joint_frame.radius),
-            can_gc,
         )))
     }
 
     /// <https://immersive-web.github.io/hit-test/#dom-xrframe-gethittestresults>
-    fn GetHitTestResults(&self, source: &XRHitTestSource) -> Vec<DomRoot<XRHitTestResult>> {
+    fn GetHitTestResults(
+        &self,
+        cx: &mut JSContext,
+        source: &XRHitTestSource,
+    ) -> Vec<DomRoot<XRHitTestResult>> {
         self.data
             .hit_test_results
             .iter()
             .filter(|r| r.id == source.id())
-            .map(|r| XRHitTestResult::new(self.global().as_window(), *r, self, CanGc::note()))
+            .map(|r| XRHitTestResult::new(cx, self.global().as_window(), *r, self))
             .collect()
     }
 
-    #[allow(unsafe_code)]
     /// <https://www.w3.org/TR/webxr-hand-input-1/#dom-xrframe-filljointradii>
     fn FillJointRadii(
         &self,
@@ -210,22 +209,22 @@ impl XRFrameMethods<crate::DomTypeHolder> for XRFrame {
         mut radii: CustomAutoRooterGuard<Float32Array>,
     ) -> Result<bool, Error> {
         if !self.active.get() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         for joint_space in &joint_spaces {
             if self.session != joint_space.upcast::<XRSpace>().session() {
-                return Err(Error::InvalidState);
+                return Err(Error::InvalidState(None));
             }
         }
 
         if joint_spaces.len() > radii.len() {
             return Err(Error::Type(
-                "Length of radii does not match length of joint spaces".to_string(),
+                c"Length of radii does not match length of joint spaces".to_owned(),
             ));
         }
 
-        let mut radii_vec = radii.to_vec();
+        let mut radii_vec = radii.to_vec().unwrap_or_default();
         let mut all_valid = true;
         radii_vec.iter_mut().enumerate().for_each(|(i, radius)| {
             if let Some(joint_frame) = joint_spaces
@@ -247,7 +246,6 @@ impl XRFrameMethods<crate::DomTypeHolder> for XRFrame {
         Ok(all_valid)
     }
 
-    #[allow(unsafe_code)]
     /// <https://www.w3.org/TR/webxr-hand-input-1/#dom-xrframe-fillposes>
     fn FillPoses(
         &self,
@@ -256,26 +254,26 @@ impl XRFrameMethods<crate::DomTypeHolder> for XRFrame {
         mut transforms: CustomAutoRooterGuard<Float32Array>,
     ) -> Result<bool, Error> {
         if !self.active.get() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         for space in &spaces {
             if self.session != space.session() {
-                return Err(Error::InvalidState);
+                return Err(Error::InvalidState(None));
             }
         }
 
         if self.session != base_space.session() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         if spaces.len() * 16 > transforms.len() {
             return Err(Error::Type(
-                "Transforms array length does not match 16 * spaces length".to_string(),
+                c"Transforms array length does not match 16 * spaces length".to_owned(),
             ));
         }
 
-        let mut transforms_vec = transforms.to_vec();
+        let mut transforms_vec = transforms.to_vec().unwrap_or_default();
         let mut all_valid = true;
         spaces.iter().enumerate().for_each(|(i, space)| {
             let Some(joint_pose) = self.get_pose(space) else {

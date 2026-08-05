@@ -2,8 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use canvas_traits::webgl::{GLLimits, WebGLVersion};
 use glow::{self as gl, Context as Gl, HasContext};
+use num_traits::AsPrimitive;
+use servo_canvas_traits::webgl::{GLLimits, WebGLVersion};
 type GLenum = u32;
 
 pub trait GLLimitsDetect {
@@ -14,6 +15,7 @@ impl GLLimitsDetect for GLLimits {
     fn detect(gl: &Gl, webgl_version: WebGLVersion) -> GLLimits {
         let max_vertex_attribs = gl.get_integer(gl::MAX_VERTEX_ATTRIBS);
         let max_tex_size = gl.get_integer(gl::MAX_TEXTURE_SIZE);
+        let max_3d_tex_size = gl.get_integer(gl::MAX_3D_TEXTURE_SIZE);
         let max_cube_map_tex_size = gl.get_integer(gl::MAX_CUBE_MAP_TEXTURE_SIZE);
         let max_combined_texture_image_units = gl.get_integer(gl::MAX_COMBINED_TEXTURE_IMAGE_UNITS);
         let max_renderbuffer_size = gl.get_integer(gl::MAX_RENDERBUFFER_SIZE);
@@ -160,6 +162,7 @@ impl GLLimitsDetect for GLLimits {
         GLLimits {
             max_vertex_attribs,
             max_tex_size,
+            max_3d_tex_size,
             max_cube_map_tex_size,
             max_combined_texture_image_units,
             max_fragment_uniform_vectors,
@@ -212,48 +215,57 @@ trait GLExt {
     fn get_float(self, parameter: GLenum) -> f32;
 }
 
-macro_rules! create_fun {
-    ($tryer:ident, $getter:ident, $gltype:ty, $glcall:ident, $rstype:ty) => {
-        #[allow(unsafe_code)]
-        fn $tryer(self, parameter: GLenum) -> Option<$rstype> {
-            let mut value = [<$gltype>::default()];
-            unsafe {
-                self.$glcall(parameter, &mut value);
-            }
-            if unsafe { self.get_error() } != gl::NO_ERROR {
-                None
-            } else {
-                Some(value[0] as $rstype)
-            }
-        }
-
-        fn $getter(self, parameter: GLenum) -> $rstype {
-            self.$tryer(parameter).unwrap()
-        }
-    };
+#[expect(unsafe_code)]
+fn try_gl_parameter<T, U>(
+    gl: &Gl,
+    parameter: GLenum,
+    f: unsafe fn(&Gl, GLenum, &mut [T]),
+) -> Option<U>
+where
+    T: 'static + Default + Copy + AsPrimitive<U>,
+    U: 'static + Copy,
+{
+    let mut value = [T::default()];
+    unsafe {
+        f(gl, parameter, &mut value);
+    }
+    if unsafe { gl.get_error() } != gl::NO_ERROR {
+        None
+    } else {
+        Some(value[0].as_())
+    }
 }
 
 impl GLExt for &Gl {
-    create_fun!(
-        try_get_integer,
-        get_integer,
-        i32,
-        get_parameter_i32_slice,
-        u32
-    );
-    create_fun!(
-        try_get_integer64,
-        get_integer64,
-        i64,
-        get_parameter_i64_slice,
-        u64
-    );
-    create_fun!(
-        try_get_signed_integer,
-        get_signed_integer,
-        i32,
-        get_parameter_i32_slice,
-        i32
-    );
-    create_fun!(try_get_float, get_float, f32, get_parameter_f32_slice, f32);
+    fn try_get_integer(self, parameter: GLenum) -> Option<u32> {
+        try_gl_parameter::<i32, _>(self, parameter, Gl::get_parameter_i32_slice)
+    }
+
+    fn get_integer(self, parameter: GLenum) -> u32 {
+        self.try_get_integer(parameter).unwrap()
+    }
+
+    fn try_get_integer64(self, parameter: GLenum) -> Option<u64> {
+        try_gl_parameter::<i64, _>(self, parameter, Gl::get_parameter_i64_slice)
+    }
+
+    fn get_integer64(self, parameter: GLenum) -> u64 {
+        self.try_get_integer64(parameter).unwrap()
+    }
+
+    fn try_get_signed_integer(self, parameter: GLenum) -> Option<i32> {
+        try_gl_parameter::<i32, _>(self, parameter, Gl::get_parameter_i32_slice)
+    }
+
+    fn get_signed_integer(self, parameter: GLenum) -> i32 {
+        self.try_get_signed_integer(parameter).unwrap()
+    }
+
+    fn try_get_float(self, parameter: GLenum) -> Option<f32> {
+        try_gl_parameter::<f32, _>(self, parameter, Gl::get_parameter_f32_slice)
+    }
+
+    fn get_float(self, parameter: GLenum) -> f32 {
+        self.try_get_float(parameter).unwrap()
+    }
 }

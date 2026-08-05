@@ -3,9 +3,9 @@
 **/export const description = `Test memory layout requirements`;import { makeTestGroup } from '../../../common/framework/test_group.js';
 import { keysOf } from '../../../common/util/data_tables.js';
 import { iterRange } from '../../../common/util/util.js';
-import { GPUTest } from '../../gpu_test.js';
+import { AllFeaturesMaxLimitsGPUTest } from '../../gpu_test.js';
 
-export const g = makeTestGroup(GPUTest);
+export const g = makeTestGroup(AllFeaturesMaxLimitsGPUTest);
 
 
 
@@ -928,22 +928,27 @@ beginSubcases()
 ).
 beforeAllSubcases((t) => {
   const testcase = kLayoutCases[t.params.case];
-  if (testcase.f16) {
-    t.selectDeviceOrSkipTestCase('shader-f16');
-  }
   // Don't test atomics in workgroup due to initialization boilerplate.
   t.skipIf(
     testcase.type.includes('atomic') && t.params.aspace !== 'storage',
     `Skipping atomic test for non-storage address space`
   );
 
+  // If the `uniform_buffer_standard_layout` feature is supported, the `uniform` address space has
+  // the same layout constraints as `storage`.
+  const ubo_std_layout = t.hasLanguageFeature('uniform_buffer_standard_layout');
+
   t.skipIf(
-    testcase.skip_uniform === true && t.params.aspace === 'uniform',
+    !ubo_std_layout && testcase.skip_uniform === true && t.params.aspace === 'uniform',
     `Uniform requires 16 byte alignment`
   );
 }).
 fn((t) => {
   const testcase = kLayoutCases[t.params.case];
+  if (testcase.f16) {
+    t.skipIfDeviceDoesNotHaveFeature('shader-f16');
+  }
+
   let code = `
 ${testcase.f16 ? 'enable f16;' : ''}
 ${testcase.decl ?? ''}
@@ -1068,9 +1073,6 @@ beginSubcases()
 ).
 beforeAllSubcases((t) => {
   const testcase = kLayoutCases[t.params.case];
-  if (testcase.f16) {
-    t.selectDeviceOrSkipTestCase('shader-f16');
-  }
   // Don't test atomics in workgroup due to initialization boilerplate.
   t.skipIf(
     testcase.type.includes('atomic') && t.params.aspace !== 'storage',
@@ -1079,6 +1081,10 @@ beforeAllSubcases((t) => {
 }).
 fn((t) => {
   const testcase = kLayoutCases[t.params.case];
+  if (testcase.f16) {
+    t.skipIfDeviceDoesNotHaveFeature('shader-f16');
+  }
+
   let code = `
 ${testcase.f16 ? 'enable f16;' : ''}
 ${testcase.decl ?? ''}

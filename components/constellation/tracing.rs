@@ -2,14 +2,14 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-/// Log an event from compositor at trace level.
-/// - To disable tracing: RUST_LOG='constellation<compositor@=off'
-/// - To enable tracing: RUST_LOG='constellation<compositor@'
+/// Log an event from embedder at trace level.
+/// - To disable tracing: RUST_LOG='constellation<embedder@=off'
+/// - To enable tracing: RUST_LOG='constellation<embedder@'
 /// - Recommended filters when tracing is enabled:
-///   - constellation<compositor@ForwardEvent(MouseMoveEvent)=off
-///   - constellation<compositor@LogEntry=off
-///   - constellation<compositor@ReadyToPresent=off
-macro_rules! trace_msg_from_compositor {
+///   - constellation<embedder@ForwardEvent(MouseMoveEvent)=off
+///   - constellation<embedder@LogEntry=off
+///   - constellation<embedder@ReadyToPresent=off
+macro_rules! trace_msg_from_embedder {
     // This macro only exists to put the docs in the same file as the target prefix,
     // so the macro definition is always the same.
     ($event:expr, $($rest:tt)+) => {
@@ -35,28 +35,23 @@ pub(crate) trait LogTarget {
     fn log_target(&self) -> &'static str;
 }
 
-mod from_compositor {
-    use embedder_traits::InputEvent;
+mod from_embedder {
+    use embedder_traits::{InputEvent, InputEventAndId};
 
     use super::LogTarget;
 
     macro_rules! target {
         ($($name:literal)+) => {
-            concat!("constellation<compositor@", $($name),+)
+            concat!("constellation<embedder@", $($name),+)
         };
     }
 
-    impl LogTarget for constellation_traits::EmbedderToConstellationMessage {
+    impl LogTarget for servo_constellation_traits::EmbedderToConstellationMessage {
         fn log_target(&self) -> &'static str {
             match self {
                 Self::Exit => target!("Exit"),
-                Self::GetFocusTopLevelBrowsingContext(..) => {
-                    target!("GetFocusTopLevelBrowsingContext")
-                },
-                Self::IsReadyToSaveImage(..) => target!("IsReadyToSaveImage"),
                 Self::AllowNavigationResponse(..) => target!("AllowNavigationResponse"),
                 Self::LoadUrl(..) => target!("LoadUrl"),
-                Self::ClearCache => target!("ClearCache"),
                 Self::TraverseHistory(..) => target!("TraverseHistory"),
                 Self::ChangeViewportDetails(..) => target!("ChangeViewportDetails"),
                 Self::ThemeChange(..) => target!("ThemeChange"),
@@ -66,35 +61,48 @@ mod from_compositor {
                 Self::LogEntry(..) => target!("LogEntry"),
                 Self::NewWebView(..) => target!("NewWebView"),
                 Self::CloseWebView(..) => target!("CloseWebView"),
-                Self::SendError(..) => target!("SendError"),
                 Self::FocusWebView(..) => target!("FocusWebView"),
                 Self::BlurWebView => target!("BlurWebView"),
                 Self::ForwardInputEvent(_webview_id, event, ..) => event.log_target(),
-                Self::SetCursor(..) => target!("SetCursor"),
+                Self::RefreshCursor(..) => target!("RefreshCursor"),
                 Self::ToggleProfiler(..) => target!("EnableProfiler"),
                 Self::ExitFullScreen(_) => target!("ExitFullScreen"),
                 Self::MediaSessionAction(_) => target!("MediaSessionAction"),
                 Self::SetWebViewThrottled(_, _) => target!("SetWebViewThrottled"),
                 Self::SetScrollStates(..) => target!("SetScrollStates"),
                 Self::PaintMetric(..) => target!("PaintMetric"),
+                Self::EvaluateJavaScript(..) => target!("EvaluateJavaScript"),
+                Self::CreateMemoryReport(..) => target!("CreateMemoryReport"),
+                Self::SendImageKeysForPipeline(..) => target!("SendImageKeysForPipeline"),
+                Self::PreferencesUpdated(..) => target!("PreferencesUpdated"),
+                Self::NoLongerWaitingOnAsynchronousImageUpdates(..) => {
+                    target!("NoLongerWaitingOnCanvas")
+                },
+                Self::RequestScreenshotReadiness(..) => target!("RequestScreenshotReadiness"),
+                Self::EmbedderControlResponse(..) => target!("EmbedderControlResponse"),
+                Self::UserContentManagerAction(..) => target!("UserContentManagerAction"),
+                Self::UpdatePinchZoomInfos(..) => target!("UpdatePinchZoomInfos"),
+                Self::SetAccessibilityActive(..) => target!("SetAccessibilityActive"),
             }
         }
     }
 
-    impl LogTarget for InputEvent {
+    impl LogTarget for InputEventAndId {
         fn log_target(&self) -> &'static str {
             macro_rules! target_variant {
                 ($name:literal) => {
                     target!("ForwardInputEvent(" $name ")")
                 };
             }
-            match self {
+            match self.event {
                 InputEvent::EditingAction(..) => target_variant!("EditingAction"),
+                #[cfg(feature = "gamepad")]
                 InputEvent::Gamepad(..) => target_variant!("Gamepad"),
                 InputEvent::Ime(..) => target_variant!("Ime"),
                 InputEvent::Keyboard(..) => target_variant!("Keyboard"),
                 InputEvent::MouseButton(..) => target_variant!("MouseButton"),
                 InputEvent::MouseMove(..) => target_variant!("MouseMove"),
+                InputEvent::MouseLeftViewport(..) => target_variant!("MouseLeftViewport"),
                 InputEvent::Touch(..) => target_variant!("Touch"),
                 InputEvent::Wheel(..) => target_variant!("Wheel"),
             }
@@ -103,8 +111,6 @@ mod from_compositor {
 }
 
 mod from_script {
-    use embedder_traits::LoadStatus;
-
     use super::LogTarget;
 
     macro_rules! target {
@@ -113,9 +119,10 @@ mod from_script {
         };
     }
 
-    impl LogTarget for constellation_traits::ScriptToConstellationMessage {
+    impl LogTarget for servo_constellation_traits::ScriptToConstellationMessage {
         fn log_target(&self) -> &'static str {
             match self {
+                Self::ServiceWorkerAlgorithm(..) => target!("ServiceWorkerAlgorithm"),
                 Self::CompleteMessagePortTransfer(..) => target!("CompleteMessagePortTransfer"),
                 Self::MessagePortTransferResult(..) => target!("MessagePortTransferResult"),
                 Self::NewMessagePort(..) => target!("NewMessagePort"),
@@ -134,14 +141,18 @@ mod from_script {
                     target!("RemoveBroadcastChannelNameInRouter")
                 },
                 Self::ScheduleBroadcast(..) => target!("ScheduleBroadcast"),
-                Self::ForwardToEmbedder(msg) => msg.log_target(),
+                Self::RegisterInterest(..) => target!("RegisterInterest"),
+                Self::UnregisterInterest(..) => target!("UnregisterInterest"),
                 Self::BroadcastStorageEvent(..) => target!("BroadcastStorageEvent"),
                 Self::ChangeRunningAnimationsState(..) => target!("ChangeRunningAnimationsState"),
                 Self::CreateCanvasPaintThread(..) => target!("CreateCanvasPaintThread"),
-                Self::Focus(..) => target!("Focus"),
-                Self::FocusRemoteDocument(..) => target!("FocusRemoteDocument"),
+                Self::FocusAncestorBrowsingContextsForFocusingSteps(..) => {
+                    target!("FocusAncestorBrowsingContextsForFocusingSteps")
+                },
+                Self::FocusRemoteBrowsingContext(..) => target!("FocusRemoteBrowsingContext"),
                 Self::GetTopForBrowsingContext(..) => target!("GetTopForBrowsingContext"),
                 Self::GetBrowsingContextInfo(..) => target!("GetBrowsingContextInfo"),
+                Self::GetDocumentOrigin(..) => target!("GetDocumentOrigin"),
                 Self::GetChildBrowsingContextId(..) => target!("GetChildBrowsingContextId"),
                 Self::LoadComplete => target!("LoadComplete"),
                 Self::LoadUrl(..) => target!("LoadUrl"),
@@ -159,15 +170,12 @@ mod from_script {
                 Self::CreateAuxiliaryWebView(..) => target!("ScriptNewAuxiliary"),
                 Self::ActivateDocument => target!("ActivateDocument"),
                 Self::SetDocumentState(..) => target!("SetDocumentState"),
-                Self::SetLayoutEpoch(..) => target!("SetLayoutEpoch"),
                 Self::SetFinalUrl(..) => target!("SetFinalUrl"),
-                Self::TouchEventProcessed(..) => target!("TouchEventProcessed"),
                 Self::LogEntry(..) => target!("LogEntry"),
                 Self::DiscardDocument => target!("DiscardDocument"),
                 Self::DiscardTopLevelBrowsingContext => target!("DiscardTopLevelBrowsingContext"),
                 Self::PipelineExited => target!("PipelineExited"),
                 Self::ForwardDOMMessage(..) => target!("ForwardDOMMessage"),
-                Self::ScheduleJob(..) => target!("ScheduleJob"),
                 Self::MediaSessionEvent(..) => target!("MediaSessionEvent"),
                 #[cfg(feature = "webgpu")]
                 Self::RequestAdapter(..) => target!("RequestAdapter"),
@@ -176,68 +184,14 @@ mod from_script {
                 Self::TitleChanged(..) => target!("TitleChanged"),
                 Self::IFrameSizes(..) => target!("IFrameSizes"),
                 Self::ReportMemory(..) => target!("ReportMemory"),
-            }
-        }
-    }
-
-    impl LogTarget for embedder_traits::EmbedderMsg {
-        fn log_target(&self) -> &'static str {
-            macro_rules! target_variant {
-                ($name:literal) => {
-                    target!("ForwardToEmbedder(" $name ")")
-                };
-            }
-            match self {
-                Self::Status(..) => target_variant!("Status"),
-                Self::ChangePageTitle(..) => target_variant!("ChangePageTitle"),
-                Self::MoveTo(..) => target_variant!("MoveTo"),
-                Self::ResizeTo(..) => target_variant!("ResizeTo"),
-                Self::ShowSimpleDialog(..) => target_variant!("ShowSimpleDialog"),
-                Self::RequestAuthentication(..) => target_variant!("RequestAuthentication"),
-                Self::ShowContextMenu(..) => target_variant!("ShowContextMenu"),
-                Self::AllowNavigationRequest(..) => target_variant!("AllowNavigationRequest"),
-                Self::AllowOpeningWebView(..) => target_variant!("AllowOpeningWebView"),
-                Self::WebViewClosed(..) => target_variant!("WebViewClosed"),
-                Self::WebViewFocused(..) => target_variant!("WebViewFocused"),
-                Self::WebViewBlurred => target_variant!("WebViewBlurred"),
-                Self::WebResourceRequested(..) => target_variant!("WebResourceRequested"),
-                Self::AllowUnload(..) => target_variant!("AllowUnload"),
-                Self::Keyboard(..) => target_variant!("Keyboard"),
-                Self::ClearClipboard(..) => target_variant!("ClearClipboard"),
-                Self::GetClipboardText(..) => target_variant!("GetClipboardText"),
-                Self::SetClipboardText(..) => target_variant!("SetClipboardText"),
-                Self::SetCursor(..) => target_variant!("SetCursor"),
-                Self::NewFavicon(..) => target_variant!("NewFavicon"),
-                Self::HistoryChanged(..) => target_variant!("HistoryChanged"),
-                Self::NotifyFullscreenStateChanged(..) => {
-                    target_variant!("NotifyFullscreenStateChanged")
+                Self::FinishJavaScriptEvaluation(..) => target!("FinishJavaScriptEvaluation"),
+                Self::ForwardKeyboardScroll(..) => target!("ForwardKeyboardScroll"),
+                Self::RespondToScreenshotReadinessRequest(..) => {
+                    target!("RespondToScreenshotReadinessRequest")
                 },
-                Self::NotifyLoadStatusChanged(_, LoadStatus::Started) => {
-                    target_variant!("NotifyLoadStatusChanged(LoadStatus::Started)")
-                },
-                Self::NotifyLoadStatusChanged(_, LoadStatus::HeadParsed) => {
-                    target_variant!("NotifyLoadStatusChanged(LoadStatus::HeadParsed)")
-                },
-                Self::NotifyLoadStatusChanged(_, LoadStatus::Complete) => {
-                    target_variant!("NotifyLoadStatusChanged(LoadStatus::Complete")
-                },
-                Self::Panic(..) => target_variant!("Panic"),
-                Self::GetSelectedBluetoothDevice(..) => {
-                    target_variant!("GetSelectedBluetoothDevice")
-                },
-                Self::SelectFiles(..) => target_variant!("SelectFiles"),
-                Self::PromptPermission(..) => target_variant!("PromptPermission"),
-                Self::ShowIME(..) => target_variant!("ShowIME"),
-                Self::HideIME(..) => target_variant!("HideIME"),
-                Self::ReportProfile(..) => target_variant!("ReportProfile"),
-                Self::MediaSessionEvent(..) => target_variant!("MediaSessionEvent"),
-                Self::OnDevtoolsStarted(..) => target_variant!("OnDevtoolsStarted"),
-                Self::RequestDevtoolsConnection(..) => target_variant!("RequestDevtoolsConnection"),
-                Self::PlayGamepadHapticEffect(..) => target_variant!("PlayGamepadHapticEffect"),
-                Self::StopGamepadHapticEffect(..) => target_variant!("StopGamepadHapticEffect"),
-                Self::ShutdownComplete => target_variant!("ShutdownComplete"),
-                Self::ShowNotification(..) => target_variant!("ShowNotification"),
-                Self::ShowSelectElementMenu(..) => target_variant!("ShowSelectElementMenu"),
+                Self::TriggerGarbageCollection => target!("TriggerGarbageCollection"),
+                Self::AcquireWakeLock(..) => target!("AcquireWakeLock"),
+                Self::ReleaseWakeLock(..) => target!("ReleaseWakeLock"),
             }
         }
     }

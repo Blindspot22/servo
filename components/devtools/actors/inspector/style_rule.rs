@@ -7,28 +7,30 @@
 //! A group is either the html style attribute or one selector from one stylesheet.
 
 use std::collections::HashMap;
-use std::net::TcpStream;
+use std::sync::Arc;
 
 use devtools_traits::DevtoolScriptControlMsg::{
     GetAttributeStyle, GetComputedStyle, GetDocumentElement, GetStylesheetStyle, ModifyRule,
 };
-use ipc_channel::ipc;
+use devtools_traits::{AncestorData, MatchedRule};
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{Map, Value};
+use servo_base::generic_channel;
 
 use crate::StreamId;
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
+use crate::actor::{Actor, ActorEncode, ActorError, ActorRegistry, new_actor_name};
 use crate::actors::inspector::node::NodeActor;
 use crate::actors::inspector::walker::WalkerActor;
-use crate::protocol::JsonPacketStream;
+use crate::protocol::ClientRequest;
 
 const ELEMENT_STYLE_TYPE: u32 = 100;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AppliedRule {
+pub(crate) struct AppliedRule {
     actor: String,
-    ancestor_data: Vec<()>,
+    ancestor_data: Vec<AncestorData>,
     authored_text: String,
     css_text: String,
     pub declarations: Vec<AppliedDeclaration>,
@@ -43,13 +45,13 @@ pub struct AppliedRule {
 }
 
 #[derive(Serialize)]
-pub struct IsUsed {
-    pub used: bool,
+pub(crate) struct IsUsed {
+    used: bool,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AppliedDeclaration {
+pub(crate) struct AppliedDeclaration {
     colon_offsets: Vec<i32>,
     is_name_valid: bool,
     is_used: IsUsed,
@@ -62,32 +64,33 @@ pub struct AppliedDeclaration {
 }
 
 #[derive(Serialize)]
-pub struct ComputedDeclaration {
+pub(crate) struct ComputedDeclaration {
     matched: bool,
     value: String,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct StyleRuleActorTraits {
+pub(crate) struct StyleRuleActorTraits {
     pub can_set_rule_text: bool,
 }
 
 #[derive(Serialize)]
-pub struct StyleRuleActorMsg {
+pub(crate) struct StyleRuleActorMsg {
     from: String,
     rule: Option<AppliedRule>,
 }
 
-pub struct StyleRuleActor {
+#[derive(MallocSizeOf)]
+pub(crate) struct StyleRuleActor {
     name: String,
-    node: String,
-    selector: Option<(String, usize)>,
+    node_name: String,
+    selector: Option<MatchedRule>,
 }
 
 impl Actor for StyleRuleActor {
-    fn name(&self) -> String {
-        self.name.clone()
+    fn name(&self) -> &str {
+        &self.name
     }
 
     /// The style rule configuration actor can handle the following messages:
@@ -98,16 +101,20 @@ impl Actor for StyleRuleActor {
     ///   when returning the list of rules.
     fn handle_message(
         &self,
+        request: ClientRequest,
         registry: &ActorRegistry,
         msg_type: &str,
         msg: &Map<String, Value>,
-        stream: &mut TcpStream,
         _id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
-        Ok(match msg_type {
+    ) -> Result<(), ActorError> {
+        match msg_type {
             "setRuleText" => {
                 // Parse the modifications sent from the client
-                let mods = msg.get("modifications").ok_or(())?.as_array().ok_or(())?;
+                let mods = msg
+                    .get("modifications")
+                    .ok_or(ActorError::MissingParameter)?
+                    .as_array()
+                    .ok_or(ActorError::BadParameterType)?;
                 let modifications: Vec<_> = mods
                     .iter()
                     .filter_map(|json_mod| {
@@ -116,71 +123,82 @@ impl Actor for StyleRuleActor {
                     .collect();
 
                 // Query the rule modification
-                let node = registry.find::<NodeActor>(&self.node);
-                let walker = registry.find::<WalkerActor>(&node.walker);
-                walker
-                    .script_chan
+                let node_actor = registry.find::<NodeActor>(&self.node_name);
+                let walker = registry.find::<WalkerActor>(&node_actor.walker_name);
+                let browsing_context_actor = walker.browsing_context_actor(registry);
+                browsing_context_actor
+                    .script_chan()
                     .send(ModifyRule(
-                        walker.pipeline,
-                        registry.actor_to_script(self.node.clone()),
+                        browsing_context_actor.pipeline_id(),
+                        registry.actor_to_script(self.node_name.clone()),
                         modifications,
                     ))
-                    .map_err(|_| ())?;
+                    .map_err(|_| ActorError::Internal)?;
 
-                let _ = stream.write_json_packet(&self.encodable(registry));
-                ActorMessageStatus::Processed
+                request.reply_final(&self.encode(registry))?
             },
-            _ => ActorMessageStatus::Ignored,
-        })
+            _ => return Err(ActorError::UnrecognizedPacketType),
+        };
+        Ok(())
     }
 }
 
 impl StyleRuleActor {
-    pub fn new(name: String, node: String, selector: Option<(String, usize)>) -> Self {
-        Self {
+    pub fn register(
+        registry: &ActorRegistry,
+        node: String,
+        selector: Option<MatchedRule>,
+    ) -> Arc<Self> {
+        let name = new_actor_name::<Self>();
+        let actor = Self {
             name,
-            node,
+            node_name: node,
             selector,
-        }
+        };
+        registry.register::<Self>(actor)
     }
 
     pub fn applied(&self, registry: &ActorRegistry) -> Option<AppliedRule> {
-        let node = registry.find::<NodeActor>(&self.node);
-        let walker = registry.find::<WalkerActor>(&node.walker);
+        let node_actor = registry.find::<NodeActor>(&self.node_name);
+        let walker = registry.find::<WalkerActor>(&node_actor.walker_name);
+        let browsing_context_actor = walker.browsing_context_actor(registry);
 
-        let (document_sender, document_receiver) = ipc::channel().ok()?;
-        walker
-            .script_chan
-            .send(GetDocumentElement(walker.pipeline, document_sender))
+        let (document_sender, document_receiver) = generic_channel::channel()?;
+        browsing_context_actor
+            .script_chan()
+            .send(GetDocumentElement(
+                browsing_context_actor.pipeline_id(),
+                document_sender,
+            ))
             .ok()?;
         let node = document_receiver.recv().ok()??;
 
         // Gets the style definitions. If there is a selector, query the relevant stylesheet, if
         // not, this represents the style attribute.
-        let (style_sender, style_receiver) = ipc::channel().ok()?;
+        let (style_sender, style_receiver) = generic_channel::channel()?;
         let req = match &self.selector {
-            Some(selector) => {
-                let (selector, stylesheet) = selector.clone();
-                GetStylesheetStyle(
-                    walker.pipeline,
-                    registry.actor_to_script(self.node.clone()),
-                    selector,
-                    stylesheet,
-                    style_sender,
-                )
-            },
+            Some(matched_rule) => GetStylesheetStyle(
+                browsing_context_actor.pipeline_id(),
+                registry.actor_to_script(self.node_name.clone()),
+                matched_rule.clone(),
+                style_sender,
+            ),
             None => GetAttributeStyle(
-                walker.pipeline,
-                registry.actor_to_script(self.node.clone()),
+                browsing_context_actor.pipeline_id(),
+                registry.actor_to_script(self.node_name.clone()),
                 style_sender,
             ),
         };
-        walker.script_chan.send(req).ok()?;
+        browsing_context_actor.script_chan().send(req).ok()?;
         let style = style_receiver.recv().ok()??;
 
         Some(AppliedRule {
-            actor: self.name(),
-            ancestor_data: vec![], // TODO: Fill with hierarchy
+            actor: self.name().into(),
+            ancestor_data: self
+                .selector
+                .as_ref()
+                .map(|r| r.ancestor_data.clone())
+                .unwrap_or_default(),
             authored_text: "".into(),
             css_text: "".into(), // TODO: Specify the css text
             declarations: style
@@ -199,8 +217,8 @@ impl StyleRuleActor {
                     }
                 })
                 .collect(),
-            href: node.base_uri.clone(),
-            selectors: self.selector.iter().map(|(s, _)| s).cloned().collect(),
+            href: node.base_uri,
+            selectors: self.selector.iter().map(|r| r.selector.clone()).collect(),
             selectors_specificity: self.selector.iter().map(|_| 1).collect(),
             type_: ELEMENT_STYLE_TYPE,
             traits: StyleRuleActorTraits {
@@ -213,15 +231,16 @@ impl StyleRuleActor {
         &self,
         registry: &ActorRegistry,
     ) -> Option<HashMap<String, ComputedDeclaration>> {
-        let node = registry.find::<NodeActor>(&self.node);
-        let walker = registry.find::<WalkerActor>(&node.walker);
+        let node_actor = registry.find::<NodeActor>(&self.node_name);
+        let walker = registry.find::<WalkerActor>(&node_actor.walker_name);
+        let browsing_context_actor = walker.browsing_context_actor(registry);
 
-        let (style_sender, style_receiver) = ipc::channel().ok()?;
-        walker
-            .script_chan
+        let (style_sender, style_receiver) = generic_channel::channel()?;
+        browsing_context_actor
+            .script_chan()
             .send(GetComputedStyle(
-                walker.pipeline,
-                registry.actor_to_script(self.node.clone()),
+                browsing_context_actor.pipeline_id(),
+                registry.actor_to_script(self.node_name.clone()),
                 style_sender,
             ))
             .ok()?;
@@ -242,10 +261,12 @@ impl StyleRuleActor {
                 .collect(),
         )
     }
+}
 
-    pub fn encodable(&self, registry: &ActorRegistry) -> StyleRuleActorMsg {
+impl ActorEncode<StyleRuleActorMsg> for StyleRuleActor {
+    fn encode(&self, registry: &ActorRegistry) -> StyleRuleActorMsg {
         StyleRuleActorMsg {
-            from: self.name(),
+            from: self.name().into(),
             rule: self.applied(registry),
         }
     }

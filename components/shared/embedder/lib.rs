@@ -6,38 +6,179 @@
 //! defining types that cross the process boundary from the embedding/rendering layer all the way
 //! to script, thus it should have very minimal dependencies on other parts of Servo. If a type
 //! is not exposed in the API or doesn't involve messages sent to the embedding/libservo layer, it
-//! is probably a better fit for the `constellation_traits` crate.
+//! is probably a better fit for the `servo_constellation_traits` crate.
 
+pub mod embedder_controls;
 pub mod input_events;
 pub mod resources;
-pub mod user_content_manager;
-mod webdriver;
+pub mod user_contents;
+pub mod webdriver;
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fmt::{Debug, Display, Error, Formatter};
-use std::path::PathBuf;
+use std::hash::Hash;
+use std::ops::Range;
 use std::sync::Arc;
 
-use base::id::{PipelineId, ScrollTreeNodeId, WebViewId};
+use accesskit::TreeUpdate;
+use content_security_policy::Destination;
 use crossbeam_channel::Sender;
-use euclid::{Scale, Size2D};
+use euclid::{Box2D, Point2D, Scale, Size2D, Vector2D};
 use http::{HeaderMap, Method, StatusCode};
-use ipc_channel::ipc::IpcSender;
-pub use keyboard_types::{KeyboardEvent, Modifiers};
 use log::warn;
 use malloc_size_of::malloc_size_of_is_0;
 use malloc_size_of_derive::MallocSizeOf;
-use num_derive::FromPrimitive;
-use pixels::Image;
+use pixels::SharedRasterImage;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use servo_base::Epoch;
+use servo_base::generic_channel::{
+    GenericCallback, GenericSender, GenericSharedMemory, SendResult,
+};
+use servo_base::id::{PipelineId, WebViewId};
+use servo_geometry::{DeviceIndependentIntRect, DeviceIndependentIntSize};
 use servo_url::ServoUrl;
-use strum_macros::IntoStaticStr;
+use strum::{EnumMessage, IntoStaticStr};
+use style::queries::values::PrefersColorScheme;
 use style_traits::CSSPixel;
 use url::Url;
-use webrender_api::units::{DeviceIntPoint, DeviceIntRect, DeviceIntSize, DevicePixel};
+use uuid::Uuid;
+use webrender_api::ExternalScrollId;
+use webrender_api::units::{
+    DeviceIntPoint, DeviceIntRect, DeviceIntSize, DevicePixel, DevicePoint, DeviceRect,
+    DeviceVector2D, LayoutPoint, LayoutRect, LayoutSize, LayoutVector2D,
+};
 
+pub use crate::embedder_controls::*;
 pub use crate::input_events::*;
+use crate::user_contents::UserContentManagerId;
 pub use crate::webdriver::*;
+
+/// A point in a `WebView`, either expressed in device pixels or page pixels.
+/// Page pixels are CSS pixels, which take into account device pixel scale,
+/// page zoom, and pinch zoom.
+#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub enum WebViewPoint {
+    Device(DevicePoint),
+    Page(Point2D<f32, CSSPixel>),
+}
+
+impl WebViewPoint {
+    #[doc(hidden)]
+    pub fn as_device_point(&self, scale: Scale<f32, CSSPixel, DevicePixel>) -> DevicePoint {
+        match self {
+            Self::Device(point) => *point,
+            Self::Page(point) => *point * scale,
+        }
+    }
+}
+
+impl From<DevicePoint> for WebViewPoint {
+    fn from(point: DevicePoint) -> Self {
+        Self::Device(point)
+    }
+}
+
+impl From<LayoutPoint> for WebViewPoint {
+    fn from(point: LayoutPoint) -> Self {
+        Self::Page(Point2D::new(point.x, point.y))
+    }
+}
+
+impl From<Point2D<f32, CSSPixel>> for WebViewPoint {
+    fn from(point: Point2D<f32, CSSPixel>) -> Self {
+        Self::Page(point)
+    }
+}
+
+/// A rectangle in a `WebView`, either expressed in device pixels or page pixels.
+/// Page pixels are CSS pixels, which take into account device pixel scale,
+/// page zoom, and pinch zoom.
+#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub enum WebViewRect {
+    Device(DeviceRect),
+    Page(Box2D<f32, CSSPixel>),
+}
+
+impl WebViewRect {
+    #[doc(hidden)]
+    pub fn as_device_rect(&self, scale: Scale<f32, CSSPixel, DevicePixel>) -> DeviceRect {
+        match self {
+            Self::Device(rect) => *rect,
+            Self::Page(rect) => *rect * scale,
+        }
+    }
+}
+
+impl From<DeviceRect> for WebViewRect {
+    fn from(rect: DeviceRect) -> Self {
+        Self::Device(rect)
+    }
+}
+
+impl From<LayoutRect> for WebViewRect {
+    fn from(rect: LayoutRect) -> Self {
+        Self::Page(Box2D::new(
+            Point2D::new(rect.min.x, rect.min.y),
+            Point2D::new(rect.max.x, rect.max.y),
+        ))
+    }
+}
+
+impl From<Box2D<f32, CSSPixel>> for WebViewRect {
+    fn from(rect: Box2D<f32, CSSPixel>) -> Self {
+        Self::Page(rect)
+    }
+}
+
+/// A 2D vector in a `WebView`, either expressed in device pixels or page pixels.
+/// Page pixels are CSS pixels, which take into account device pixel scale,
+/// page zoom, and pinch zoom.
+#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub enum WebViewVector {
+    Device(DeviceVector2D),
+    Page(Vector2D<f32, CSSPixel>),
+}
+
+impl WebViewVector {
+    #[doc(hidden)]
+    pub fn as_device_vector(&self, scale: Scale<f32, CSSPixel, DevicePixel>) -> DeviceVector2D {
+        match self {
+            Self::Device(vector) => *vector,
+            Self::Page(vector) => *vector * scale,
+        }
+    }
+}
+
+impl From<DeviceVector2D> for WebViewVector {
+    fn from(vector: DeviceVector2D) -> Self {
+        Self::Device(vector)
+    }
+}
+
+impl From<LayoutVector2D> for WebViewVector {
+    fn from(vector: LayoutVector2D) -> Self {
+        Self::Page(Vector2D::new(vector.x, vector.y))
+    }
+}
+
+impl From<Vector2D<f32, CSSPixel>> for WebViewVector {
+    fn from(vector: Vector2D<f32, CSSPixel>) -> Self {
+        Self::Page(vector)
+    }
+}
+
+/// Represents the destination of a scroll operation.
+#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub enum Scroll {
+    /// An offset to scroll by, with positive offsets revealing more content on the bottom
+    /// and right of the scrollable area.
+    Delta(WebViewVector),
+    /// Scroll to the start of the scrollable area.
+    Start,
+    /// Scroll to the end of the scrollable area.
+    End,
+}
 
 /// Tracks whether Servo isn't shutting down, is in the process of shutting down,
 /// or has finished shutting down.
@@ -51,9 +192,10 @@ pub enum ShutdownState {
 /// A cursor for the window. This is different from a CSS cursor (see
 /// `CursorKind`) in that it has no `Auto` value.
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, Deserialize, Eq, FromPrimitive, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
 pub enum Cursor {
     None,
+    #[default]
     Default,
     Pointer,
     ContextMenu,
@@ -90,9 +232,19 @@ pub enum Cursor {
     ZoomOut,
 }
 
-pub trait EventLoopWaker: 'static + Send {
+/// A way for Servo to request that the embedder wake up the main event loop.
+///
+/// A trait which embedders should implement to allow Servo to request that the
+/// embedder spin the Servo event loop on the main thread.
+pub trait EventLoopWaker: 'static + Send + Sync {
     fn clone_box(&self) -> Box<dyn EventLoopWaker>;
-    fn wake(&self) {}
+
+    /// This method is called when Servo wants the embedder to wake up the event loop.
+    ///
+    /// Note that this may be called on a different thread than the thread that was used to
+    /// start Servo. When called, the embedder is expected to call [`Servo::spin_event_loop`]
+    /// on the thread where Servo is running.
+    fn wake(&self);
 }
 
 impl Clone for Box<dyn EventLoopWaker> {
@@ -100,14 +252,15 @@ impl Clone for Box<dyn EventLoopWaker> {
         self.clone_box()
     }
 }
+
 /// Sends messages to the embedder.
-pub struct EmbedderProxy {
-    pub sender: Sender<EmbedderMsg>,
+pub struct GenericEmbedderProxy<T> {
+    pub sender: Sender<T>,
     pub event_loop_waker: Box<dyn EventLoopWaker>,
 }
 
-impl EmbedderProxy {
-    pub fn send(&self, message: EmbedderMsg) {
+impl<T> GenericEmbedderProxy<T> {
+    pub fn send(&self, message: T) {
         // Send a message and kick the OS event loop awake.
         if let Err(err) = self.sender.send(message) {
             warn!("Failed to send response ({:?}).", err);
@@ -116,103 +269,38 @@ impl EmbedderProxy {
     }
 }
 
-impl Clone for EmbedderProxy {
-    fn clone(&self) -> EmbedderProxy {
-        EmbedderProxy {
+impl<T> Clone for GenericEmbedderProxy<T> {
+    fn clone(&self) -> Self {
+        Self {
             sender: self.sender.clone(),
             event_loop_waker: self.event_loop_waker.clone(),
         }
     }
 }
 
-#[derive(Deserialize, Serialize)]
-pub enum ContextMenuResult {
-    Dismissed,
-    Ignored,
-    Selected(usize),
+pub type EmbedderProxy = GenericEmbedderProxy<EmbedderMsg>;
+
+/// A [`RefreshDriver`] is a trait that can be implemented by Servo embedders in
+/// order to drive let Servo know when to start preparing the next frame. For example,
+/// on systems that support Vsync notifications, an embedder may want to implement
+/// this trait to drive Servo animations via those notifications.
+pub trait RefreshDriver {
+    /// Servo will call this method when it wants to be informed of the next frame start
+    /// time. Implementors should call the callback when it is time to start preparing
+    /// the new frame.
+    ///
+    /// Multiple callbacks may be registered for the same frame. It is up to the implementation
+    /// to call *all* callbacks that have been registered since the last frame.
+    fn observe_next_frame(&self, start_frame_callback: Box<dyn Fn() + Send + 'static>);
 }
 
-/// [Simple dialogs](https://html.spec.whatwg.org/multipage/#simple-dialogs) are synchronous dialogs
-/// that can be opened by web content. Since their messages are controlled by web content, they
-/// should be presented to the user in a way that makes them impossible to mistake for browser UI.
-#[derive(Deserialize, Serialize)]
-pub enum SimpleDialog {
-    /// [`alert()`](https://html.spec.whatwg.org/multipage/#dom-alert).
-    /// TODO: Include details about the document origin.
-    Alert {
-        message: String,
-        response_sender: IpcSender<AlertResponse>,
-    },
-    /// [`confirm()`](https://html.spec.whatwg.org/multipage/#dom-confirm).
-    /// TODO: Include details about the document origin.
-    Confirm {
-        message: String,
-        response_sender: IpcSender<ConfirmResponse>,
-    },
-    /// [`prompt()`](https://html.spec.whatwg.org/multipage/#dom-prompt).
-    /// TODO: Include details about the document origin.
-    Prompt {
-        message: String,
-        default: String,
-        response_sender: IpcSender<PromptResponse>,
-    },
-}
-
+/// Credentials to use in an HTTP authentication challenge.
 #[derive(Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct AuthenticationResponse {
-    /// Username for http request authentication
+    /// Username for HTTP request authentication
     pub username: String,
-    /// Password for http request authentication
+    /// Password for HTTP request authentication
     pub password: String,
-}
-
-#[derive(Deserialize, PartialEq, Serialize)]
-pub enum AlertResponse {
-    /// The user chose Ok, or the dialog was otherwise dismissed or ignored.
-    Ok,
-}
-
-impl Default for AlertResponse {
-    fn default() -> Self {
-        // Per <https://html.spec.whatwg.org/multipage/#dom-alert>,
-        // if we **cannot show simple dialogs**, including cases where the user or user agent decides to ignore
-        // all modal dialogs, we need to return (which represents Ok).
-        Self::Ok
-    }
-}
-
-#[derive(Deserialize, PartialEq, Serialize)]
-pub enum ConfirmResponse {
-    /// The user chose Ok.
-    Ok,
-    /// The user chose Cancel, or the dialog was otherwise dismissed or ignored.
-    Cancel,
-}
-
-impl Default for ConfirmResponse {
-    fn default() -> Self {
-        // Per <https://html.spec.whatwg.org/multipage/#dom-confirm>,
-        // if we **cannot show simple dialogs**, including cases where the user or user agent decides to ignore
-        // all modal dialogs, we need to return false (which represents Cancel), not true (Ok).
-        Self::Cancel
-    }
-}
-
-#[derive(Deserialize, PartialEq, Serialize)]
-pub enum PromptResponse {
-    /// The user chose Ok, with the given input.
-    Ok(String),
-    /// The user chose Cancel, or the dialog was otherwise dismissed or ignored.
-    Cancel,
-}
-
-impl Default for PromptResponse {
-    fn default() -> Self {
-        // Per <https://html.spec.whatwg.org/multipage/#dom-prompt>,
-        // if we **cannot show simple dialogs**, including cases where the user or user agent decides to ignore
-        // all modal dialogs, we need to return null (which represents Cancel), not the default input.
-        Self::Cancel
-    }
 }
 
 /// A response to a request to allow or deny an action.
@@ -222,24 +310,24 @@ pub enum AllowOrDeny {
     Deny,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct SelectElementOption {
-    /// A unique identifier for the option that can be used to select it.
-    pub id: usize,
-    /// The label that should be used to display the option to the user.
-    pub label: String,
-    /// Whether or not the option is selectable
-    pub is_disabled: bool,
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Whether a protocol handler is requested to be registered or unregistered.
+pub enum RegisterOrUnregister {
+    Register,
+    Unregister,
 }
 
-/// Represents the contents of either an `<option>` or an `<optgroup>` element
+/// A request from Servo to embedder to register or unregister a custom
+/// protocol handler for a scheme, typically triggered by web content.
+/// See <https://html.spec.whatwg.org/multipage/#custom-handlers>
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub enum SelectElementOptionOrOptgroup {
-    Option(SelectElementOption),
-    Optgroup {
-        label: String,
-        options: Vec<SelectElementOption>,
-    },
+pub struct ProtocolHandlerUpdateRegistration {
+    /// The scheme for the protocol handler.
+    pub scheme: String,
+    /// The URL to navigate to when handling requests for scheme.
+    pub url: ServoUrl,
+    /// Whether this update is to register or unregister the protocol handler.
+    pub register_or_unregister: RegisterOrUnregister,
 }
 
 /// Data about a `WebView` or `<iframe>` viewport: its size and also the
@@ -250,10 +338,133 @@ pub struct ViewportDetails {
     pub size: Size2D<f32, CSSPixel>,
 
     /// The scale factor to use to account for HiDPI scaling. This does not take into account
-    /// any page or pinch zoom applied by the compositor to the contents.
+    /// any page or pinch zoom applied by `Paint` to the contents.
     pub hidpi_scale_factor: Scale<f32, CSSPixel, DevicePixel>,
+
+    /// The device dimensions that this viewport is displayed within.
+    pub device_size: Size2D<f32, DevicePixel>,
 }
 
+impl ViewportDetails {
+    /// Convert this [`ViewportDetails`] size to a [`LayoutSize`]. This is the same numerical
+    /// value as [`Self::size`], because a `LayoutPixel` is the same as a `CSSPixel`.
+    pub fn layout_size(&self) -> LayoutSize {
+        Size2D::from_untyped(self.size.to_untyped())
+    }
+}
+
+/// Unlike [`ScreenGeometry`], the data is in device-independent pixels
+/// to be used by DOM APIs
+#[derive(Default, Deserialize, Serialize)]
+pub struct ScreenMetrics {
+    pub screen_size: DeviceIndependentIntSize,
+    pub available_size: DeviceIndependentIntSize,
+}
+
+/// An opaque identifier for a single history traversal operation.
+#[derive(Clone, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct TraversalId(String);
+
+impl TraversalId {
+    #[expect(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4().to_string())
+    }
+}
+
+/// The pixel format of the buffer representing a raster image.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, MallocSizeOf)]
+pub enum PixelFormat {
+    /// Luminance channel only
+    K8,
+    /// Luminance + alpha
+    KA8,
+    /// RGB, 8 bits per channel
+    RGB8,
+    /// RGB + alpha, 8 bits per channel
+    RGBA8,
+    /// BGR + alpha, 8 bits per channel
+    BGRA8,
+}
+
+/// A raster image buffer.
+#[derive(Clone, Deserialize, Serialize, MallocSizeOf)]
+pub struct Image {
+    pub width: u32,
+    pub height: u32,
+    pub format: PixelFormat,
+    /// A shared memory block containing the data of one or more image frames.
+    #[conditional_malloc_size_of]
+    data: Arc<GenericSharedMemory>,
+    range: Range<usize>,
+}
+
+impl Image {
+    /// Creates a new [`Image`] with the given `width` and `height`.
+    ///
+    /// `data` is a shared memory block containing the pixel data of one or more image frames, in
+    /// the given `format`.
+    ///
+    /// `range` is the byte offset within `data` that is the start of the first frame.
+    pub fn new(
+        width: u32,
+        height: u32,
+        data: Arc<GenericSharedMemory>,
+        range: Range<usize>,
+        format: PixelFormat,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            format,
+            data,
+            range,
+        }
+    }
+
+    /// Return the bytes belonging to the first image frame.
+    pub fn data(&self) -> &[u8] {
+        &self.data[self.range.clone()]
+    }
+}
+
+/// The severity level of a message logged by page content.
+#[derive(Clone, Debug, Deserialize, Serialize, MallocSizeOf)]
+#[serde(rename_all = "lowercase")]
+pub enum ConsoleLogLevel {
+    Log,
+    Debug,
+    Info,
+    Warn,
+    Error,
+    Trace,
+    Dir,
+}
+
+impl From<ConsoleLogLevel> for log::Level {
+    fn from(value: ConsoleLogLevel) -> Self {
+        match value {
+            ConsoleLogLevel::Log => log::Level::Info,
+            ConsoleLogLevel::Debug => log::Level::Debug,
+            ConsoleLogLevel::Info => log::Level::Info,
+            ConsoleLogLevel::Warn => log::Level::Warn,
+            ConsoleLogLevel::Error => log::Level::Error,
+            ConsoleLogLevel::Trace => log::Level::Trace,
+            ConsoleLogLevel::Dir => log::Level::Info,
+        }
+    }
+}
+
+/// Information about a single Bluetooth device.
+#[derive(Clone, Deserialize, Serialize)]
+pub struct BluetoothDeviceDescription {
+    /// The unique address of this device.
+    pub address: String,
+    /// A human-readable name for this device.
+    pub name: String,
+}
+
+/// Messages towards the embedder.
 #[derive(Deserialize, IntoStaticStr, Serialize)]
 pub enum EmbedderMsg {
     /// A status message to be displayed by the browser chrome.
@@ -267,111 +478,74 @@ pub enum EmbedderMsg {
     /// Show the user a [simple dialog](https://html.spec.whatwg.org/multipage/#simple-dialogs) (`alert()`, `confirm()`,
     /// or `prompt()`). Since their messages are controlled by web content, they should be presented to the user in a
     /// way that makes them impossible to mistake for browser UI.
-    ShowSimpleDialog(WebViewId, SimpleDialog),
-    /// Request authentication for a load or navigation from the embedder.
-    RequestAuthentication(
+    ShowSimpleDialog(WebViewId, SimpleDialogRequest),
+    /// Request to (un)register protocol handler by page content.
+    AllowProtocolHandlerRequest(
         WebViewId,
-        ServoUrl,
-        bool, /* for proxy */
-        IpcSender<Option<AuthenticationResponse>>,
+        ProtocolHandlerUpdateRegistration,
+        GenericSender<AllowOrDeny>,
     ),
-    /// Show a context menu to the user
-    ShowContextMenu(
-        WebViewId,
-        IpcSender<ContextMenuResult>,
-        Option<String>,
-        Vec<String>,
-    ),
-    /// Whether or not to allow a pipeline to load a url.
-    AllowNavigationRequest(WebViewId, PipelineId, ServoUrl),
-    /// Whether or not to allow script to open a new tab/browser
-    AllowOpeningWebView(WebViewId, IpcSender<Option<(WebViewId, ViewportDetails)>>),
-    /// A webview was destroyed.
-    WebViewClosed(WebViewId),
-    /// A webview gained focus for keyboard events
-    WebViewFocused(WebViewId),
-    /// All webviews lost focus for keyboard events.
-    WebViewBlurred,
     /// Wether or not to unload a document
-    AllowUnload(WebViewId, IpcSender<AllowOrDeny>),
-    /// Sends an unconsumed key event back to the embedder.
-    Keyboard(WebViewId, KeyboardEvent),
+    AllowUnload(WebViewId, GenericSender<AllowOrDeny>),
     /// Inform embedder to clear the clipboard
     ClearClipboard(WebViewId),
     /// Gets system clipboard contents
-    GetClipboardText(WebViewId, IpcSender<Result<String, String>>),
+    GetClipboardText(WebViewId, GenericCallback<Result<String, String>>),
     /// Sets system clipboard contents
     SetClipboardText(WebViewId, String),
     /// Changes the cursor.
     SetCursor(WebViewId, Cursor),
     /// A favicon was detected
-    NewFavicon(WebViewId, ServoUrl),
-    /// The history state has changed.
-    HistoryChanged(WebViewId, Vec<ServoUrl>, usize),
+    NewFavicon(WebViewId, Image),
+    /// Get the device independent window rectangle.
+    GetWindowRect(WebViewId, GenericSender<DeviceIndependentIntRect>),
+    /// Get the device independent screen size and available size.
+    GetScreenMetrics(WebViewId, GenericSender<ScreenMetrics>),
     /// Entered or exited fullscreen.
     NotifyFullscreenStateChanged(WebViewId, bool),
     /// The [`LoadStatus`] of the Given `WebView` has changed.
     NotifyLoadStatusChanged(WebViewId, LoadStatus),
-    WebResourceRequested(
-        Option<WebViewId>,
-        WebResourceRequest,
-        IpcSender<WebResourceResponseMsg>,
-    ),
-    /// A pipeline panicked. First string is the reason, second one is the backtrace.
-    Panic(WebViewId, String, Option<String>),
     /// Open dialog to select bluetooth device.
-    GetSelectedBluetoothDevice(WebViewId, Vec<String>, IpcSender<Option<String>>),
-    /// Open file dialog to select files. Set boolean flag to true allows to select multiple files.
-    SelectFiles(
+    GetSelectedBluetoothDevice(
         WebViewId,
-        Vec<FilterPattern>,
-        bool,
-        IpcSender<Option<Vec<PathBuf>>>,
+        Vec<BluetoothDeviceDescription>,
+        GenericSender<Option<String>>,
     ),
     /// Open interface to request permission specified by prompt.
-    PromptPermission(WebViewId, PermissionFeature, IpcSender<AllowOrDeny>),
-    /// Request to present an IME to the user when an editable element is focused.
-    /// If the input is text, the second parameter defines the pre-existing string
-    /// text content and the zero-based index into the string locating the insertion point.
-    /// bool is true for multi-line and false otherwise.
-    ShowIME(
-        WebViewId,
-        InputMethodType,
-        Option<(String, i32)>,
-        bool,
-        DeviceIntRect,
-    ),
-    /// Request to hide the IME when the editable element is blurred.
-    HideIME(WebViewId),
-    /// Report a complete sampled profile
-    ReportProfile(Vec<u8>),
-    /// Notifies the embedder about media session events
-    /// (i.e. when there is metadata for the active media session, playback state changes...).
-    MediaSessionEvent(WebViewId, MediaSessionEvent),
+    PromptPermission(WebViewId, PermissionFeature, GenericSender<AllowOrDeny>),
+    /// Async permission request for screen wake lock. The callback is invoked
+    /// with the user's decision, which resolves or rejects the pending promise
+    /// without blocking the script thread.
+    RequestWakeLockPermission(WebViewId, GenericCallback<AllowOrDeny>, WakeLockType),
     /// Report the status of Devtools Server with a token that can be used to bypass the permission prompt.
     OnDevtoolsStarted(Result<u16, ()>, String),
     /// Ask the user to allow a devtools client to connect.
-    RequestDevtoolsConnection(IpcSender<AllowOrDeny>),
+    RequestDevtoolsConnection(GenericSender<AllowOrDeny>),
     /// Request to play a haptic effect on a connected gamepad.
-    PlayGamepadHapticEffect(WebViewId, usize, GamepadHapticEffectType, IpcSender<bool>),
+    #[cfg(feature = "gamepad")]
+    PlayGamepadHapticEffect(
+        WebViewId,
+        usize,
+        GamepadHapticEffectType,
+        GenericCallback<bool>,
+    ),
     /// Request to stop a haptic effect on a connected gamepad.
-    StopGamepadHapticEffect(WebViewId, usize, IpcSender<bool>),
-    /// Informs the embedder that the constellation has completed shutdown.
-    /// Required because the constellation can have pending calls to make
-    /// (e.g. SetFrameTree) at the time that we send it an ExitMsg.
-    ShutdownComplete,
+    #[cfg(feature = "gamepad")]
+    StopGamepadHapticEffect(WebViewId, usize, GenericCallback<bool>),
     /// Request to display a notification.
     ShowNotification(Option<WebViewId>, Notification),
-    /// Indicates that the user has activated a `<select>` element.
-    ///
-    /// The embedder should respond with the new state of the `<select>` element.
-    ShowSelectElementMenu(
-        WebViewId,
-        Vec<SelectElementOptionOrOptgroup>,
-        Option<usize>,
-        DeviceIntRect,
-        IpcSender<Option<usize>>,
-    ),
+    /// Let the embedder process a DOM Console API message.
+    /// <https://developer.mozilla.org/en-US/docs/Web/API/Console_API>
+    ShowConsoleApiMessage(Option<WebViewId>, ConsoleLogLevel, String),
+    /// Request to the embedder to display a user interace control.
+    ShowEmbedderControl(EmbedderControlId, DeviceIntRect, EmbedderControlRequest),
+    /// Request to the embedder to hide a user interface control.
+    HideEmbedderControl(EmbedderControlId),
+    /// Inform the embedding layer that a particular `InputEvent` was handled by Servo
+    /// and the embedder can continue processing it, if necessary.
+    InputEventsHandled(WebViewId, Vec<InputEventOutcome>),
+    /// Send the embedder an accessibility tree update.
+    AccessibilityTreeUpdate(WebViewId, TreeUpdate, Epoch),
 }
 
 impl Debug for EmbedderMsg {
@@ -380,11 +554,6 @@ impl Debug for EmbedderMsg {
         write!(formatter, "{string}")
     }
 }
-
-/// Filter for file selection;
-/// the `String` content is expected to be extension (e.g, "doc", without the prefixing ".")
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct FilterPattern(pub String);
 
 /// <https://w3c.github.io/mediasession/#mediametadata>
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -462,12 +631,14 @@ pub enum PermissionFeature {
     BackgroundSync,
     Bluetooth,
     PersistentStorage,
+    ScreenWakeLock(WakeLockType),
+    Gamepad,
 }
 
 /// Used to specify the kind of input method editor appropriate to edit a field.
 /// This is a subset of htmlinputelement::InputType because some variants of InputType
 /// don't make sense in this context.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub enum InputMethodType {
     Color,
     Date,
@@ -484,6 +655,7 @@ pub enum InputMethodType {
     Week,
 }
 
+#[cfg(feature = "gamepad")]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 /// <https://w3.org/TR/gamepad/#dom-gamepadhapticeffecttype-dual-rumble>
 pub struct DualRumbleEffectParams {
@@ -493,6 +665,7 @@ pub struct DualRumbleEffectParams {
     pub weak_magnitude: f64,
 }
 
+#[cfg(feature = "gamepad")]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 /// <https://w3.org/TR/gamepad/#dom-gamepadhapticeffecttype>
 pub enum GamepadHapticEffectType {
@@ -505,15 +678,15 @@ pub struct WebResourceRequest {
         deserialize_with = "::hyper_serde::deserialize",
         serialize_with = "::hyper_serde::serialize"
     )]
-    #[ignore_malloc_size_of = "Defined in hyper"]
     pub method: Method,
     #[serde(
         deserialize_with = "::hyper_serde::deserialize",
         serialize_with = "::hyper_serde::serialize"
     )]
-    #[ignore_malloc_size_of = "Defined in hyper"]
     pub headers: HeaderMap,
     pub url: Url,
+    pub destination: Destination,
+    pub referrer_url: Option<Url>,
     pub is_for_main_frame: bool,
     pub is_redirect: bool,
 }
@@ -586,6 +759,16 @@ pub enum Theme {
     /// Dark theme.
     Dark,
 }
+
+impl From<Theme> for PrefersColorScheme {
+    fn from(value: Theme) -> Self {
+        match value {
+            Theme::Light => PrefersColorScheme::Light,
+            Theme::Dark => PrefersColorScheme::Dark,
+        }
+    }
+}
+
 // The type of MediaSession action.
 /// <https://w3c.github.io/mediasession/#enumdef-mediasessionaction>
 #[derive(Clone, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
@@ -616,6 +799,7 @@ pub enum MediaSessionActionType {
 }
 
 /// The status of the load in this `WebView`.
+#[repr(i32)]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum LoadStatus {
     /// The load has started, but the headers have not yet been parsed.
@@ -651,16 +835,16 @@ pub struct Notification {
     /// The URL of an icon. The icon will be displayed as part of the notification.
     pub icon_url: Option<ServoUrl>,
     /// Icon's raw image data and metadata.
-    pub icon_resource: Option<Arc<Image>>,
+    pub icon_resource: Option<Arc<SharedRasterImage>>,
     /// The URL of a badge. The badge is used when there is no enough space to display the notification,
     /// such as on a mobile device's notification bar.
     pub badge_url: Option<ServoUrl>,
     /// Badge's raw image data and metadata.
-    pub badge_resource: Option<Arc<Image>>,
+    pub badge_resource: Option<Arc<SharedRasterImage>>,
     /// The URL of an image. The image will be displayed as part of the notification.
     pub image_url: Option<ServoUrl>,
     /// Image's raw image data and metadata.
-    pub image_resource: Option<Arc<Image>>,
+    pub image_resource: Option<Arc<SharedRasterImage>>,
     /// Actions available for users to choose from for interacting with the notification.
     pub actions: Vec<NotificationAction>,
 }
@@ -675,26 +859,30 @@ pub struct NotificationAction {
     /// The URL of an icon. The icon will be displayed with the action.
     pub icon_url: Option<ServoUrl>,
     /// Icon's raw image data and metadata.
-    pub icon_resource: Option<Arc<Image>>,
+    pub icon_resource: Option<Arc<SharedRasterImage>>,
 }
 
 /// Information about a `WebView`'s screen geometry and offset. This is used
-/// for the [Screen](https://drafts.csswg.org/cssom-view/#the-screen-interface)
-/// CSSOM APIs and `window.screenLeft` / `window.screenTop`.
+/// for the [Screen](https://drafts.csswg.org/cssom-view/#the-screen-interface) CSSOM APIs
+/// and `window.screenLeft` / `window.screenX` / `window.screenTop` / `window.screenY` /
+/// `window.moveBy`/ `window.resizeBy` / `window.outerWidth` / `window.outerHeight` /
+/// `window.screen.availHeight` / `window.screen.availWidth`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScreenGeometry {
     /// The size of the screen in device pixels. This will be converted to
     /// CSS pixels based on the pixel scaling of the `WebView`.
     pub size: DeviceIntSize,
-    /// The available size of the screen in device pixels. This size is the size
+    /// The available size of the screen in device pixels for the purposes of
+    /// the `window.screen.availHeight` / `window.screen.availWidth`. This is the size
     /// available for web content on the screen, and should be `size` minus any system
-    /// toolbars, docks, and interface elements of the browser. This will be converted to
+    /// toolbars, docks, and interface elements. This will be converted to
     /// CSS pixels based on the pixel scaling of the `WebView`.
     pub available_size: DeviceIntSize,
-    /// The offset of the `WebView` in device pixels for the purposes of the `window.screenLeft`
-    /// and `window.screenTop` APIs. This will be converted to CSS pixels based on the pixel scaling
-    /// of the `WebView`.
-    pub offset: DeviceIntPoint,
+    /// The rectangle the `WebView`'s containing window (including OS decorations)
+    /// in device pixels for the purposes of the
+    /// `window.screenLeft`, `window.outerHeight` and similar APIs.
+    /// This will be converted to CSS pixels based on the pixel scaling of the `WebView`.
+    pub window_rect: DeviceIntRect,
 }
 
 impl From<SelectElementOption> for SelectElementOptionOrOptgroup {
@@ -710,7 +898,7 @@ pub struct UntrustedNodeAddress(pub *const c_void);
 
 malloc_size_of_is_0!(UntrustedNodeAddress);
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 unsafe impl Send for UntrustedNodeAddress {}
 
 impl From<style_traits::dom::OpaqueNode> for UntrustedNodeAddress {
@@ -740,35 +928,17 @@ impl UntrustedNodeAddress {
     }
 }
 
-/// The result of a hit test in the compositor.
+/// The result of a hit test in `Paint`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct CompositorHitTestResult {
+pub struct PaintHitTestResult {
     /// The pipeline id of the resulting item.
     pub pipeline_id: PipelineId,
 
     /// The hit test point in the item's viewport.
-    pub point_in_viewport: euclid::default::Point2D<f32>,
+    pub point_in_viewport: Point2D<f32, CSSPixel>,
 
-    /// The hit test point relative to the item itself.
-    pub point_relative_to_item: euclid::default::Point2D<f32>,
-
-    /// The node address of the hit test result.
-    pub node: UntrustedNodeAddress,
-
-    /// The cursor that should be used when hovering the item hit by the hit test.
-    pub cursor: Option<Cursor>,
-
-    /// The scroll tree node associated with this hit test item.
-    pub scroll_tree_node: ScrollTreeNodeId,
-}
-
-/// Whether the default action for a touch event was prevented by web content
-#[derive(Debug, Deserialize, Serialize)]
-pub enum TouchEventResult {
-    /// Allowed by web content
-    DefaultAllowed(TouchSequenceId, TouchEventType),
-    /// Prevented by web content
-    DefaultPrevented(TouchSequenceId, TouchEventType),
+    /// The [`ExternalScrollId`] of the scroll tree node associated with this hit test item.
+    pub external_scroll_id: ExternalScrollId,
 }
 
 /// For a given pipeline, whether any animations are currently running
@@ -856,4 +1026,186 @@ impl Display for FocusSequenceNumber {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
         Display::fmt(&self.0, f)
     }
+}
+
+/// An identifier for a particular JavaScript evaluation that is used to track the
+/// evaluation from the embedding layer to the script layer and then back.
+#[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct JavaScriptEvaluationId(pub usize);
+
+/// A JavaScript value produced by evaluation of a script.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub enum JSValue {
+    Undefined,
+    Null,
+    Boolean(bool),
+    Number(f64),
+    String(String),
+    Element(String),
+    ShadowRoot(String),
+    Frame(String),
+    Window(String),
+    Array(Vec<JSValue>),
+    Object(HashMap<String, JSValue>),
+}
+
+/// Information about a JavaScript error that occured during the evaluation of a script.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct JavaScriptErrorInfo {
+    pub message: String,
+    pub filename: String,
+    pub stack: Option<String>,
+    pub line_number: u64,
+    pub column: u64,
+}
+
+/// Indicates the reason that JavaScript evaluation failed due serializing issues the
+/// result of the evaluation.
+#[derive(Clone, Debug, Deserialize, EnumMessage, PartialEq, Serialize)]
+pub enum JavaScriptEvaluationResultSerializationError {
+    /// Serialization could not complete because a JavaScript value contained a detached
+    /// shadow root according to <https://w3c.github.io/webdriver/#dfn-internal-json-clone>.
+    DetachedShadowRoot,
+    /// Serialization could not complete because a JavaScript value contained a "stale"
+    /// element reference according to <https://w3c.github.io/webdriver/#dfn-get-a-known-element>.
+    StaleElementReference,
+    /// Serialization could not complete because a JavaScript value of an unknown type
+    /// was encountered.
+    UnknownType,
+    /// This is a catch all for other kinds of errors that can happen during JavaScript value
+    /// serialization. For instances where this can happen, see:
+    /// <https://w3c.github.io/webdriver/#dfn-clone-an-object>.
+    OtherJavaScriptError,
+}
+
+/// An error that happens when trying to evaluate JavaScript on a `WebView`.
+#[derive(Clone, Debug, Deserialize, EnumMessage, PartialEq, Serialize)]
+pub enum JavaScriptEvaluationError {
+    /// The `Document` of frame that the script was going to execute in no longer exists.
+    DocumentNotFound,
+    /// The script could not be compiled.
+    CompilationFailure,
+    /// The script could not be evaluated.
+    EvaluationFailure(Option<JavaScriptErrorInfo>),
+    /// An internal Servo error prevented the JavaSript evaluation from completing properly.
+    /// This indicates a bug in Servo.
+    InternalError,
+    /// The `WebView` on which this evaluation request was triggered is not ready. This might
+    /// happen if the `WebView`'s `Document` is changing due to ongoing load events, for instance.
+    WebViewNotReady,
+    /// The script executed successfully, but Servo could not serialize the JavaScript return
+    /// value into a [`JSValue`].
+    SerializationError(JavaScriptEvaluationResultSerializationError),
+}
+
+#[repr(i32)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub enum ScreenshotCaptureError {
+    /// The screenshot request failed to read the screenshot image from the `WebView`'s
+    /// `RenderingContext`.
+    CouldNotReadImage,
+    /// The WebView that this screenshot request was made for no longer exists.
+    WebViewDoesNotExist,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct RgbColor {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+}
+
+/// A Script to Embedder Channel
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct ScriptToEmbedderChan(GenericCallback<EmbedderMsg>);
+
+impl ScriptToEmbedderChan {
+    /// Create a new Channel allowing script to send messages to the Embedder
+    pub fn new(
+        embedder_chan: Sender<EmbedderMsg>,
+        waker: Box<dyn EventLoopWaker>,
+    ) -> ScriptToEmbedderChan {
+        let embedder_callback = GenericCallback::new(move |embedder_msg| {
+            let msg = match embedder_msg {
+                Ok(embedder_msg) => embedder_msg,
+                Err(err) => {
+                    log::warn!("Script to Embedder message error: {err}");
+                    return;
+                },
+            };
+            let _ = embedder_chan.send(msg);
+            waker.wake();
+        })
+        .expect("Failed to create channel");
+        ScriptToEmbedderChan(embedder_callback)
+    }
+
+    /// Send a message to and wake the Embedder
+    pub fn send(&self, msg: EmbedderMsg) -> SendResult {
+        self.0.send(msg)
+    }
+}
+
+/// Used for communicating the details of a new `WebView` created by the embedder
+/// back to the constellation.
+#[derive(Deserialize, Serialize)]
+pub struct NewWebViewDetails {
+    pub webview_id: WebViewId,
+    pub viewport_details: ViewportDetails,
+    pub user_content_manager_id: Option<UserContentManagerId>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+/// A request to load a URL. This can be used to trigger a configurable load in a `WebView`.
+///
+/// ```
+///  let mut headers = http::HeaderMap::new();
+///  headers.append(HeaderName::from_static("CustomHeader"), "Value".parse().unwrap());
+///  let url_request = URLRequest::new(url).headers(headers);
+///  webview.load_request(url_request);
+/// ```
+pub struct UrlRequest {
+    pub url: ServoUrl,
+    #[serde(
+        deserialize_with = "hyper_serde::deserialize",
+        serialize_with = "hyper_serde::serialize"
+    )]
+    pub headers: HeaderMap,
+}
+
+impl UrlRequest {
+    pub fn new(url: Url) -> Self {
+        UrlRequest {
+            url: url.into(),
+            headers: HeaderMap::new(),
+        }
+    }
+
+    /// Set headers that will be added to the Headers
+    pub fn headers(mut self, headers: HeaderMap) -> Self {
+        self.headers = headers;
+        self
+    }
+}
+
+/// The type of wake lock to acquire or release.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum WakeLockType {
+    Screen,
+}
+
+/// Trait for platform-specific wake lock support.
+///
+/// Implementations are responsible for interacting with the OS to prevent
+/// the screen (or other resources) from sleeping while a wake lock is held.
+pub trait WakeLockDelegate: Send + Sync {
+    /// Acquire a wake lock of the given type, preventing the associated
+    /// resource from sleeping. Called when the aggregate lock count transitions
+    /// from 0 to 1. Returns an error if the OS fails to grant the lock.
+    fn acquire(&self, type_: WakeLockType) -> Result<(), Box<dyn std::error::Error>>;
+
+    /// Release a previously acquired wake lock of the given type, allowing
+    /// the resource to sleep. Called when the aggregate lock count transitions
+    /// from N to 0.
+    fn release(&self, type_: WakeLockType) -> Result<(), Box<dyn std::error::Error>>;
 }

@@ -5,133 +5,81 @@
 //! Liberally derived from the [Firefox JS implementation](http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/webconsole.js).
 //! Handles interaction with the remote web console on network events (HTTP requests, responses) in Servo.
 
-use std::net::TcpStream;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, UNIX_EPOCH};
 
+use atomic_refcell::AtomicRefCell;
+use base64::engine::Engine;
+use base64::engine::general_purpose::STANDARD;
 use chrono::{Local, LocalResult, TimeZone};
-use devtools_traits::{HttpRequest as DevtoolsHttpRequest, HttpResponse as DevtoolsHttpResponse};
-use headers::{ContentType, Cookie, HeaderMapExt};
-use http::{HeaderMap, Method, header};
-use net_traits::http_status::HttpStatus;
+use devtools_traits::{HttpRequest, HttpResponse};
+use headers::{ContentLength, HeaderMapExt};
+use http::HeaderMap;
+use malloc_size_of_derive::MallocSizeOf;
+use net::cookie::ServoCookie;
+use net_traits::fetch::headers::extract_mime_type_as_dataurl_mime;
+use net_traits::{CookieSource, TlsSecurityInfo};
 use serde::Serialize;
 use serde_json::{Map, Value};
+use servo_url::ServoUrl;
 
 use crate::StreamId;
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
-use crate::protocol::JsonPacketStream;
+use crate::actor::{Actor, ActorEncode, ActorError, ActorRegistry, new_actor_name};
+use crate::actors::browsing_context::BrowsingContextActor;
+use crate::actors::long_string::LongStringActor;
+use crate::network_handler::Cause;
+use crate::protocol::ClientRequest;
 
-struct HttpRequest {
-    url: String,
-    method: Method,
-    headers: HeaderMap,
-    body: Option<Vec<u8>>,
-    started_date_time: SystemTime,
-    time_stamp: i64,
-    connect_time: Duration,
-    send_time: Duration,
+#[derive(Default, MallocSizeOf)]
+pub(crate) struct NetworkEventActor {
+    name: String,
+    request: AtomicRefCell<Option<NetworkEventRequest>>,
+    resource_id: u64,
+    response: AtomicRefCell<Option<NetworkEventResponse>>,
+    security_info: AtomicRefCell<TlsSecurityInfo>,
+    pub browsing_context_name: String,
 }
 
-struct HttpResponse {
-    headers: Option<HeaderMap>,
-    status: HttpStatus,
-    body: Option<Vec<u8>>,
-}
-
-pub struct NetworkEventActor {
-    pub name: String,
-    request: HttpRequest,
-    response: HttpResponse,
-    is_xhr: bool,
-}
-
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct EventActor {
-    pub actor: String,
-    pub url: String,
-    pub method: String,
-    pub started_date_time: String,
-    pub time_stamp: i64,
+pub(crate) struct NetworkEventResource {
+    #[serde(rename = "browsingContextID")]
+    browsing_context_id: u32,
+    inner_window_id: u64,
+    resource_id: u64,
+    resource_updates: ResourceUpdates,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NetworkEventMsg {
+    actor: String,
+    #[serde(rename = "browsingContextID")]
+    browsing_context_id: u32,
+    cause: Cause,
     #[serde(rename = "isXHR")]
-    pub is_xhr: bool,
-    pub private: bool,
-}
-
-#[derive(Serialize)]
-pub struct ResponseCookiesMsg {
-    pub cookies: usize,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ResponseStartMsg {
-    pub http_version: String,
-    pub remote_address: String,
-    pub remote_port: u32,
-    pub status: String,
-    pub status_text: String,
-    pub headers_size: usize,
-    pub discard_response_body: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ResponseContentMsg {
-    pub mime_type: String,
-    pub content_size: u32,
-    pub transferred_size: u32,
-    pub discard_response_body: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ResponseHeadersMsg {
-    pub headers: usize,
-    pub headers_size: usize,
-}
-
-#[derive(Serialize)]
-pub struct RequestCookiesMsg {
-    pub cookies: usize,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RequestHeadersMsg {
-    headers: usize,
-    headers_size: usize,
+    is_xhr: bool,
+    method: String,
+    private: bool,
+    resource_id: u64,
+    started_date_time: String,
+    time_stamp: i64,
+    url: String,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GetRequestHeadersReply {
     from: String,
-    headers: Vec<Header>,
+    headers: Vec<HeaderWrapper>,
     header_size: usize,
     raw_headers: String,
 }
 
 #[derive(Serialize)]
-struct Header {
-    name: String,
-    value: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GetResponseHeadersReply {
+struct GetCookiesReply {
     from: String,
-    headers: Vec<Header>,
-    header_size: usize,
-    raw_headers: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GetResponseContentReply {
-    from: String,
-    content: Option<Vec<u8>>,
-    content_discarded: bool,
+    cookies: Vec<CookieWrapper>,
 }
 
 #[derive(Serialize)]
@@ -143,38 +91,30 @@ struct GetRequestPostDataReply {
 }
 
 #[derive(Serialize)]
-struct GetRequestCookiesReply {
+#[serde(rename_all = "camelCase")]
+struct GetResponseHeadersReply {
     from: String,
-    cookies: Vec<u8>,
+    headers: Vec<HeaderWrapper>,
+    header_size: usize,
+    raw_headers: String,
 }
 
 #[derive(Serialize)]
-struct GetResponseCookiesReply {
+#[serde(rename_all = "camelCase")]
+struct GetResponseContentReply {
     from: String,
-    cookies: Vec<u8>,
-}
-
-#[derive(Serialize)]
-struct Timings {
-    blocked: u32,
-    dns: u32,
-    connect: u64,
-    send: u64,
-    wait: u32,
-    receive: u32,
+    content: Option<ResponseContent>,
+    content_discarded: bool,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GetEventTimingsReply {
     from: String,
+    offsets: Timings,
+    server_timings: Vec<()>,
     timings: Timings,
-    total_time: u64,
-}
-
-#[derive(Serialize)]
-struct SecurityInfo {
-    state: String,
+    total_time: usize,
 }
 
 #[derive(Serialize)]
@@ -184,308 +124,605 @@ struct GetSecurityInfoReply {
     security_info: SecurityInfo,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RequestFields {
+    event_timings_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_port: Option<u16>,
+    request_cookies_available: bool,
+    request_headers_available: bool,
+    total_time: f64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResponseFields {
+    #[serde(flatten)]
+    cache_details: CacheDetails,
+    response_content_available: bool,
+    response_cookies_available: bool,
+    response_headers_available: bool,
+    response_start_available: bool,
+    status: String,
+    status_text: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SecurityFields {
+    security_state: String,
+    security_info_available: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ResourceUpdates {
+    http_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(flatten)]
+    request: Option<RequestFields>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(flatten)]
+    response: Option<ResponseFields>,
+    #[serde(flatten)]
+    security: SecurityFields,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResponseContent {
+    body_size: usize,
+    content_charset: String,
+    decoded_body_size: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoding: Option<String>,
+    headers_size: usize,
+    is_content_encoded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mime_type: Option<String>,
+    size: usize,
+    text: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transferred_size: Option<u64>,
+}
+
+#[derive(Clone, Serialize, MallocSizeOf)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CacheDetails {
+    from_cache: bool,
+    from_service_worker: bool,
+}
+
+#[derive(Clone, Default, Serialize, MallocSizeOf)]
+pub(crate) struct Timings {
+    blocked: usize,
+    dns: usize,
+    connect: usize,
+    send: usize,
+    wait: usize,
+    receive: usize,
+}
+
+impl Timings {
+    fn total(&self) -> usize {
+        self.dns + self.connect + self.send + self.wait + self.receive
+    }
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct CertificateIdentity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    common_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    organization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    organizational_unit: Option<String>,
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct CertificateValidity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lifetime: Option<String>,
+    expired: bool,
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct CertificateFingerprint {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha1: Option<String>,
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct SecurityCertificate {
+    subject: CertificateIdentity,
+    issuer: CertificateIdentity,
+    validity: CertificateValidity,
+    fingerprint: CertificateFingerprint,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    serial_number: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_built_in_root: Option<bool>,
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct SecurityInfo {
+    state: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    weakness_reasons: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protocol_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cipher_suite: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kea_group_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature_scheme_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    alpn_protocol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    certificate_transparency: Option<String>,
+    hsts: bool,
+    hpkp: bool,
+    used_ech: bool,
+    used_delegated_credentials: bool,
+    used_ocsp: bool,
+    used_private_dns: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    certificate_chain: Vec<String>,
+    cert: SecurityCertificate,
+}
+
+impl From<&TlsSecurityInfo> for SecurityInfo {
+    fn from(info: &TlsSecurityInfo) -> Self {
+        Self {
+            state: info.state.to_string(),
+            weakness_reasons: info.weakness_reasons.clone(),
+            protocol_version: info.protocol_version.clone(),
+            cipher_suite: info.cipher_suite.clone(),
+            kea_group_name: info.kea_group_name.clone(),
+            signature_scheme_name: info.signature_scheme_name.clone(),
+            alpn_protocol: info.alpn_protocol.clone(),
+            certificate_transparency: info
+                .certificate_transparency
+                .clone()
+                .or_else(|| Some("unknown".to_string())),
+            hsts: info.hsts,
+            hpkp: info.hpkp,
+            used_ech: info.used_ech,
+            used_delegated_credentials: info.used_delegated_credentials,
+            used_ocsp: info.used_ocsp,
+            used_private_dns: info.used_private_dns,
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(MallocSizeOf)]
+struct NetworkEventRequest {
+    offsets: Timings,
+    timings: Timings,
+    request: HttpRequest,
+    total_time: Duration,
+}
+
+#[derive(MallocSizeOf)]
+struct NetworkEventResponse {
+    cache_details: CacheDetails,
+    response: HttpResponse,
+}
+
+#[derive(Serialize)]
+pub(crate) struct CookieWrapper {
+    name: String,
+    value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    domain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    http_only: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secure: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    same_site: Option<String>,
+}
+
+#[derive(Serialize)]
+struct HeaderWrapper {
+    name: String,
+    value: String,
+}
+
 impl Actor for NetworkEventActor {
-    fn name(&self) -> String {
-        self.name.clone()
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn handle_message(
         &self,
-        _registry: &ActorRegistry,
+        client_request: ClientRequest,
+        registry: &ActorRegistry,
         msg_type: &str,
         _msg: &Map<String, Value>,
-        stream: &mut TcpStream,
         _id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
-        Ok(match msg_type {
+    ) -> Result<(), ActorError> {
+        match msg_type {
             "getRequestHeaders" => {
-                let mut headers = Vec::new();
-                let mut raw_headers_string = "".to_owned();
-                let mut headers_size = 0;
-                for (name, value) in self.request.headers.iter() {
-                    let value = &value.to_str().unwrap().to_string();
-                    raw_headers_string = raw_headers_string + name.as_str() + ":" + value + "\r\n";
-                    headers_size += name.as_str().len() + value.len();
-                    headers.push(Header {
-                        name: name.as_str().to_owned(),
-                        value: value.to_owned(),
-                    });
-                }
+                let request = self.request.borrow();
+                let request = request.as_ref().ok_or(ActorError::Internal)?;
+
+                let headers = get_header_list(&request.request.headers);
+                let raw_headers = get_raw_headers(&headers);
+
                 let msg = GetRequestHeadersReply {
-                    from: self.name(),
+                    from: self.name().into(),
                     headers,
-                    header_size: headers_size,
-                    raw_headers: raw_headers_string,
+                    header_size: raw_headers.len(),
+                    raw_headers,
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                client_request.reply_final(&msg)?
             },
+
             "getRequestCookies" => {
-                let mut cookies = Vec::new();
+                let request = self.request.borrow();
+                let request = request.as_ref().ok_or(ActorError::Internal)?;
 
-                for cookie in self.request.headers.get_all(header::COOKIE) {
-                    if let Ok(cookie_value) = String::from_utf8(cookie.as_bytes().to_vec()) {
-                        cookies = cookie_value.into_bytes();
-                    }
-                }
-
-                let msg = GetRequestCookiesReply {
-                    from: self.name(),
-                    cookies,
+                let msg = GetCookiesReply {
+                    from: self.name().into(),
+                    cookies: get_cookies_from_headers(
+                        &request.request.headers,
+                        &request.request.url,
+                    ),
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+
+                client_request.reply_final(&msg)?
             },
+
             "getRequestPostData" => {
-                let msg = GetRequestPostDataReply {
-                    from: self.name(),
-                    post_data: self.request.body.clone(),
-                    post_data_discarded: false,
-                };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
-            },
-            "getResponseHeaders" => {
-                if let Some(ref response_headers) = self.response.headers {
-                    let mut headers = vec![];
-                    let mut raw_headers_string = "".to_owned();
-                    let mut headers_size = 0;
-                    for (name, value) in response_headers.iter() {
-                        headers.push(Header {
-                            name: name.as_str().to_owned(),
-                            value: value.to_str().unwrap().to_owned(),
-                        });
-                        headers_size += name.as_str().len() + value.len();
-                        raw_headers_string.push_str(name.as_str());
-                        raw_headers_string.push(':');
-                        raw_headers_string.push_str(value.to_str().unwrap());
-                        raw_headers_string.push_str("\r\n");
-                    }
-                    let msg = GetResponseHeadersReply {
-                        from: self.name(),
-                        headers,
-                        header_size: headers_size,
-                        raw_headers: raw_headers_string,
-                    };
-                    let _ = stream.write_json_packet(&msg);
-                }
-                ActorMessageStatus::Processed
-            },
-            "getResponseCookies" => {
-                let mut cookies = Vec::new();
-                // TODO: This seems quite broken
-                for cookie in self.request.headers.get_all(header::SET_COOKIE) {
-                    if let Ok(cookie_value) = String::from_utf8(cookie.as_bytes().to_vec()) {
-                        cookies = cookie_value.into_bytes();
-                    }
-                }
+                let request = self.request.borrow();
+                let request = request.as_ref().ok_or(ActorError::Internal)?;
 
-                let msg = GetResponseCookiesReply {
-                    from: self.name(),
-                    cookies,
+                let msg = GetRequestPostDataReply {
+                    from: self.name().into(),
+                    post_data: request.request.body.as_ref().map(|b| b.0.clone()),
+                    post_data_discarded: request.request.body.is_none(),
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                client_request.reply_final(&msg)?
             },
+
+            "getResponseHeaders" => {
+                let response = self.response.borrow();
+                let response = response.as_ref().ok_or(ActorError::Internal)?;
+
+                let list = response
+                    .response
+                    .headers
+                    .as_ref()
+                    .map(get_header_list)
+                    .unwrap_or_default();
+                let raw_headers = get_raw_headers(&list);
+
+                let msg = GetResponseHeadersReply {
+                    from: self.name().into(),
+                    headers: list,
+                    header_size: raw_headers.len(),
+                    raw_headers,
+                };
+                client_request.reply_final(&msg)?;
+            },
+
+            "getResponseCookies" => {
+                let request = self.request.borrow();
+                let request = request.as_ref().ok_or(ActorError::Internal)?;
+                let response = self.response.borrow();
+                let response = response.as_ref().ok_or(ActorError::Internal)?;
+
+                let msg = GetCookiesReply {
+                    from: self.name().into(),
+                    cookies: get_cookies_from_headers(
+                        response
+                            .response
+                            .headers
+                            .as_ref()
+                            .ok_or(ActorError::Internal)?,
+                        &request.request.url,
+                    ),
+                };
+                client_request.reply_final(&msg)?
+            },
+
             "getResponseContent" => {
+                let response = self.response.borrow();
+                let response = response.as_ref().ok_or(ActorError::Internal)?;
+
+                let headers = response.response.headers.as_ref();
+                let list = headers.map(get_header_list).unwrap_or_default();
+                let raw_headers = get_raw_headers(&list);
+
+                let mime_type = headers
+                    .and_then(extract_mime_type_as_dataurl_mime)
+                    .map(|url| url.to_string());
+                let transferred_size = headers
+                    .and_then(|header| header.typed_get::<ContentLength>())
+                    .map(|content_length_header| content_length_header.0);
+
+                let content = response.response.body.as_ref().map(|body| {
+                    let (encoding, text) = if mime_type.is_some() {
+                        // Queue a LongStringActor for this body
+                        let body_string = String::from_utf8_lossy(body).to_string();
+                        let long_string_actor = LongStringActor::register(registry, body_string);
+                        let value = long_string_actor.long_string_obj();
+                        (None, serde_json::to_value(value).unwrap())
+                    } else {
+                        let b64 = STANDARD.encode(&body.0);
+                        (Some("base64".into()), serde_json::to_value(b64).unwrap())
+                    };
+                    let is_content_encoded = encoding.is_some();
+
+                    ResponseContent {
+                        body_size: body.len(),
+                        content_charset: "".into(),
+                        decoded_body_size: body.len(),
+                        encoding,
+                        headers_size: raw_headers.len(),
+                        is_content_encoded,
+                        mime_type,
+                        size: body.len(),
+                        text,
+                        transferred_size,
+                    }
+                });
+
                 let msg = GetResponseContentReply {
-                    from: self.name(),
-                    content: self.response.body.clone(),
-                    content_discarded: self.response.body.is_none(),
+                    from: self.name().into(),
+                    content,
+                    content_discarded: response.response.body.is_none(),
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                client_request.reply_final(&msg)?
             },
+
             "getEventTimings" => {
-                // TODO: This is a fake timings msg
-                let timings_obj = Timings {
-                    blocked: 0,
-                    dns: 0,
-                    connect: self.request.connect_time.as_millis() as u64,
-                    send: self.request.send_time.as_millis() as u64,
-                    wait: 0,
-                    receive: 0,
-                };
-                let total = timings_obj.connect + timings_obj.send;
-                // TODO: Send the correct values for all these fields.
+                let request = self.request.borrow();
+                let request = request.as_ref().ok_or(ActorError::Internal)?;
+
+                let offsets = request.offsets.clone();
+                let timings = request.timings.clone();
+                let total_time = timings.total();
+
                 let msg = GetEventTimingsReply {
-                    from: self.name(),
-                    timings: timings_obj,
-                    total_time: total,
+                    from: self.name().into(),
+                    offsets,
+                    server_timings: vec![],
+                    timings,
+                    total_time,
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                client_request.reply_final(&msg)?
             },
+
             "getSecurityInfo" => {
-                // TODO: Send the correct values for securityInfo.
+                let security_info = &*self.security_info.borrow();
+
                 let msg = GetSecurityInfoReply {
-                    from: self.name(),
-                    security_info: SecurityInfo {
-                        state: "insecure".to_owned(),
-                    },
+                    from: self.name().into(),
+                    security_info: security_info.into(),
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                client_request.reply_final(&msg)?
             },
-            _ => ActorMessageStatus::Ignored,
-        })
+
+            _ => return Err(ActorError::UnrecognizedPacketType),
+        };
+        Ok(())
     }
 }
 
 impl NetworkEventActor {
-    pub fn new(name: String) -> NetworkEventActor {
-        NetworkEventActor {
+    pub fn register(
+        registry: &ActorRegistry,
+        resource_id: u64,
+        browsing_context_name: String,
+    ) -> Arc<Self> {
+        let name = new_actor_name::<Self>();
+        let actor = NetworkEventActor {
             name,
-            request: HttpRequest {
-                url: String::new(),
-                method: Method::GET,
-                headers: HeaderMap::new(),
-                body: None,
-                started_date_time: SystemTime::now(),
-                time_stamp: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64,
-                send_time: Duration::ZERO,
-                connect_time: Duration::ZERO,
+            resource_id,
+            browsing_context_name,
+            ..Default::default()
+        };
+        registry.register::<Self>(actor)
+    }
+
+    pub fn add_request(&self, request: HttpRequest) {
+        *self.request.borrow_mut() = Some(NetworkEventRequest {
+            // TODO: Fill the rest of the fields correctly for offsets and timings
+            offsets: Default::default(),
+            timings: Timings {
+                connect: request.connect_time.as_millis() as usize,
+                send: request.send_time.as_millis() as usize,
+                ..Default::default()
             },
-            response: HttpResponse {
-                headers: None,
-                status: HttpStatus::default(),
-                body: None,
+            total_time: request.connect_time + request.send_time,
+            request,
+        });
+    }
+
+    pub fn add_response(&self, response: HttpResponse) {
+        if response.body.is_none() {
+            return;
+        }
+        *self.response.borrow_mut() = Some(NetworkEventResponse {
+            cache_details: CacheDetails {
+                from_cache: response.from_cache,
+                from_service_worker: false,
             },
-            is_xhr: false,
+            response,
+        });
+    }
+
+    pub fn add_security_info(&self, security_info: Option<TlsSecurityInfo>) {
+        *self.security_info.borrow_mut() = security_info.unwrap_or_default();
+    }
+
+    fn request_fields(&self) -> Option<RequestFields> {
+        let request = self.request.borrow();
+        let request = request.as_ref()?;
+        let url = request.request.url.as_url();
+        let cookies = get_cookies_from_headers(&request.request.headers, &request.request.url);
+
+        Some(RequestFields {
+            event_timings_available: true,
+            remote_address: url.host_str().map(|a| a.into()),
+            remote_port: url.port(),
+            request_cookies_available: !cookies.is_empty(),
+            request_headers_available: !request.request.headers.is_empty(),
+            total_time: request.total_time.as_secs_f64(),
+        })
+    }
+
+    fn response_fields(&self) -> Option<ResponseFields> {
+        let response = self.response.borrow();
+        let response = response.as_ref()?;
+        let url = self.request.borrow().as_ref()?.request.url.clone();
+        let headers = response.response.headers.as_ref();
+        let cookies = headers.map(|headers| get_cookies_from_headers(headers, &url));
+        let status = &response.response.status;
+
+        Some(ResponseFields {
+            cache_details: response.cache_details.clone(),
+            response_content_available: response
+                .response
+                .body
+                .as_ref()
+                .is_some_and(|body| !body.is_empty()),
+            response_cookies_available: cookies.is_some(),
+            response_headers_available: headers.is_some(),
+            response_start_available: true,
+            status: status.code().to_string(),
+            status_text: String::from_utf8_lossy(status.message()).to_string(),
+        })
+    }
+
+    fn security_fields(&self) -> SecurityFields {
+        let security_info = self.security_info.borrow();
+
+        SecurityFields {
+            security_state: security_info.state.to_string(),
+            security_info_available: true,
         }
     }
 
-    pub fn add_request(&mut self, request: DevtoolsHttpRequest) {
-        request.url.as_str().clone_into(&mut self.request.url);
+    pub fn resource_updates(&self, registry: &ActorRegistry) -> NetworkEventResource {
+        let browsing_context_actor =
+            registry.find::<BrowsingContextActor>(&self.browsing_context_name);
 
-        self.request.method = request.method.clone();
-        self.request.headers = request.headers.clone();
-        self.request.body = request.body;
-        self.request.started_date_time = request.started_date_time;
-        self.request.time_stamp = request.time_stamp;
-        self.request.connect_time = request.connect_time;
-        self.request.send_time = request.send_time;
-        self.is_xhr = request.is_xhr;
+        NetworkEventResource {
+            resource_id: self.resource_id,
+            resource_updates: ResourceUpdates {
+                // TODO: Set correct value
+                http_version: "HTTP/1.1".into(),
+                request: self.request_fields(),
+                response: self.response_fields(),
+                security: self.security_fields(),
+            },
+            browsing_context_id: browsing_context_actor.browsing_context_id.value(),
+            inner_window_id: 0,
+        }
     }
+}
 
-    pub fn add_response(&mut self, response: DevtoolsHttpResponse) {
-        self.response.headers.clone_from(&response.headers);
-        self.response.status = response.status;
-        self.response.body = response.body;
-    }
+fn get_cookies_from_headers(headers: &HeaderMap, url: &ServoUrl) -> Vec<CookieWrapper> {
+    headers
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|cookie| {
+            let cookie_str = std::str::from_utf8(cookie.as_bytes()).ok()?;
+            ServoCookie::from_cookie_string(cookie_str, url, CookieSource::HTTP)
+        })
+        .map(|cookie| {
+            let cookie = &cookie.cookie;
+            CookieWrapper {
+                name: cookie.name().into(),
+                value: cookie.value().into(),
+                path: cookie.path().map(|p| p.into()),
+                domain: cookie.domain().map(|d| d.into()),
+                expires: cookie.expires().map(|e| format!("{e:?}")),
+                http_only: cookie.http_only(),
+                secure: cookie.secure(),
+                same_site: cookie.same_site().map(|s| s.to_string()),
+            }
+        })
+        .collect()
+}
 
-    pub fn event_actor(&self) -> EventActor {
-        // TODO: Send the correct values for startedDateTime, isXHR, private
+fn get_header_list(headers: &HeaderMap) -> Vec<HeaderWrapper> {
+    headers
+        .iter()
+        .map(|(name, value)| HeaderWrapper {
+            name: name.as_str().into(),
+            value: value.to_str().unwrap_or_default().into(),
+        })
+        .collect()
+}
+
+fn get_raw_headers(headers: &[HeaderWrapper]) -> String {
+    headers
+        .iter()
+        .map(|header| format!("{}:{}", header.name, header.value))
+        .collect::<Vec<_>>()
+        .join("\r\n")
+}
+
+impl ActorEncode<NetworkEventMsg> for NetworkEventActor {
+    fn encode(&self, registry: &ActorRegistry) -> NetworkEventMsg {
+        let request = self.request.borrow();
+        let request = &request.as_ref().expect("There should be a request").request;
 
         let started_datetime_rfc3339 = match Local.timestamp_millis_opt(
-            self.request
+            request
                 .started_date_time
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as i64,
         ) {
             LocalResult::None => "".to_owned(),
-            LocalResult::Single(date_time) => date_time.to_rfc3339().to_string(),
-            LocalResult::Ambiguous(date_time, _) => date_time.to_rfc3339().to_string(),
+            LocalResult::Single(date_time) => date_time.to_rfc3339(),
+            LocalResult::Ambiguous(date_time, _) => date_time.to_rfc3339(),
         };
 
-        EventActor {
-            actor: self.name(),
-            url: self.request.url.clone(),
-            method: format!("{}", self.request.method),
-            started_date_time: started_datetime_rfc3339,
-            time_stamp: self.request.time_stamp,
-            is_xhr: self.is_xhr,
+        let browsing_context_actor =
+            registry.find::<BrowsingContextActor>(&self.browsing_context_name);
+
+        NetworkEventMsg {
+            actor: self.name().into(),
+            browsing_context_id: browsing_context_actor.browsing_context_id.value(),
+            cause: Cause {
+                type_: request.destination.as_str().to_string(),
+                loading_document_uri: None, // Set if available
+            },
+            is_xhr: request.is_xhr,
+            method: format!("{}", request.method),
             private: false,
+            resource_id: self.resource_id,
+            started_date_time: started_datetime_rfc3339,
+            time_stamp: request.time_stamp,
+            url: request.url.to_string(),
         }
-    }
-
-    pub fn response_start(&self) -> ResponseStartMsg {
-        // TODO: Send the correct values for all these fields.
-        let h_size_option = self.response.headers.as_ref().map(|headers| headers.len());
-        let h_size = h_size_option.unwrap_or(0);
-        let status = &self.response.status;
-        // TODO: Send the correct values for remoteAddress and remotePort and http_version.
-        ResponseStartMsg {
-            http_version: "HTTP/1.1".to_owned(),
-            remote_address: "63.245.217.43".to_owned(),
-            remote_port: 443,
-            status: status.code().to_string(),
-            status_text: String::from_utf8_lossy(status.message()).to_string(),
-            headers_size: h_size,
-            discard_response_body: false,
-        }
-    }
-
-    pub fn response_content(&self) -> ResponseContentMsg {
-        let mut m_string = "".to_owned();
-        if let Some(ref headers) = self.response.headers {
-            m_string = match headers.typed_get::<ContentType>() {
-                Some(ct) => ct.to_string(),
-                _ => "".to_owned(),
-            };
-        }
-        // TODO: Set correct values when response's body is sent to the devtools in http_loader.
-        ResponseContentMsg {
-            mime_type: m_string,
-            content_size: 0,
-            transferred_size: 0,
-            discard_response_body: true,
-        }
-    }
-
-    pub fn response_cookies(&self) -> ResponseCookiesMsg {
-        let mut cookies_size = 0;
-        if let Some(ref headers) = self.response.headers {
-            cookies_size = match headers.typed_get::<Cookie>() {
-                Some(ref cookie) => cookie.len(),
-                _ => 0,
-            };
-        }
-        ResponseCookiesMsg {
-            cookies: cookies_size,
-        }
-    }
-
-    pub fn response_headers(&self) -> ResponseHeadersMsg {
-        let mut headers_size = 0;
-        let mut headers_byte_count = 0;
-        if let Some(ref headers) = self.response.headers {
-            headers_size = headers.len();
-            for (name, value) in headers.iter() {
-                headers_byte_count += name.as_str().len() + value.len();
-            }
-        }
-        ResponseHeadersMsg {
-            headers: headers_size,
-            headers_size: headers_byte_count,
-        }
-    }
-
-    pub fn request_headers(&self) -> RequestHeadersMsg {
-        let size = self.request.headers.iter().fold(0, |acc, (name, value)| {
-            acc + name.as_str().len() + value.len()
-        });
-        RequestHeadersMsg {
-            headers: self.request.headers.len(),
-            headers_size: size,
-        }
-    }
-
-    pub fn request_cookies(&self) -> RequestCookiesMsg {
-        let cookies_size = match self.request.headers.typed_get::<Cookie>() {
-            Some(ref cookie) => cookie.len(),
-            _ => 0,
-        };
-        RequestCookiesMsg {
-            cookies: cookies_size,
-        }
-    }
-
-    pub fn total_time(&self) -> Duration {
-        self.request.connect_time + self.request.send_time
     }
 }

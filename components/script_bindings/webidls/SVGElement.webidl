@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 // https://svgwg.org/svg2-draft/types.html#InterfaceSVGElement
-[Exposed=Window, Pref="dom_svg_enabled"]
+[Exposed=Window]
 interface SVGElement : Element {
 
   //[SameObject] readonly attribute SVGAnimatedString className;
@@ -18,7 +18,7 @@ interface SVGElement : Element {
   //void blur();
 };
 
-//SVGElement includes GlobalEventHandlers;
+SVGElement includes GlobalEventHandlers;
 //SVGElement includes SVGElementInstance;
 SVGElement includes ElementCSSInlineStyle;
 SVGElement includes HTMLOrSVGElement;

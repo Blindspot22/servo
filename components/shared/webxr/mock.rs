@@ -3,13 +3,14 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use euclid::{Point2D, Rect, RigidTransform3D, Transform3D};
-#[cfg(feature = "ipc")]
+use profile_traits::generic_callback::GenericCallback as ProfileGenericCallback;
 use serde::{Deserialize, Serialize};
+use servo_base::generic_channel::GenericReceiver;
 
 use crate::{
     DiscoveryAPI, Display, EntityType, Error, Floor, Handedness, Input, InputId, InputSource,
     LeftEye, Native, RightEye, SelectEvent, SelectKind, TargetRayMode, Triangle, Viewer, Viewport,
-    Visibility, WebXrReceiver, WebXrSender,
+    Visibility,
 };
 
 /// A trait for discovering mock XR devices
@@ -17,12 +18,11 @@ pub trait MockDiscoveryAPI<GL>: 'static {
     fn simulate_device_connection(
         &mut self,
         init: MockDeviceInit,
-        receiver: WebXrReceiver<MockDeviceMsg>,
+        receiver: GenericReceiver<MockDeviceMsg>,
     ) -> Result<Box<dyn DiscoveryAPI<GL>>, Error>;
 }
 
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "ipc", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MockDeviceInit {
     pub floor_origin: Option<RigidTransform3D<f32, Floor, Native>>,
     pub supports_inline: bool,
@@ -34,8 +34,7 @@ pub struct MockDeviceInit {
     pub world: Option<MockWorld>,
 }
 
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "ipc", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MockViewInit<Eye> {
     pub transform: RigidTransform3D<f32, Viewer, Eye>,
     pub projection: Transform3D<f32, Eye, Display>,
@@ -44,15 +43,13 @@ pub struct MockViewInit<Eye> {
     pub fov: Option<(f32, f32, f32, f32)>,
 }
 
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "ipc", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum MockViewsInit {
     Mono(MockViewInit<Viewer>),
     Stereo(MockViewInit<LeftEye>, MockViewInit<RightEye>),
 }
 
-#[derive(Debug)]
-#[cfg_attr(feature = "ipc", derive(Serialize, Deserialize))]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum MockDeviceMsg {
     SetViewerOrigin(Option<RigidTransform3D<f32, Viewer, Native>>),
     SetFloorOrigin(Option<RigidTransform3D<f32, Floor, Native>>),
@@ -62,13 +59,12 @@ pub enum MockDeviceMsg {
     VisibilityChange(Visibility),
     SetWorld(MockWorld),
     ClearWorld,
-    Disconnect(WebXrSender<()>),
+    Disconnect(ProfileGenericCallback<()>),
     SetBoundsGeometry(Vec<Point2D<f32, Floor>>),
     SimulateResetPose,
 }
 
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "ipc", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MockInputInit {
     pub source: InputSource,
     pub pointer_origin: Option<RigidTransform3D<f32, Input, Native>>,
@@ -76,8 +72,7 @@ pub struct MockInputInit {
     pub supported_buttons: Vec<MockButton>,
 }
 
-#[derive(Debug)]
-#[cfg_attr(feature = "ipc", derive(Serialize, Deserialize))]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum MockInputMsg {
     SetHandedness(Handedness),
     SetTargetRayMode(TargetRayMode),
@@ -94,21 +89,18 @@ pub enum MockInputMsg {
     UpdateButtonState(MockButton),
 }
 
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "ipc", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MockRegion {
     pub faces: Vec<Triangle>,
     pub ty: EntityType,
 }
 
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "ipc", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MockWorld {
     pub regions: Vec<MockRegion>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "ipc", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum MockButtonType {
     Grip,
     Touchpad,
@@ -117,8 +109,7 @@ pub enum MockButtonType {
     OptionalThumbstick,
 }
 
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "ipc", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MockButton {
     pub button_type: MockButtonType,
     pub pressed: bool,

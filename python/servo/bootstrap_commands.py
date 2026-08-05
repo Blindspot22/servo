@@ -8,78 +8,80 @@
 # except according to those terms.
 
 import base64
+import csv
 import glob
 import json
 import os
 import os.path as path
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import traceback
-import urllib
+import urllib.error
 
 import toml
-
 from mach.decorators import (
+    Command,
     CommandArgument,
     CommandProvider,
-    Command,
 )
 
 import servo.platform
-
 from servo.command_base import CommandBase, cd, check_call
 from servo.util import delete, download_bytes
 
 
 @CommandProvider
 class MachCommands(CommandBase):
-    @Command('bootstrap',
-             description='Install required packages for building.',
-             category='bootstrap')
-    @CommandArgument('--force', '-f',
-                     action='store_true',
-                     help='Boostrap without confirmation')
-    @CommandArgument('--skip-platform',
-                     action='store_true',
-                     help='Skip platform bootstrapping.')
-    @CommandArgument('--skip-lints',
-                     action='store_true',
-                     help='Skip tool necessary for linting.')
-    def bootstrap(self, force=False, skip_platform=False, skip_lints=False):
+    @Command("bootstrap", description="Install required packages for building.", category="bootstrap")
+    @CommandArgument("--force", "-f", action="store_true", help="Boostrap without confirmation")
+    @CommandArgument("--yes", "-y", action="store_true", help="Answer yes to all installation prompts")
+    @CommandArgument("--skip-platform", action="store_true", help="Skip platform bootstrapping.")
+    @CommandArgument("--skip-lints", action="store_true", help="Skip tool necessary for linting.")
+    @CommandArgument("--skip-nextest", action="store_true", help="Skip tool for running Rust tests.")
+    def bootstrap(
+        self,
+        force: bool = False,
+        yes: bool = False,
+        skip_platform: bool = False,
+        skip_lints: bool = False,
+        skip_nextest: bool = False,
+    ) -> int:
         # Note: This entry point isn't actually invoked by ./mach bootstrap.
         # ./mach bootstrap calls mach_bootstrap.bootstrap_command_only so that
         # it can install dependencies without needing mach's dependencies
         try:
-            servo.platform.get().bootstrap(force, skip_platform, skip_lints)
+            servo.platform.get().bootstrap(force, yes, skip_platform, skip_lints, skip_nextest)
         except NotImplementedError as exception:
             print(exception)
             return 1
         return 0
 
-    @Command('bootstrap-gstreamer',
-             description='Set up a local copy of the gstreamer libraries (linux only).',
-             category='bootstrap')
-    @CommandArgument('--force', '-f',
-                     action='store_true',
-                     help='Boostrap without confirmation')
-    def bootstrap_gstreamer(self, force=False):
+    @Command(
+        "bootstrap-gstreamer",
+        description="Set up a local copy of the gstreamer libraries (linux only).",
+        category="bootstrap",
+    )
+    @CommandArgument("--force", "-f", action="store_true", help="Boostrap without confirmation")
+    def bootstrap_gstreamer(self, force: bool = False, yes: bool = False) -> int:
         try:
-            servo.platform.get().bootstrap_gstreamer(force)
+            servo.platform.get().bootstrap_gstreamer(force, yes)
         except NotImplementedError as exception:
             print(exception)
             return 1
         return 0
 
-    @Command('update-hsts-preload',
-             description='Download the HSTS preload list',
-             category='bootstrap')
-    def bootstrap_hsts_preload(self, force=False):
-        preload_filename = "hsts_preload.json"
-        preload_path = path.join(self.context.topdir, "resources")
+    @Command("update-hsts-preload", description="Download the HSTS preload list", category="bootstrap")
+    def bootstrap_hsts_preload(self, force: bool = False) -> None:
+        preload_filename = "hsts_preload.fstmap"
+        preload_path = path.join(self.context.topdir, "components", "default-resources", "resources")
 
-        chromium_hsts_url = "https://chromium.googlesource.com/chromium/src" + \
-            "/net/+/master/http/transport_security_state_static.json?format=TEXT"
+        chromium_hsts_url = (
+            "https://chromium.googlesource.com/chromium/src"
+            + "/+/main/net/http/transport_security_state_static.json?format=TEXT"
+        )
 
         try:
             content_base64 = download_bytes("Chromium HSTS preload list", chromium_hsts_url)
@@ -87,37 +89,39 @@ class MachCommands(CommandBase):
             print("Unable to download chromium HSTS preload list; are you connected to the internet?")
             sys.exit(1)
 
-        content_decoded = base64.b64decode(content_base64)
+        content_decoded = base64.b64decode(content_base64).decode()
 
         # The chromium "json" has single line comments in it which, of course,
         # are non-standard/non-valid json. Simply strip them out before parsing
-        content_json = re.sub(r'(^|\s+)//.*$', '', content_decoded, flags=re.MULTILINE)
-
+        content_json = re.sub(r"(^|\s+)//.*$", "", content_decoded, flags=re.MULTILINE)
         try:
             pins_and_static_preloads = json.loads(content_json)
-            entries = {
-                "entries": [
-                    {
-                        "host": e["name"],
-                        "include_subdomains": e.get("include_subdomains", False)
-                    }
-                    for e in pins_and_static_preloads["entries"]
-                ]
-            }
-
-            with open(path.join(preload_path, preload_filename), 'w') as fd:
-                json.dump(entries, fd, indent=4)
-        except ValueError:
-            print("Unable to parse chromium HSTS preload list, has the format changed?")
+            with tempfile.NamedTemporaryFile(mode="w") as csv_file:
+                writer = csv.writer(csv_file)
+                for idx, e in enumerate(sorted(pins_and_static_preloads["entries"], key=lambda e: e["name"])):
+                    next_id = idx * 2 + (1 if e.get("include_subdomains", False) else 0)
+                    writer.writerow([e["name"], str(next_id)])
+                csv_file.flush()
+                subprocess.run(["fst", "map", "--sorted", csv_file.name, path.join(preload_path, preload_filename)])
+        except ValueError as e:
+            print(f"Unable to parse chromium HSTS preload list, has the format changed? \n{e}")
             sys.exit(1)
 
-    @Command('update-pub-domains',
-             description='Download the public domains list and update resources/public_domains.txt',
-             category='bootstrap')
-    def bootstrap_pub_suffix(self, force=False):
+    @Command(
+        "update-pub-domains",
+        description="Download the public domains list and update the copy in servo-default-resources",
+        category="bootstrap",
+    )
+    def bootstrap_pub_suffix(self, force: bool = False) -> None:
         list_url = "https://publicsuffix.org/list/public_suffix_list.dat"
-        dst_filename = path.join(self.context.topdir, "resources", "public_domains.txt")
-        not_implemented_case = re.compile(r'^[^*]+\*')
+        dst_filename = path.join(
+            self.context.topdir,
+            "components",
+            "default-resources",
+            "resources",
+            "public_domains.txt",
+        )
+        not_implemented_case = re.compile(r"^[^*]+\*")
 
         try:
             content = download_bytes("Public suffix list", list_url)
@@ -132,31 +136,27 @@ class MachCommands(CommandBase):
             for suffix in suffixes:
                 if not_implemented_case.match(suffix):
                     print("Warning: the new list contains a case that servo can't handle: %s" % suffix)
-                fo.write(suffix.encode("idna") + "\n")
+                fo.write(suffix.encode("idna") + b"\n")
 
-    @Command('clean-nightlies',
-             description='Clean unused nightly builds of Rust and Cargo',
-             category='bootstrap')
-    @CommandArgument('--force', '-f',
-                     action='store_true',
-                     help='Actually remove stuff')
-    @CommandArgument('--keep',
-                     default='1',
-                     help='Keep up to this many most recent nightlies')
-    def clean_nightlies(self, force=False, keep=None):
+    @Command("clean-nightlies", description="Clean unused nightly builds of Rust and Cargo", category="bootstrap")
+    @CommandArgument("--force", "-f", action="store_true", help="Actually remove stuff")
+    @CommandArgument("--keep", default="1", help="Keep up to this many most recent nightlies")
+    def clean_nightlies(self, force: bool, keep: str | int) -> None:
         print(f"Current Rust version for Servo: {self.rust_toolchain()}")
         old_toolchains = []
         keep = int(keep)
-        stdout = subprocess.check_output(['git', 'log', '--format=%H', 'rust-toolchain.toml'])
+        stdout = subprocess.check_output(["git", "log", "--format=%H", "rust-toolchain.toml"])
         for i, commit_hash in enumerate(stdout.split(), 1):
             if i > keep:
-                toolchain_config_text = subprocess.check_output(
-                    ['git', 'show', f'{commit_hash}:rust-toolchain.toml'])
-                toolchain = toml.loads(toolchain_config_text)['toolchain']['channel']
+                toolchain_config_text = subprocess.check_output(["git", "show", f"{commit_hash}:rust-toolchain.toml"])
+                toolchain = toml.loads(toolchain_config_text)["toolchain"]["channel"]
                 old_toolchains.append(toolchain)
 
         removing_anything = False
-        stdout = subprocess.check_output(['rustup', 'toolchain', 'list'])
+        if shutil.which("rustup") is None:
+            print("rustup not found. Cannot list or remove old toolchains.")
+            return
+        stdout = subprocess.check_output(["rustup", "toolchain", "list"])
         for toolchain_with_host in stdout.split():
             for old in old_toolchains:
                 if toolchain_with_host.startswith(old):
@@ -169,23 +169,14 @@ class MachCommands(CommandBase):
         if not removing_anything:
             print("Nothing to remove.")
         elif not force:
-            print("Nothing done. "
-                  "Run `./mach clean-nightlies -f` to actually remove.")
+            print("Nothing done. Run `./mach clean-nightlies -f` to actually remove.")
 
-    @Command('clean-cargo-cache',
-             description='Clean unused Cargo packages',
-             category='bootstrap')
-    @CommandArgument('--force', '-f',
-                     action='store_true',
-                     help='Actually remove stuff')
-    @CommandArgument('--show-size', '-s',
-                     action='store_true',
-                     help='Show packages size')
-    @CommandArgument('--keep',
-                     default='1',
-                     help='Keep up to this many most recent dependencies')
-    def clean_cargo_cache(self, force=False, show_size=False, keep=None):
-        def get_size(path):
+    @Command("clean-cargo-cache", description="Clean unused Cargo packages", category="bootstrap")
+    @CommandArgument("--force", "-f", action="store_true", help="Actually remove stuff")
+    @CommandArgument("--show-size", "-s", action="store_true", help="Show packages size")
+    @CommandArgument("--keep", default="1", help="Keep up to this many most recent dependencies")
+    def clean_cargo_cache(self, force: bool, show_size: bool, keep: str) -> None:
+        def get_size(path: str) -> float:
             if os.path.isfile(path):
                 return os.path.getsize(path) / (1024 * 1024.0)
             total_size = 0
@@ -197,12 +188,13 @@ class MachCommands(CommandBase):
 
         removing_anything = False
         packages = {
-            'crates': {},
-            'git': {},
+            "crates": {},
+            "git": {},
         }
         import toml
+
         if os.environ.get("CARGO_HOME", ""):
-            cargo_dir = os.environ.get("CARGO_HOME")
+            cargo_dir = os.environ["CARGO_HOME"]
         else:
             home_dir = os.path.expanduser("~")
             cargo_dir = path.join(home_dir, ".cargo")
@@ -214,7 +206,7 @@ class MachCommands(CommandBase):
         for package in content.get("package", []):
             source = package.get("source", "")
             version = package["version"]
-            if source == u"registry+https://github.com/rust-lang/crates.io-index":
+            if source == "registry+https://github.com/rust-lang/crates.io-index":
                 crate_name = "{}-{}".format(package["name"], version)
                 if not packages["crates"].get(crate_name, False):
                     packages["crates"][package["name"]] = {
@@ -252,7 +244,7 @@ class MachCommands(CommandBase):
         git_db_dir = path.join(git_dir, "db")
         git_checkout_dir = path.join(git_dir, "checkouts")
         if os.path.isdir(git_db_dir):
-            git_db_list = list(filter(lambda f: not f.startswith('.'), os.listdir(git_db_dir)))
+            git_db_list = list(filter(lambda f: not f.startswith("."), os.listdir(git_db_dir)))
         else:
             git_db_list = []
         if os.path.isdir(git_checkout_dir):
@@ -269,7 +261,7 @@ class MachCommands(CommandBase):
                 }
             if os.path.isdir(path.join(git_checkout_dir, d)):
                 with cd(path.join(git_checkout_dir, d)):
-                    git_crate_hash = glob.glob('*')
+                    git_crate_hash = glob.glob("*")
                 if not git_crate_hash or not os.path.isdir(path.join(git_db_dir, d)):
                     packages["git"][crate_name]["exist"].append(("del", d, ""))
                     continue
@@ -290,7 +282,7 @@ class MachCommands(CommandBase):
                     }
                 packages["crates"][crate_name]["exist"].append(d)
 
-        total_size = 0
+        total_size = 0.0
         for packages_type in ["git", "crates"]:
             sorted_packages = sorted(packages[packages_type])
             for crate_name in sorted_packages:
@@ -303,8 +295,12 @@ class MachCommands(CommandBase):
                     exist_item = exist[2] if packages_type == "git" else exist
                     if exist_item not in current_crate:
                         crate_count += 1
-                        if int(crate_count) >= int(keep) or not current_crate or \
-                           exist[0] == "del" or exist[2] == "master":
+                        if (
+                            int(crate_count) >= int(keep)
+                            or not current_crate
+                            or exist[0] == "del"
+                            or exist[2] == "master"
+                        ):
                             removing_anything = True
                             crate_paths = []
                             if packages_type == "git":
@@ -321,7 +317,7 @@ class MachCommands(CommandBase):
                                 else:
                                     crate_paths.append(exist_path)
 
-                                    exist_checkout_list = glob.glob(path.join(exist_checkout_path, '*'))
+                                    exist_checkout_list = glob.glob(path.join(exist_checkout_path, "*"))
                                     if len(exist_checkout_list) <= 1:
                                         crate_paths.append(exist_checkout_path)
                                         if os.path.isdir(exist_db_path):
@@ -330,7 +326,7 @@ class MachCommands(CommandBase):
                                 crate_paths.append(path.join(crates_cache_dir, "{}.crate".format(exist)))
                                 crate_paths.append(path.join(crates_src_dir, exist))
 
-                            size = sum(get_size(p) for p in crate_paths) if show_size else 0
+                            size = sum((get_size(p) for p in crate_paths), 0.0) if show_size else 0.0
                             total_size += size
                             print_msg = (exist_name, " ({}MB)".format(round(size, 2)) if show_size else "", cargo_dir)
                             if force:
@@ -351,5 +347,4 @@ class MachCommands(CommandBase):
         if not removing_anything:
             print("Nothing to remove.")
         elif not force:
-            print("\nNothing done. "
-                  "Run `./mach clean-cargo-cache -f` to actually remove.")
+            print("\nNothing done. Run `./mach clean-cargo-cache -f` to actually remove.")

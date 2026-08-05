@@ -2,27 +2,23 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::net::TcpStream;
+use std::sync::Arc;
 
-use serde::Serialize;
+use malloc_size_of_derive::MallocSizeOf;
 use serde_json::{Map, Value};
 
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
-use crate::protocol::JsonPacketStream;
-use crate::{EmptyReplyMsg, StreamId};
+use crate::actor::{Actor, ActorEncode, ActorError, ActorRegistry, new_actor_name};
+use crate::protocol::ClientRequest;
+use crate::{ActorMsg, EmptyReplyMsg, StreamId};
 
-#[derive(Serialize)]
-pub struct NetworkParentActorMsg {
-    actor: String,
-}
-
-pub struct NetworkParentActor {
+#[derive(MallocSizeOf)]
+pub(crate) struct NetworkParentActor {
     name: String,
 }
 
 impl Actor for NetworkParentActor {
-    fn name(&self) -> String {
-        self.name.clone()
+    fn name(&self) -> &str {
+        &self.name
     }
 
     /// The network parent actor can handle the following messages:
@@ -30,29 +26,43 @@ impl Actor for NetworkParentActor {
     /// - `setSaveRequestAndResponseBodies`: Doesn't do anything yet
     fn handle_message(
         &self,
+        request: ClientRequest,
         _registry: &ActorRegistry,
         msg_type: &str,
         _msg: &Map<String, Value>,
-        stream: &mut TcpStream,
         _id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
-        Ok(match msg_type {
+    ) -> Result<(), ActorError> {
+        match msg_type {
             "setSaveRequestAndResponseBodies" => {
-                let msg = EmptyReplyMsg { from: self.name() };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                let msg = EmptyReplyMsg {
+                    from: self.name().into(),
+                };
+                request.reply_final(&msg)?
             },
-            _ => ActorMessageStatus::Ignored,
-        })
+            "setPersist" => {
+                let msg = EmptyReplyMsg {
+                    from: self.name().into(),
+                };
+                request.reply_final(&msg)?
+            },
+            _ => return Err(ActorError::UnrecognizedPacketType),
+        };
+        Ok(())
     }
 }
 
 impl NetworkParentActor {
-    pub fn new(name: String) -> Self {
-        Self { name }
+    pub fn register(registry: &ActorRegistry) -> Arc<Self> {
+        let name = new_actor_name::<Self>();
+        let actor = Self { name };
+        registry.register::<Self>(actor)
     }
+}
 
-    pub fn encodable(&self) -> NetworkParentActorMsg {
-        NetworkParentActorMsg { actor: self.name() }
+impl ActorEncode<ActorMsg> for NetworkParentActor {
+    fn encode(&self, _: &ActorRegistry) -> ActorMsg {
+        ActorMsg {
+            actor: self.name().into(),
+        }
     }
 }

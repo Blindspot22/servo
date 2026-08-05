@@ -1,53 +1,11 @@
-import { common } from '@kit.AbilityKit';
-import display from '@ohos.display';
-import deviceInfo from '@ohos.deviceInfo';
 import promptAction from '@ohos.promptAction';
-
-interface ServoXComponentInterface {
-  loadURL(url: string): void;
-  goBack(): void;
-  goForward(): void;
-  registerURLcallback(callback: (url: string) => void): void;
-  registerPromptToastCallback(callback: (msg: string) => void): void
-  initServo(options: InitOpts): void;
-}
-
-interface InitOpts {
-  url: string;
-  deviceType: string,
-  osFullName: string,
-  resourceDir: string,
-  cacheDir: string,
-  displayDensity: number,
-  commandlineArgs: string,
-}
-
-function get_density(): number {
-    try {
-      let displayClass = display.getDefaultDisplaySync();
-      console.info('Test densityDPI:' + JSON.stringify(displayClass.densityDPI));
-      return displayClass.densityDPI / 160;
-  } catch (exception) {
-      console.error('Failed to obtain the default display object. Code: ' + JSON.stringify(exception));
-      return 3;
-  }
-}
-
-function get_device_type(): string {
-  let device_type: string = deviceInfo.deviceType;
-  if (device_type == "") {
-      console.error("deviceInfo.deviceType is empty string!")
-  } else {
-    console.info("Device type is " + device_type)
-  }
-  return device_type;
-}
+import servoshell from 'libservoshell.so';
 
 function prompt_toast(msg: string) {
-    promptAction.showToast({
-      message: msg,
-      duration: 2000
-    });
+  promptAction.showToast({
+    message: msg,
+    duration: 2000
+  });
 }
 
 // Use the getShared API to obtain the LocalStorage instance shared by stage.
@@ -56,79 +14,123 @@ let storage = LocalStorage.getShared()
 @Entry(storage)
 @Component
 struct Index {
-  xComponentContext: ServoXComponentInterface | undefined = undefined;
   xComponentAttrs: XComponentAttrs = {
     id: 'ServoDemo',
     type: XComponentType.SURFACE,
     libraryname: 'servoshell',
   }
 
-  private context = getContext(this) as common.UIAbilityContext;
-  @LocalStorageProp('InitialURI') InitialURI: string = "unused"
-  @LocalStorageProp('CommandlineArgs') CommandlineArgs: string = ""
-  @State urlToLoad: string = this.InitialURI
+  // The state seem to be required to be on the top.
+  @State urlToLoad: string = ""
+  @State tablist: Array<number> = [0];
+  @State currentIndex: number = 0;
+
+  @Builder tabBuilder(title: string, index: number) {
+    Row() {
+      Text(String(index))
+        .padding('10pt')
+      Button('X')
+      .backgroundColor('#00000000')
+      .visibility(this.tablist.length>1 && index != 0 ? Visibility.Visible: Visibility.Hidden)
+      .fontColor(Color.Black)
+      .fontWeight(FontWeight.Bolder)
+      .onClick((event) => {
+          this.currentIndex = 0;
+          servoshell.deleteWebview(index, this.tablist);
+          this.tablist.splice(index,1);
+        })
+    }
+    .width(65)
+    .height(40)
+    .justifyContent(FlexAlign.Center)
+    .backgroundColor(this.currentIndex === index ? '#1B8381': Color.White)
+    .borderRadius(10)
+    .shadow({
+          radius: 10,
+          color: Color.Gray,
+          offsetX: 10,
+          offsetY: 10
+        })
+  }
+
+  aboutToAppear(): void {
+    console.info("aboutToAppear - registering callbacks!")
+    servoshell.registerURLcallback((new_url: string) => {
+      console.info('New URL from native: ', new_url)
+      this.urlToLoad = new_url
+    })
+    servoshell.registerPromptToastCallback(prompt_toast)
+  }
 
   // Called when the user swipes from the right or left edge to the middle
   // Default behavior is bringing the app to the background.
-  onBackPress(): boolean | void {
-    this.xComponentContext?.goBack()
+  onBackPress(): boolean {
+    servoshell.goBack();
     return true;
   }
 
   build() {
-    Column() {
+    // We originally use `Column()` here, but for some reason the column
+    // extends beyond the edge of the screen. This does not happen with
+    // Flex.
+    Flex({ direction: FlexDirection.Column}) {
       Row() {
-        Button('⇦').backgroundColor(Color.White)
+        Button('+')
+          .backgroundColor(Color.White)
+          .fontColor(Color.Black)
+          .fontWeight(FontWeight.Bolder)
+          .fontSize(22)
+          .width('12%')
+          .onClick((event) => {
+            const new_id = this.tablist[this.tablist.length-1]+1;
+            // the order is important as setting the new index will automatically create a new surface.
+            servoshell.nextWindowId(new_id);
+            this.currentIndex = this.tablist.push(new_id) - 1;
+          })
+        Button('⇦')
+          .backgroundColor(Color.White)
           .fontColor(Color.Black)
           .fontWeight(FontWeight.Bolder)
           .width('12%')
           .fontSize(12)
-          .onClick(()=>{
+          .onClick(() => {
             this.onBackPress()
           })
-        Button('⇨').backgroundColor(Color.White)
+        Button('⇨')
+          .backgroundColor(Color.White)
           .fontColor(Color.Black)
           .fontWeight(FontWeight.Bolder)
           .fontSize(12)
           .width('12%')
-          .onClick(()=> {
-            this.xComponentContext?.goForward()
+          .onClick(() => {
+            servoshell.goForward()
           })
-        TextInput({placeholder:'URL',text: $$this.urlToLoad})
-          .type(InputType.Normal)
+        TextInput({ placeholder: 'URL', text: $$this.urlToLoad })
+          .type(InputType.URL)
           .width('76%')
           .onChange((value) => {
             this.urlToLoad = value
           })
-          .onSubmit((EnterKeyType)=>{
-            this.xComponentContext?.loadURL(this.urlToLoad)
+          .onSubmit((EnterKeyType) => {
+            servoshell.loadURL(this.urlToLoad)
             console.info('Load URL: ', this.urlToLoad)
           })
       }
-      XComponent(this.xComponentAttrs)
-        .focusable(true)
-        .onLoad((xComponentContext) => {
-          this.xComponentContext = xComponentContext as ServoXComponentInterface;
-          let resource_dir: string = this.context.resourceDir;
-          let cache_dir: string = this.context.cacheDir;
-          console.debug("resourceDir: ", resource_dir);
-          console.debug("cacheDir: ", cache_dir);
-          let init_options: InitOpts = {
-            url: this.urlToLoad,
-            deviceType: get_device_type(),
-            osFullName: deviceInfo.osFullName,
-            displayDensity: get_density(),
-            resourceDir: resource_dir,
-            cacheDir: cache_dir,
-            commandlineArgs: this.CommandlineArgs
-          }
-          this.xComponentContext.initServo(init_options)
-          this.xComponentContext.registerURLcallback((new_url) => {
-            console.info('New URL from native: ', new_url)
-            this.urlToLoad = new_url
-          })
-          this.xComponentContext.registerPromptToastCallback(prompt_toast)
+
+      Tabs({ barPosition: BarPosition.Start, index: this.currentIndex}) {
+        ForEach(this.tablist, (item: number, index: number) => {
+          TabContent() {
+            XComponent(this.xComponentAttrs)
+              .focusable(true)
+          }.tabBar(this.tabBuilder(String(item), index))
         })
+      }.barHeight(40)
+      .scrollable(false)
+      .onChange((index: number) => {
+        this.currentIndex = index;
+        servoshell.focusWebview(index, this.tablist);
+      })
+      .backgroundColor('#e1e1e1')
     }
     .width('100%')
   }

@@ -4,24 +4,37 @@
 
 use std::{panic, process};
 
-use crate::sampler::{Address, NativeStack, Registers, Sampler};
+use crate::sampler::{NativeStack, Sampler};
 
 type MonitoredThreadId = mach2::mach_types::thread_act_t;
+
+// Several types in this file are currently not used in a Linux or Windows build.
+type Address = *const u8;
+
+/// The registers used for stack unwinding
+struct Registers {
+    /// Instruction pointer.
+    pub instruction_ptr: Address,
+    /// Stack pointer.
+    pub stack_ptr: Address,
+    /// Frame pointer.
+    pub frame_ptr: Address,
+}
 
 pub struct MacOsSampler {
     thread_id: MonitoredThreadId,
 }
 
-impl MacOsSampler {
-    #[allow(unsafe_code)]
-    pub fn new_boxed() -> Box<dyn Sampler> {
+impl Default for MacOsSampler {
+    #[expect(unsafe_code)]
+    fn default() -> Self {
         let thread_id = unsafe { mach2::mach_init::mach_thread_self() };
-        Box::new(MacOsSampler { thread_id })
+        Self { thread_id }
     }
 }
 
 impl Sampler for MacOsSampler {
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn suspend_and_sample_thread(&self) -> Result<NativeStack, ()> {
         // Warning: The "critical section" begins here.
         // In the critical section:
@@ -60,12 +73,12 @@ fn check_kern_return(kret: mach2::kern_return::kern_return_t) -> Result<(), ()> 
     Ok(())
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 unsafe fn suspend_thread(thread_id: MonitoredThreadId) -> Result<(), ()> {
     check_kern_return(unsafe { mach2::thread_act::thread_suspend(thread_id) })
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 unsafe fn get_registers(thread_id: MonitoredThreadId) -> Result<Registers, ()> {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
@@ -106,17 +119,17 @@ unsafe fn get_registers(thread_id: MonitoredThreadId) -> Result<Registers, ()> {
         })
     }
 }
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 unsafe fn resume_thread(thread_id: MonitoredThreadId) -> Result<(), ()> {
     check_kern_return(unsafe { mach2::thread_act::thread_resume(thread_id) })
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 unsafe fn frame_pointer_stack_walk(regs: Registers) -> NativeStack {
     // Note: this function will only work with code build with:
     // --dev,
     // or --with-frame-pointer.
-    let mut native_stack = NativeStack::new();
+    let mut native_stack = NativeStack::default();
     unsafe {
         let pthread_t = libc::pthread_self();
         let stackaddr = libc::pthread_get_stackaddr_np(pthread_t);

@@ -114,6 +114,12 @@ fn test_cmdline_and_location_bar_url() {
         "data:text/html,a",
     );
     test_url(
+        "servo:config",
+        "servo:config",
+        "servo:config",
+        "servo:config",
+    );
+    test_url(
         "README.md",
         "https://readme.md/",
         "file:///fake/cwd/README.md",
@@ -155,6 +161,12 @@ fn test_cmdline_and_location_bar_url() {
         "file:///fake/cwd/dragonfruit",
         "https://duckduckgo.com/html/?q=dragonfruit",
     );
+    test_url(
+        "localhost:8000",
+        "http://localhost:8000/",
+        "http://localhost:8000/",
+        "http://localhost:8000/",
+    )
 }
 
 #[test]
@@ -165,6 +177,12 @@ fn test_cmdline_and_location_bar_url() {
         "data:text/html,a",
         "data:text/html,a",
         "data:text/html,a",
+    );
+    test_url(
+        "servo:config",
+        "servo:config",
+        "servo:config",
+        "servo:config",
     );
     test_url(
         "README.md",
@@ -208,6 +226,12 @@ fn test_cmdline_and_location_bar_url() {
         "file:///C:/fake/cwd/dragonfruit",
         "https://duckduckgo.com/html/?q=dragonfruit",
     );
+    test_url(
+        "localhost:8000",
+        "http://localhost:8000/",
+        "http://localhost:8000/",
+        "http://localhost:8000/",
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -222,17 +246,25 @@ fn test_cmd_and_location_bar_url() {
 }
 
 /// Like [test_url] but will produce test for Windows or non Windows using `#[cfg(target_os)]` internally.
+#[cfg(not(target_os = "windows"))]
 fn test_url_any_os(
     input: &str,
     location: &str,
-    #[allow(unused)] if_exists: &str,
-    #[allow(unused)] if_exists_windows: &str,
+    if_exists: &str,
+    _if_exists_windows: &str,
     otherwise: &str,
 ) {
-    #[cfg(not(target_os = "windows"))]
     test_url(input, location, if_exists, otherwise);
+}
 
-    #[cfg(target_os = "windows")]
+#[cfg(target_os = "windows")]
+fn test_url_any_os(
+    input: &str,
+    location: &str,
+    _if_exists: &str,
+    if_exists_windows: &str,
+    otherwise: &str,
+) {
     test_url(input, location, if_exists_windows, otherwise);
 }
 

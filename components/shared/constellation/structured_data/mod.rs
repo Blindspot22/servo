@@ -8,13 +8,15 @@
 mod serializable;
 mod transferable;
 
-use std::collections::HashMap;
-
-use base::id::{BlobId, DomExceptionId, DomPointId, MessagePortId};
 use log::warn;
 use malloc_size_of_derive::MallocSizeOf;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use serde::{Deserialize, Serialize};
 pub use serializable::*;
+use servo_base::id::{
+    BlobId, CryptoKeyId, DomExceptionId, DomMatrixId, DomPointId, DomQuadId, DomRectId, FileId,
+    FileListId, ImageBitmapId, ImageDataId, MessagePortId, OffscreenCanvasId, QuotaExceededErrorId,
+};
 use strum::IntoEnumIterator;
 pub use transferable::*;
 
@@ -25,24 +27,52 @@ pub struct StructuredSerializedData {
     /// Data serialized by SpiderMonkey.
     pub serialized: Vec<u8>,
     /// Serialized in a structured callback,
-    pub blobs: Option<HashMap<BlobId, BlobImpl>>,
+    pub blobs: Option<FxHashMap<BlobId, BlobImpl>>,
+    /// Serialized files.
+    pub files: Option<FxHashMap<FileId, SerializableFile>>,
+    /// Serialized file lists.
+    pub file_lists: Option<FxHashMap<FileListId, SerializableFileList>>,
     /// Serialized point objects.
-    pub points: Option<HashMap<DomPointId, DomPoint>>,
+    pub points: Option<FxHashMap<DomPointId, DomPoint>>,
+    /// Serialized rect objects.
+    pub rects: Option<FxHashMap<DomRectId, DomRect>>,
+    /// Serialized quad objects.
+    pub quads: Option<FxHashMap<DomQuadId, DomQuad>>,
+    /// Serialized matrix objects.
+    pub matrices: Option<FxHashMap<DomMatrixId, DomMatrix>>,
     /// Serialized exception objects.
-    pub exceptions: Option<HashMap<DomExceptionId, DomException>>,
+    pub exceptions: Option<FxHashMap<DomExceptionId, DomException>>,
+    /// Serialized quota exceeded errors.
+    pub quota_exceeded_errors:
+        Option<FxHashMap<QuotaExceededErrorId, SerializableQuotaExceededError>>,
     /// Transferred objects.
-    pub ports: Option<HashMap<MessagePortId, MessagePortImpl>>,
+    pub ports: Option<FxHashMap<MessagePortId, MessagePortImpl>>,
+    /// Transform streams transferred objects.
+    pub transform_streams: Option<FxHashMap<MessagePortId, TransformStreamData>>,
+    /// Serialized image bitmap objects.
+    pub image_bitmaps: Option<FxHashMap<ImageBitmapId, SerializableImageBitmap>>,
+    /// Transferred image bitmap objects.
+    pub transferred_image_bitmaps: Option<FxHashMap<ImageBitmapId, SerializableImageBitmap>>,
+    /// Transferred offscreen canvas objects.
+    pub offscreen_canvases: Option<FxHashMap<OffscreenCanvasId, TransferableOffscreenCanvas>>,
+    /// Serialized image data objects.
+    pub image_data: Option<FxHashMap<ImageDataId, SerializableImageData>>,
+    /// Serialized crypto key objects.
+    pub crypto_keys: Option<FxHashMap<CryptoKeyId, SerializableCryptoKey>>,
 }
 
 impl StructuredSerializedData {
     fn is_empty(&self, val: Transferrable) -> bool {
-        fn is_field_empty<K, V>(field: &Option<HashMap<K, V>>) -> bool {
-            field.as_ref().is_some_and(|h| h.is_empty())
+        fn is_field_empty<K, V>(field: &Option<FxHashMap<K, V>>) -> bool {
+            field.as_ref().is_none_or(|h| h.is_empty())
         }
         match val {
+            Transferrable::ImageBitmap => is_field_empty(&self.transferred_image_bitmaps),
             Transferrable::MessagePort => is_field_empty(&self.ports),
+            Transferrable::OffscreenCanvas => is_field_empty(&self.offscreen_canvases),
             Transferrable::ReadableStream => is_field_empty(&self.ports),
             Transferrable::WritableStream => is_field_empty(&self.ports),
+            Transferrable::TransformStream => is_field_empty(&self.ports),
         }
     }
 
@@ -51,7 +81,7 @@ impl StructuredSerializedData {
     fn clone_all_of_type<T: BroadcastClone>(&self, cloned: &mut StructuredSerializedData) {
         let existing = T::source(self);
         let Some(existing) = existing else { return };
-        let mut clones = HashMap::with_capacity(existing.len());
+        let mut clones = FxHashMap::with_capacity_and_hasher(existing.len(), FxBuildHasher);
 
         for (original_id, obj) in existing.iter() {
             if let Some(clone) = obj.clone_for_broadcast() {

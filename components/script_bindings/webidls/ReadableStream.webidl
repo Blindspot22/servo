@@ -4,7 +4,7 @@
 
 // https://streams.spec.whatwg.org/#readablestream
 
-[Exposed=*] // [Transferable] - See Bug 1562065
+[Exposed=*, Transferable]
 interface _ReadableStream {
   [Throws]
   constructor(optional object underlyingSource, optional QueuingStrategy strategy = {});
@@ -20,8 +20,8 @@ interface _ReadableStream {
   [Throws]
   ReadableStreamReader getReader(optional ReadableStreamGetReaderOptions options = {});
 
-  // [Throws]
-  // ReadableStream pipeThrough(ReadableWritablePair transform, optional StreamPipeOptions options = {});
+  [Throws]
+  ReadableStream pipeThrough(ReadableWritablePair transform, optional StreamPipeOptions options = {});
 
   [NewObject]
   Promise<undefined> pipeTo(WritableStream destination, optional StreamPipeOptions options = {});
@@ -56,5 +56,5 @@ dictionary StreamPipeOptions {
   boolean preventClose = false;
   boolean preventAbort = false;
   boolean preventCancel = false;
-  // AbortSignal signal;
+  AbortSignal signal;
 };

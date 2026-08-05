@@ -24,18 +24,21 @@ TEST_CMD = [
     "--log-raw=-",
     # We run the content-security-policy test because it creates
     # cross-origin iframes, which are good for stress-testing pipelines
-    "content-security-policy"
+    "content-security-policy",
 ]
 
 # Note that there will probably be test failures caused
 # by random pipeline closure, so we ignore the status code
 # returned by the test command (which is why we can't use check_output).
 
-test_results = Popen(TEST_CMD, stdout=PIPE)
+test_results = Popen(TEST_CMD, stdout=PIPE, text=True)
 any_crashes = False
 
+if test_results.stdout is None:
+    sys.exit(1)
+
 for line in test_results.stdout:
-    report = json.loads(line.decode('utf-8'))
+    report = json.loads(line)
     if report.get("action") == "process_output":
         print("{} - {}".format(report.get("thread"), report.get("data")))
     status = report.get("status")

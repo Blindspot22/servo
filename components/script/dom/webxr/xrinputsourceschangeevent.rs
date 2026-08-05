@@ -3,9 +3,11 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use js::jsapi::Heap;
 use js::jsval::JSVal;
 use js::rust::{HandleObject, MutableHandleValue};
+use script_bindings::reflector::reflect_dom_object_with_proto;
 use stylo_atoms::Atom;
 
 use crate::dom::bindings::codegen::Bindings::EventBinding::Event_Binding::EventMethods;
@@ -13,17 +15,14 @@ use crate::dom::bindings::codegen::Bindings::XRInputSourcesChangeEventBinding::{
     self, XRInputSourcesChangeEventMethods,
 };
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::reflect_dom_object_with_proto;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::utils::to_frozen_array;
 use crate::dom::event::Event;
-use crate::dom::globalscope::GlobalScope;
 use crate::dom::window::Window;
 use crate::dom::xrinputsource::XRInputSource;
 use crate::dom::xrsession::XRSession;
-use crate::realms::enter_realm;
-use crate::script_runtime::{CanGc, JSContext};
+use crate::realms::enter_auto_realm;
 
 #[dom_struct]
 pub(crate) struct XRInputSourcesChangeEvent {
@@ -36,7 +35,6 @@ pub(crate) struct XRInputSourcesChangeEvent {
 }
 
 impl XRInputSourcesChangeEvent {
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn new_inherited(session: &XRSession) -> XRInputSourcesChangeEvent {
         XRInputSourcesChangeEvent {
             event: Event::new_inherited(),
@@ -46,8 +44,9 @@ impl XRInputSourcesChangeEvent {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
+        cx: &mut JSContext,
         window: &Window,
         type_: Atom,
         bubbles: bool,
@@ -55,16 +54,15 @@ impl XRInputSourcesChangeEvent {
         session: &XRSession,
         added: &[DomRoot<XRInputSource>],
         removed: &[DomRoot<XRInputSource>],
-        can_gc: CanGc,
     ) -> DomRoot<XRInputSourcesChangeEvent> {
         Self::new_with_proto(
-            window, None, type_, bubbles, cancelable, session, added, removed, can_gc,
+            cx, window, None, type_, bubbles, cancelable, session, added, removed,
         )
     }
 
-    #[allow(unsafe_code)]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn new_with_proto(
+        cx: &mut JSContext,
         window: &Window,
         proto: Option<HandleObject>,
         type_: Atom,
@@ -73,39 +71,39 @@ impl XRInputSourcesChangeEvent {
         session: &XRSession,
         added: &[DomRoot<XRInputSource>],
         removed: &[DomRoot<XRInputSource>],
-        can_gc: CanGc,
     ) -> DomRoot<XRInputSourcesChangeEvent> {
         let changeevent = reflect_dom_object_with_proto(
+            cx,
             Box::new(XRInputSourcesChangeEvent::new_inherited(session)),
             window,
             proto,
-            can_gc,
         );
         {
             let event = changeevent.upcast::<Event>();
             event.init_event(type_, bubbles, cancelable);
         }
-        let _ac = enter_realm(window);
-        let cx = GlobalScope::get_cx();
-        rooted!(in(*cx) let mut frozen_val: JSVal);
-        to_frozen_array(added, cx, frozen_val.handle_mut(), can_gc);
+        let mut realm = enter_auto_realm(cx, window);
+        let cx = &mut realm.current_realm();
+        rooted!(&in(cx) let mut frozen_val: JSVal);
+        to_frozen_array(cx, added, frozen_val.handle_mut());
         changeevent.added.set(*frozen_val);
-        to_frozen_array(removed, cx, frozen_val.handle_mut(), can_gc);
+        to_frozen_array(cx, removed, frozen_val.handle_mut());
         changeevent.removed.set(*frozen_val);
         changeevent
     }
 }
 
 impl XRInputSourcesChangeEventMethods<crate::DomTypeHolder> for XRInputSourcesChangeEvent {
-    // https://immersive-web.github.io/webxr/#dom-xrinputsourceschangeevent-xrinputsourceschangeevent
+    /// <https://immersive-web.github.io/webxr/#dom-xrinputsourceschangeevent-xrinputsourceschangeevent>
     fn Constructor(
+        cx: &mut JSContext,
         window: &Window,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
         type_: DOMString,
         init: &XRInputSourcesChangeEventBinding::XRInputSourcesChangeEventInit,
     ) -> DomRoot<XRInputSourcesChangeEvent> {
         XRInputSourcesChangeEvent::new_with_proto(
+            cx,
             window,
             proto,
             Atom::from(type_),
@@ -114,26 +112,25 @@ impl XRInputSourcesChangeEventMethods<crate::DomTypeHolder> for XRInputSourcesCh
             &init.session,
             &init.added,
             &init.removed,
-            can_gc,
         )
     }
 
-    // https://immersive-web.github.io/webxr/#dom-xrinputsourceschangeevent-session
+    /// <https://immersive-web.github.io/webxr/#dom-xrinputsourceschangeevent-session>
     fn Session(&self) -> DomRoot<XRSession> {
         DomRoot::from_ref(&*self.session)
     }
 
-    // https://immersive-web.github.io/webxr/#dom-xrinputsourceschangeevent-added
-    fn Added(&self, _cx: JSContext, mut retval: MutableHandleValue) {
+    /// <https://immersive-web.github.io/webxr/#dom-xrinputsourceschangeevent-added>
+    fn Added(&self, mut retval: MutableHandleValue) {
         retval.set(self.added.get())
     }
 
-    // https://immersive-web.github.io/webxr/#dom-xrinputsourceschangeevent-removed
-    fn Removed(&self, _cx: JSContext, mut retval: MutableHandleValue) {
+    /// <https://immersive-web.github.io/webxr/#dom-xrinputsourceschangeevent-removed>
+    fn Removed(&self, mut retval: MutableHandleValue) {
         retval.set(self.removed.get())
     }
 
-    // https://dom.spec.whatwg.org/#dom-event-istrusted
+    /// <https://dom.spec.whatwg.org/#dom-event-istrusted>
     fn IsTrusted(&self) -> bool {
         self.event.IsTrusted()
     }

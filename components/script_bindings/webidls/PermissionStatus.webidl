@@ -26,6 +26,8 @@ enum PermissionName {
   "background-sync",
   "bluetooth",
   "persistent-storage",
+  "screen-wake-lock",
+  "gamepad",
 };
 
 [Pref="dom_permissions_enabled", Exposed=(Window,Worker)]

@@ -4,17 +4,19 @@
 
 use std::borrow::ToOwned;
 use std::cell::Cell;
-use std::ptr;
+use std::ptr::{self, NonNull};
+use std::rc::Rc;
 
-use constellation_traits::BlobImpl;
-use content_security_policy::Violation;
 use dom_struct::dom_struct;
-use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
 use ipc_channel::router::ROUTER;
-use js::jsapi::{JSAutoRealm, JSObject};
+use js::context::JSContext;
+use js::conversions::ToJSValConvertible;
+use js::jsapi::JSObject;
 use js::jsval::UndefinedValue;
+use js::realm::AutoRealm;
 use js::rust::{CustomAutoRooterGuard, HandleObject};
 use js::typedarray::{ArrayBuffer, ArrayBufferView, CreateWith};
+use net_traits::blob_url_store::UrlWithBlobClaim;
 use net_traits::request::{
     CacheMode, CredentialsMode, RedirectMode, Referrer, RequestBuilder, RequestMode,
     ServiceWorkersMode,
@@ -23,26 +25,31 @@ use net_traits::{
     CoreResourceMsg, FetchChannels, MessageData, WebSocketDomAction, WebSocketNetworkEvent,
 };
 use profile_traits::ipc as ProfiledIpc;
+use script_bindings::cell::DomRefCell;
+use script_bindings::reflector::{DomObject, reflect_weak_referenceable_dom_object_with_proto};
+use servo_base::generic_channel::{LazyCallback, lazy_callback};
+use servo_constellation_traits::BlobImpl;
 use servo_url::{ImmutableOrigin, ServoUrl};
 
-use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::BlobBinding::BlobMethods;
 use crate::dom::bindings::codegen::Bindings::WebSocketBinding::{BinaryType, WebSocketMethods};
+use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::codegen::UnionTypes::StringOrStringSequence;
-use crate::dom::bindings::conversions::ToJSValConvertible;
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
-use crate::dom::bindings::reflector::{DomGlobal, DomObject, reflect_dom_object_with_proto};
+use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::{DOMString, USVString, is_token};
 use crate::dom::blob::Blob;
 use crate::dom::closeevent::CloseEvent;
+use crate::dom::csp::{GlobalCspReporting, Violation};
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::messageevent::MessageEvent;
-use crate::script_runtime::CanGc;
+use crate::dom::window::Window;
+use crate::fetch::RequestWithGlobalScope;
 use crate::task::TaskOnce;
 use crate::task_source::SendableTaskSource;
 
@@ -56,7 +63,7 @@ enum WebSocketRequestState {
 
 // Close codes defined in https://tools.ietf.org/html/rfc6455#section-7.4.1
 // Names are from https://github.com/mozilla/gecko-dev/blob/master/netwerk/protocol/websocket/nsIWebSocketChannel.idl
-#[allow(dead_code)]
+#[expect(dead_code)]
 mod close_code {
     pub(crate) const NORMAL: u16 = 1000;
     pub(crate) const GOING_AWAY: u16 = 1001;
@@ -102,48 +109,51 @@ pub(crate) struct WebSocket {
     url: ServoUrl,
     ready_state: Cell<WebSocketRequestState>,
     buffered_amount: Cell<u64>,
-    clearing_buffer: Cell<bool>, //Flag to tell if there is a running thread to clear buffered_amount
-    #[ignore_malloc_size_of = "Defined in std"]
+    clearing_buffer: Cell<bool>, // Flag to tell if there is a running thread to clear buffered_amount
     #[no_trace]
-    sender: IpcSender<WebSocketDomAction>,
+    callback: LazyCallback<WebSocketDomAction>,
     binary_type: Cell<BinaryType>,
-    protocol: DomRefCell<String>, //Subprotocol selected by server
+    protocol: DomRefCell<String>, // Subprotocol selected by server
 }
 
 impl WebSocket {
-    fn new_inherited(url: ServoUrl, sender: IpcSender<WebSocketDomAction>) -> WebSocket {
+    fn new_inherited(url: ServoUrl, callback: LazyCallback<WebSocketDomAction>) -> WebSocket {
         WebSocket {
             eventtarget: EventTarget::new_inherited(),
             url,
             ready_state: Cell::new(WebSocketRequestState::Connecting),
             buffered_amount: Cell::new(0),
             clearing_buffer: Cell::new(false),
-            sender,
+            callback,
             binary_type: Cell::new(BinaryType::Blob),
             protocol: DomRefCell::new("".to_owned()),
         }
     }
 
     fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
         url: ServoUrl,
-        sender: IpcSender<WebSocketDomAction>,
-        can_gc: CanGc,
+        sender: LazyCallback<WebSocketDomAction>,
     ) -> DomRoot<WebSocket> {
-        reflect_dom_object_with_proto(
-            Box::new(WebSocket::new_inherited(url, sender)),
+        let websocket = reflect_weak_referenceable_dom_object_with_proto(
+            cx,
+            Rc::new(WebSocket::new_inherited(url, sender)),
             global,
             proto,
-            can_gc,
-        )
+        );
+        if let Some(window) = global.downcast::<Window>() {
+            window.Document().track_websocket(&websocket);
+        }
+        websocket
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-websocket-send
+    /// <https://html.spec.whatwg.org/multipage/#dom-websocket-send>
     fn send_impl(&self, data_byte_len: u64) -> Fallible<bool> {
         let return_after_buffer = match self.ready_state.get() {
             WebSocketRequestState::Connecting => {
-                return Err(Error::InvalidState);
+                return Err(Error::InvalidState(None));
             },
             WebSocketRequestState::Open => false,
             WebSocketRequestState::Closing | WebSocketRequestState::Closed => true,
@@ -176,21 +186,31 @@ impl WebSocket {
     pub(crate) fn origin(&self) -> ImmutableOrigin {
         self.url.origin()
     }
+
+    /// <https://websockets.spec.whatwg.org/#make-disappear>
+    /// Returns true if any action was taken.
+    pub(crate) fn make_disappear(&self) -> bool {
+        let result = self.ready_state.get() != WebSocketRequestState::Closed;
+        let _ = self.Close(Some(1001), None);
+        result
+    }
 }
 
 impl WebSocketMethods<crate::DomTypeHolder> for WebSocket {
     /// <https://html.spec.whatwg.org/multipage/#dom-websocket>
     fn Constructor(
+        cx: &mut JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
         url: DOMString,
         protocols: Option<StringOrStringSequence>,
     ) -> Fallible<DomRoot<WebSocket>> {
         // Step 1. Let baseURL be this's relevant settings object's API base URL.
+        let base_url = global.api_base_url();
         // Step 2. Let urlRecord be the result of applying the URL parser to url with baseURL.
         // Step 3. If urlRecord is failure, then throw a "SyntaxError" DOMException.
-        let mut url_record = ServoUrl::parse(&url).or(Err(Error::Syntax))?;
+        let mut url_record =
+            ServoUrl::parse_with_base(Some(&base_url), &url.str()).or(Err(Error::Syntax(None)))?;
 
         // Step 4. If urlRecord’s scheme is "http", then set urlRecord’s scheme to "ws".
         // Step 5. Otherwise, if urlRecord’s scheme is "https", set urlRecord’s scheme to "wss".
@@ -209,12 +229,12 @@ impl WebSocketMethods<crate::DomTypeHolder> for WebSocket {
                     .expect("Can't set scheme from https to wss");
             },
             "ws" | "wss" => {},
-            _ => return Err(Error::Syntax),
+            _ => return Err(Error::Syntax(None)),
         }
 
         // Step 7. If urlRecord’s fragment is non-null, then throw a "SyntaxError" DOMException.
         if url_record.fragment().is_some() {
-            return Err(Error::Syntax);
+            return Err(Error::Syntax(None));
         }
 
         // Step 8. If protocols is a string, set protocols to a sequence consisting of just that string.
@@ -236,39 +256,43 @@ impl WebSocketMethods<crate::DomTypeHolder> for WebSocket {
                 .iter()
                 .any(|p| p.eq_ignore_ascii_case(protocol))
             {
-                return Err(Error::Syntax);
+                return Err(Error::Syntax(None));
             }
 
             // https://tools.ietf.org/html/rfc6455#section-4.1
             if !is_token(protocol.as_bytes()) {
-                return Err(Error::Syntax);
+                return Err(Error::Syntax(None));
             }
         }
 
         // Create the interface for communication with the resource thread
-        let (dom_action_sender, resource_action_receiver): (
-            IpcSender<WebSocketDomAction>,
-            IpcReceiver<WebSocketDomAction>,
-        ) = ipc::channel().unwrap();
-        let (resource_event_sender, dom_event_receiver): (
-            IpcSender<WebSocketNetworkEvent>,
-            ProfiledIpc::IpcReceiver<WebSocketNetworkEvent>,
-        ) = ProfiledIpc::channel(global.time_profiler_chan().clone()).unwrap();
+        let (dom_action_sender, resource_action_receiver) = lazy_callback();
+        let (resource_event_sender, dom_event_receiver) =
+            ProfiledIpc::channel(global.time_profiler_chan().clone()).unwrap();
 
         // Step 12. Establish a WebSocket connection given urlRecord, protocols, and client.
-        let ws = WebSocket::new(global, proto, url_record.clone(), dom_action_sender, can_gc);
+        let ws = WebSocket::new(cx, global, proto, url_record.clone(), dom_action_sender);
         let address = Trusted::new(&*ws);
 
-        let request = RequestBuilder::new(global.webview_id(), url_record, Referrer::NoReferrer)
-            .origin(global.origin().immutable().clone())
-            .insecure_requests_policy(global.insecure_requests_policy())
-            .has_trustworthy_ancestor_origin(global.has_trustworthy_ancestor_or_current_origin())
-            .mode(RequestMode::WebSocket { protocols })
-            .service_workers_mode(ServiceWorkersMode::None)
-            .credentials_mode(CredentialsMode::Include)
-            .cache_mode(CacheMode::NoCache)
-            .policy_container(global.policy_container())
-            .redirect_mode(RedirectMode::Error);
+        // https://websockets.spec.whatwg.org/#concept-websocket-establish
+        //
+        // Let request be a new request, whose URL is requestURL, client is client, service-workers
+        // mode is "none", referrer is "no-referrer", mode is "websocket", credentials mode is
+        // "include", cache mode is "no-store" , and redirect mode is "error"
+        let request = RequestBuilder::new(
+            global.webview_id(),
+            UrlWithBlobClaim::from_url_without_having_claimed_blob(url_record.clone()),
+            Referrer::NoReferrer,
+        )
+        .with_global_scope(global)
+        .mode(RequestMode::WebSocket {
+            protocols,
+            original_url: url_record,
+        })
+        .service_workers_mode(ServiceWorkersMode::None)
+        .credentials_mode(CredentialsMode::Include)
+        .cache_mode(CacheMode::NoCache)
+        .redirect_mode(RedirectMode::Error);
 
         let channels = FetchChannels::WebSocket {
             event_sender: resource_event_sender,
@@ -327,51 +351,51 @@ impl WebSocketMethods<crate::DomTypeHolder> for WebSocket {
     // https://html.spec.whatwg.org/multipage/#handler-websocket-onmessage
     event_handler!(message, GetOnmessage, SetOnmessage);
 
-    // https://html.spec.whatwg.org/multipage/#dom-websocket-url
+    /// <https://html.spec.whatwg.org/multipage/#dom-websocket-url>
     fn Url(&self) -> DOMString {
         DOMString::from(self.url.as_str())
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-websocket-readystate
+    /// <https://html.spec.whatwg.org/multipage/#dom-websocket-readystate>
     fn ReadyState(&self) -> u16 {
         self.ready_state.get() as u16
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-websocket-bufferedamount
+    /// <https://html.spec.whatwg.org/multipage/#dom-websocket-bufferedamount>
     fn BufferedAmount(&self) -> u64 {
         self.buffered_amount.get()
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-websocket-binarytype
+    /// <https://html.spec.whatwg.org/multipage/#dom-websocket-binarytype>
     fn BinaryType(&self) -> BinaryType {
         self.binary_type.get()
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-websocket-binarytype
+    /// <https://html.spec.whatwg.org/multipage/#dom-websocket-binarytype>
     fn SetBinaryType(&self, btype: BinaryType) {
         self.binary_type.set(btype)
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-websocket-protocol
+    /// <https://html.spec.whatwg.org/multipage/#dom-websocket-protocol>
     fn Protocol(&self) -> DOMString {
         DOMString::from(self.protocol.borrow().clone())
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-websocket-send
+    /// <https://html.spec.whatwg.org/multipage/#dom-websocket-send>
     fn Send(&self, data: USVString) -> ErrorResult {
         let data_byte_len = data.0.len() as u64;
         let send_data = self.send_impl(data_byte_len)?;
 
         if send_data {
             let _ = self
-                .sender
+                .callback
                 .send(WebSocketDomAction::SendMessage(MessageData::Text(data.0)));
         }
 
         Ok(())
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-websocket-send
+    /// <https://html.spec.whatwg.org/multipage/#dom-websocket-send>
     fn Send_(&self, blob: &Blob) -> ErrorResult {
         /* As per https://html.spec.whatwg.org/multipage/#websocket
            the buffered amount needs to be clamped to u32, even though Blob.Size() is u64
@@ -383,60 +407,60 @@ impl WebSocketMethods<crate::DomTypeHolder> for WebSocket {
         if send_data {
             let bytes = blob.get_bytes().unwrap_or_default();
             let _ = self
-                .sender
+                .callback
                 .send(WebSocketDomAction::SendMessage(MessageData::Binary(bytes)));
         }
 
         Ok(())
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-websocket-send
+    /// <https://html.spec.whatwg.org/multipage/#dom-websocket-send>
     fn Send__(&self, array: CustomAutoRooterGuard<ArrayBuffer>) -> ErrorResult {
-        let bytes = array.to_vec();
+        let bytes = array.to_vec().unwrap_or_default();
         let data_byte_len = bytes.len();
         let send_data = self.send_impl(data_byte_len as u64)?;
 
         if send_data {
             let _ = self
-                .sender
+                .callback
                 .send(WebSocketDomAction::SendMessage(MessageData::Binary(bytes)));
         }
         Ok(())
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-websocket-send
+    /// <https://html.spec.whatwg.org/multipage/#dom-websocket-send>
     fn Send___(&self, array: CustomAutoRooterGuard<ArrayBufferView>) -> ErrorResult {
-        let bytes = array.to_vec();
+        let bytes = array.to_vec().unwrap_or_default();
         let data_byte_len = bytes.len();
         let send_data = self.send_impl(data_byte_len as u64)?;
 
         if send_data {
             let _ = self
-                .sender
+                .callback
                 .send(WebSocketDomAction::SendMessage(MessageData::Binary(bytes)));
         }
         Ok(())
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-websocket-close
+    /// <https://html.spec.whatwg.org/multipage/#dom-websocket-close>
     fn Close(&self, code: Option<u16>, reason: Option<USVString>) -> ErrorResult {
         if let Some(code) = code {
-            //Fail if the supplied code isn't normal and isn't reserved for libraries, frameworks, and applications
+            // Fail if the supplied code isn't normal and isn't reserved for libraries, frameworks, and applications
             if code != close_code::NORMAL && !(3000..=4999).contains(&code) {
-                return Err(Error::InvalidAccess);
+                return Err(Error::InvalidAccess(None));
             }
         }
-        if let Some(ref reason) = reason {
-            if reason.0.len() > 123 {
-                //reason cannot be larger than 123 bytes
-                return Err(Error::Syntax);
-            }
+        if let Some(ref reason) = reason &&
+            reason.0.len() > 123
+        {
+            // reason cannot be larger than 123 bytes
+            return Err(Error::Syntax(Some("Reason too long".to_string())));
         }
 
         match self.ready_state.get() {
-            WebSocketRequestState::Closing | WebSocketRequestState::Closed => {}, //Do nothing
+            WebSocketRequestState::Closing | WebSocketRequestState::Closed => {}, // Do nothing
             WebSocketRequestState::Connecting => {
-                //Connection is not yet established
+                // Connection is not yet established
                 /*By setting the state to closing, the open function
                 will abort connecting the websocket*/
                 self.ready_state.set(WebSocketRequestState::Closing);
@@ -456,10 +480,10 @@ impl WebSocketMethods<crate::DomTypeHolder> for WebSocket {
                 // Kick off _Start the WebSocket Closing Handshake_
                 // https://tools.ietf.org/html/rfc6455#section-7.1.2
                 let reason = reason.map(|reason| reason.0);
-                let _ = self.sender.send(WebSocketDomAction::Close(code, reason));
+                let _ = self.callback.send(WebSocketDomAction::Close(code, reason));
             },
         }
-        Ok(()) //Return Ok
+        Ok(()) // Return Ok
     }
 }
 
@@ -469,9 +493,9 @@ struct ReportCSPViolationTask {
 }
 
 impl TaskOnce for ReportCSPViolationTask {
-    fn run_once(self) {
+    fn run_once(self, cx: &mut JSContext) {
         let global = self.websocket.root().global();
-        global.report_csp_violations(self.violations);
+        global.report_csp_violations(cx, self.violations, None, None);
     }
 }
 
@@ -484,7 +508,7 @@ struct ConnectionEstablishedTask {
 
 impl TaskOnce for ConnectionEstablishedTask {
     /// <https://html.spec.whatwg.org/multipage/#feedback-from-the-protocol:concept-websocket-established>
-    fn run_once(self) {
+    fn run_once(self, cx: &mut JSContext) {
         let ws = self.address.root();
 
         // Step 1.
@@ -499,7 +523,7 @@ impl TaskOnce for ConnectionEstablishedTask {
         };
 
         // Step 4.
-        ws.upcast().fire_event(atom!("open"), CanGc::note());
+        ws.upcast().fire_event(cx, atom!("open"));
     }
 }
 
@@ -513,7 +537,7 @@ impl TaskOnce for BufferedAmountTask {
     // To be compliant with standards, we need to reset bufferedAmount only when the event loop
     // reaches step 1.  In our implementation, the bytes will already have been sent on a background
     // thread.
-    fn run_once(self) {
+    fn run_once(self, _cx: &mut JSContext) {
         let ws = self.address.root();
 
         ws.buffered_amount.set(0);
@@ -529,7 +553,7 @@ struct CloseTask {
 }
 
 impl TaskOnce for CloseTask {
-    fn run_once(self) {
+    fn run_once(self, cx: &mut JSContext) {
         let ws = self.address.root();
 
         if ws.ready_state.get() == WebSocketRequestState::Closed {
@@ -545,7 +569,7 @@ impl TaskOnce for CloseTask {
 
         // Step 2.
         if self.failed {
-            ws.upcast().fire_event(atom!("error"), CanGc::note());
+            ws.upcast().fire_event(cx, atom!("error"));
         }
 
         // Step 3.
@@ -553,6 +577,7 @@ impl TaskOnce for CloseTask {
         let code = self.code.unwrap_or(close_code::NO_STATUS);
         let reason = DOMString::from(self.reason.unwrap_or("".to_owned()));
         let close_event = CloseEvent::new(
+            cx,
             &ws.global(),
             atom!("close"),
             EventBubbles::DoesNotBubble,
@@ -560,11 +585,8 @@ impl TaskOnce for CloseTask {
             clean_close,
             code,
             reason,
-            CanGc::note(),
         );
-        close_event
-            .upcast::<Event>()
-            .fire(ws.upcast(), CanGc::note());
+        close_event.upcast::<Event>().fire(cx, ws.upcast());
     }
 }
 
@@ -574,8 +596,8 @@ struct MessageReceivedTask {
 }
 
 impl TaskOnce for MessageReceivedTask {
-    #[allow(unsafe_code)]
-    fn run_once(self) {
+    #[expect(unsafe_code)]
+    fn run_once(self, cx: &mut JSContext) {
         let ws = self.address.root();
         debug!(
             "MessageReceivedTask::handler({:p}): readyState={:?}",
@@ -590,46 +612,45 @@ impl TaskOnce for MessageReceivedTask {
 
         // Step 2-5.
         let global = ws.global();
-        // GlobalScope::get_cx() returns a valid `JSContext` pointer, so this is safe.
-        unsafe {
-            let cx = GlobalScope::get_cx();
-            let _ac = JSAutoRealm::new(*cx, ws.reflector().get_jsobject().get());
-            rooted!(in(*cx) let mut message = UndefinedValue());
-            match self.message {
-                MessageData::Text(text) => text.to_jsval(*cx, message.handle_mut()),
-                MessageData::Binary(data) => match ws.binary_type.get() {
-                    BinaryType::Blob => {
-                        let blob = Blob::new(
-                            &global,
-                            BlobImpl::new_from_bytes(data, "".to_owned()),
-                            CanGc::note(),
-                        );
-                        blob.to_jsval(*cx, message.handle_mut());
-                    },
-                    BinaryType::Arraybuffer => {
-                        rooted!(in(*cx) let mut array_buffer = ptr::null_mut::<JSObject>());
+        let mut realm = AutoRealm::new(
+            cx,
+            NonNull::new(ws.reflector().get_jsobject().get()).unwrap(),
+        );
+        let cx = &mut *realm;
+        rooted!(&in(cx) let mut message = UndefinedValue());
+        match self.message {
+            MessageData::Text(text) => text.safe_to_jsval(cx, message.handle_mut()),
+            MessageData::Binary(data) => match ws.binary_type.get() {
+                BinaryType::Blob => {
+                    let blob =
+                        Blob::new(cx, &global, BlobImpl::new_from_bytes(data, "".to_owned()));
+                    blob.safe_to_jsval(cx, message.handle_mut());
+                },
+                BinaryType::Arraybuffer => {
+                    rooted!(&in(cx) let mut array_buffer = ptr::null_mut::<JSObject>());
+                    unsafe {
                         assert!(
                             ArrayBuffer::create(
-                                *cx,
+                                cx.raw_cx(),
                                 CreateWith::Slice(&data),
                                 array_buffer.handle_mut()
                             )
                             .is_ok()
-                        );
+                        )
+                    };
 
-                        (*array_buffer).to_jsval(*cx, message.handle_mut());
-                    },
+                    (*array_buffer).safe_to_jsval(cx, message.handle_mut());
                 },
-            }
-            MessageEvent::dispatch_jsval(
-                ws.upcast(),
-                &global,
-                message.handle(),
-                Some(&ws.origin().ascii_serialization()),
-                None,
-                vec![],
-                CanGc::note(),
-            );
+            },
         }
+        MessageEvent::dispatch_jsval(
+            cx,
+            ws.upcast(),
+            &global,
+            message.handle(),
+            Some(&ws.origin().ascii_serialization()),
+            None,
+            vec![],
+        );
     }
 }

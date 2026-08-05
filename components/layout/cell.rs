@@ -4,10 +4,10 @@
 
 use std::fmt;
 use std::ops::Deref;
+use std::sync::{Arc, Weak};
 
-use atomic_refcell::AtomicRefCell;
+use atomic_refcell::{AtomicRef, AtomicRefCell};
 use malloc_size_of_derive::MallocSizeOf;
-use servo_arc::Arc;
 
 #[derive(MallocSizeOf)]
 pub struct ArcRefCell<T> {
@@ -21,6 +21,16 @@ impl<T> ArcRefCell<T> {
             value: Arc::new(AtomicRefCell::new(value)),
         }
     }
+
+    pub(crate) fn downgrade(&self) -> WeakRefCell<T> {
+        WeakRefCell {
+            value: Arc::downgrade(&self.value),
+        }
+    }
+
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.value, &other.value)
+    }
 }
 
 impl<T> Clone for ArcRefCell<T> {
@@ -28,6 +38,12 @@ impl<T> Clone for ArcRefCell<T> {
         Self {
             value: self.value.clone(),
         }
+    }
+}
+
+impl<T> From<T> for ArcRefCell<T> {
+    fn from(value: T) -> Self {
+        Self::new(value)
     }
 }
 
@@ -56,5 +72,40 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         self.value.fmt(formatter)
+    }
+}
+
+#[derive(Debug, MallocSizeOf)]
+pub(crate) struct WeakRefCell<T> {
+    value: Weak<AtomicRefCell<T>>,
+}
+
+impl<T> Clone for WeakRefCell<T> {
+    fn clone(&self) -> Self {
+        Self {
+            value: self.value.clone(),
+        }
+    }
+}
+
+impl<T> WeakRefCell<T> {
+    pub(crate) fn upgrade(&self) -> Option<ArcRefCell<T>> {
+        self.value.upgrade().map(|value| ArcRefCell { value })
+    }
+}
+
+pub(crate) enum RefOrAtomicRef<'a, T> {
+    Ref(&'a T),
+    AtomicRef(AtomicRef<'a, T>),
+}
+
+impl<T> Deref for RefOrAtomicRef<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Ref(value) => value,
+            Self::AtomicRef(value) => value.deref(),
+        }
     }
 }

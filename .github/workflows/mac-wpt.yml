@@ -10,15 +10,19 @@ on:
       profile:
         required: true
         type: string
+      arm:
+        required: true
+        type: boolean
 
 env:
   RUST_BACKTRACE: 1
   SHELL: /bin/bash
+  NAME: ${{ inputs.arm && 'macos-arm64' || 'macos' }}
 
 jobs:
   mac-wpt:
     name: WPT
-    runs-on: macos-13
+    runs-on: ${{ inputs.arm && 'macos-15' || 'macos-15-intel' }}
     env:
       max_chunk_id: 5
     strategy:
@@ -26,48 +30,44 @@ jobs:
       matrix:
         chunk_id: [1, 2, 3, 4, 5]
     steps:
-      - uses: actions/checkout@v4
-        if: github.event_name != 'pull_request_target'
-      # This is necessary to checkout the pull request if this run was triggered via a
-      # `pull_request_target` event.
-      - uses: actions/checkout@v4
-        if: github.event_name == 'pull_request_target'
+      - uses: servo/ci-runners/actions/checkout@a05e7e830e3f4d4c71bdc5a38f003f052b72668c
+      - uses: actions/download-artifact@v8
         with:
-          ref: refs/pull/${{ github.event.number }}/head
-      - uses: actions/download-artifact@v4
-        with:
-          name: ${{ inputs.profile }}-binary-macos
+          name: ${{ inputs.profile }}-binary-${{ env.NAME }}
       - name: Setup Python
         uses: ./.github/actions/setup-python
       - name: Prep test environment
+        timeout-minutes: 60
         run: |
           gtar -xzf target.tar.gz
-          ./mach bootstrap --skip-lints
+          ./mach bootstrap --yes --skip-lints --skip-nextest
       - name: Smoketest
-        run: ./mach smoketest --${{ inputs.profile }}
+        run: ./mach smoketest --profile ${{ inputs.profile }}
       - name: Run tests
         run: |
-          mkdir -p wpt-filtered-logs/macos
-          mkdir -p wpt-full-logs/macos
+          mkdir -p wpt-filtered-logs/${{ env.NAME }}
+          mkdir -p wpt-full-logs/${{ env.NAME }}
           ./mach test-wpt \
-            --${{ inputs.profile }} --processes $(sysctl -n hw.logicalcpu) --timeout-multiplier 8 \
+            --profile ${{ inputs.profile }} --processes $(sysctl -n hw.logicalcpu) --timeout-multiplier 8 \
             --total-chunks ${{ env.max_chunk_id }} --this-chunk ${{ matrix.chunk_id }} \
-            --log-raw wpt-full-logs/macos/${{ matrix.chunk_id }}.log \
-            --log-raw-unexpected wpt-filtered-logs/macos/${{ matrix.chunk_id }}.log \
-            --filter-intermittents wpt-filtered-logs/macos/${{ matrix.chunk_id }}.json
+            --log-raw wpt-full-logs/${{ env.NAME }}/${{ matrix.chunk_id }}.log \
+            --log-raw-stable-unexpected wpt-filtered-logs/${{ env.NAME }}/${{ matrix.chunk_id }}.log \
+            --filter-intermittents wpt-filtered-logs/${{ env.NAME }}/${{ matrix.chunk_id }}.json
             ${{ inputs.wpt-args }}
       - name: Archive results (filtered)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: ${{ always() }}
         with:
-          name: wpt-filtered-logs-macos-${{ matrix.chunk_id }}
+          name: wpt-filtered-logs-${{ env.NAME }}-${{ matrix.chunk_id }}
           path: wpt-filtered-logs/*/
+          if-no-files-found: error
       - name: Archive results (full)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: ${{ always() }}
         with:
-          name: wpt-full-logs-macos-${{ matrix.chunk_id }}
+          name: wpt-full-logs-${{ env.NAME }}-${{ matrix.chunk_id }}
           path: wpt-full-logs/*/
+          if-no-files-found: error
 
   report-test-results:
     name: Process WPT Results
@@ -76,32 +76,44 @@ jobs:
     needs: mac-wpt
     steps:
       - name: Merge logs (filtered)
-        uses: actions/upload-artifact/merge@v4
+        uses: actions/upload-artifact/merge@v7
         with:
-          name: wpt-filtered-logs-macos
-          pattern: wpt-filtered-logs-macos-*
+          name: wpt-filtered-logs-${{ env.NAME }}
+          pattern: wpt-filtered-logs-${{ env.NAME }}-*
           delete-merged: true
       - name: Merge logs (full)
-        uses: actions/upload-artifact/merge@v4
+        uses: actions/upload-artifact/merge@v7
         with:
-          name: wpt-full-logs-macos
-          pattern: wpt-full-logs-macos-*
+          name: wpt-full-logs-${{ env.NAME }}
+          pattern: wpt-full-logs-${{ env.NAME }}-*
           delete-merged: true
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v6
         if: ${{ !cancelled() }}
         with:
           fetch-depth: 2
-      - uses: actions/download-artifact@v4
+      - name: Aggregate results
+        if: ${{ !cancelled() && !inputs.wpt-sync-from-upstream }}
+        run: |
+          touch stable-unexpected-results.log
+          cat results/${{ env.NAME }}/*.log > stable-unexpected-results.log || true
+      - name: Upload aggregated results
+        if: ${{ !cancelled() && !inputs.wpt-sync-from-upstream }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: stable-unexpected-results-${{ env.NAME }}
+          path: stable-unexpected-results.log
+          if-no-files-found: error
+      - uses: actions/download-artifact@v8
         if: ${{ !cancelled() }}
         with:
-          name: wpt-filtered-logs-macos
+          name: wpt-filtered-logs-${{ env.NAME }}
           path: results
       - name: Report results
         if: ${{ !cancelled() }}
         run: |
           etc/ci/report_aggregated_expected_results.py \
-            --tag="macos-wpt" \
-            results/macos/*.json
+            --tag="${{ env.NAME }}-wpt" \
+            results/${{ env.NAME }}/*.json
         env:
           GITHUB_CONTEXT: ${{ toJson(github) }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

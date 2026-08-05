@@ -7,14 +7,14 @@
 use std::ffi::CStr;
 use std::ptr;
 
-use js::jsapi::{JSClass, JSFunctionSpec};
+use js::context::JSContext;
+use js::jsapi::{JSClass, JSFunctionSpec, JSPropertySpec};
 use js::rust::{HandleObject, MutableHandleObject};
 
 use crate::DomTypes;
 use crate::constant::ConstantSpec;
 use crate::guard::Guard;
 use crate::interface::{create_object, define_on_global_object};
-use crate::script_runtime::JSContext;
 
 /// The class of a namespace object.
 #[derive(Clone, Copy)]
@@ -28,7 +28,7 @@ impl NamespaceObjectClass {
         NamespaceObjectClass(JSClass {
             name: name.as_ptr(),
             flags: 0,
-            cOps: 0 as *mut _,
+            cOps: ptr::null(),
             spec: ptr::null(),
             ext: ptr::null(),
             oOps: ptr::null(),
@@ -37,13 +37,14 @@ impl NamespaceObjectClass {
 }
 
 /// Create a new namespace object.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn create_namespace_object<D: DomTypes>(
-    cx: JSContext,
+    cx: &mut JSContext,
     global: HandleObject,
     proto: HandleObject,
     class: &'static NamespaceObjectClass,
     methods: &[Guard<&'static [JSFunctionSpec]>],
+    attributes: &[Guard<&'static [JSPropertySpec]>],
     constants: &[Guard<&'static [ConstantSpec]>],
     name: &CStr,
     mut rval: MutableHandleObject,
@@ -54,7 +55,7 @@ pub(crate) fn create_namespace_object<D: DomTypes>(
         proto,
         &class.0,
         methods,
-        &[],
+        attributes,
         constants,
         rval.reborrow(),
     );

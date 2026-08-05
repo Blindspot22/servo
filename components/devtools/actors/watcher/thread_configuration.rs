@@ -6,28 +6,24 @@
 //! This actor manages the configuration flags that the devtools host can apply to threads.
 
 use std::collections::HashMap;
-use std::net::TcpStream;
+use std::sync::Arc;
 
-use serde::Serialize;
+use malloc_size_of_derive::MallocSizeOf;
 use serde_json::{Map, Value};
 
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
-use crate::protocol::JsonPacketStream;
-use crate::{EmptyReplyMsg, StreamId};
+use crate::actor::{Actor, ActorEncode, ActorError, ActorRegistry, new_actor_name};
+use crate::protocol::ClientRequest;
+use crate::{ActorMsg, EmptyReplyMsg, StreamId};
 
-#[derive(Serialize)]
-pub struct ThreadConfigurationActorMsg {
-    actor: String,
-}
-
-pub struct ThreadConfigurationActor {
+#[derive(MallocSizeOf)]
+pub(crate) struct ThreadConfigurationActor {
     name: String,
     _configuration: HashMap<&'static str, bool>,
 }
 
 impl Actor for ThreadConfigurationActor {
-    fn name(&self) -> String {
-        self.name.clone()
+    fn name(&self) -> &str {
+        &self.name
     }
 
     /// The thread configuration actor can handle the following messages:
@@ -35,33 +31,41 @@ impl Actor for ThreadConfigurationActor {
     /// - `updateConfiguration`: Receives new configuration flags from the devtools host.
     fn handle_message(
         &self,
+        request: ClientRequest,
         _registry: &ActorRegistry,
         msg_type: &str,
         _msg: &Map<String, Value>,
-        stream: &mut TcpStream,
         _id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
-        Ok(match msg_type {
+    ) -> Result<(), ActorError> {
+        match msg_type {
             "updateConfiguration" => {
                 // TODO: Actually update configuration
-                let msg = EmptyReplyMsg { from: self.name() };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                let msg = EmptyReplyMsg {
+                    from: self.name().into(),
+                };
+                request.reply_final(&msg)?
             },
-            _ => ActorMessageStatus::Ignored,
-        })
+            _ => return Err(ActorError::UnrecognizedPacketType),
+        };
+        Ok(())
     }
 }
 
 impl ThreadConfigurationActor {
-    pub fn new(name: String) -> Self {
-        Self {
+    pub fn register(registry: &ActorRegistry) -> Arc<Self> {
+        let name = new_actor_name::<Self>();
+        let actor = Self {
             name,
             _configuration: HashMap::new(),
-        }
+        };
+        registry.register::<Self>(actor)
     }
+}
 
-    pub fn encodable(&self) -> ThreadConfigurationActorMsg {
-        ThreadConfigurationActorMsg { actor: self.name() }
+impl ActorEncode<ActorMsg> for ThreadConfigurationActor {
+    fn encode(&self, _: &ActorRegistry) -> ActorMsg {
+        ActorMsg {
+            actor: self.name().into(),
+        }
     }
 }

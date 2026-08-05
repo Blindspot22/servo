@@ -2,29 +2,29 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::collections::HashMap;
-
-use base::id::{DomExceptionId, DomExceptionIndex};
-use constellation_traits::DomException;
 use dom_struct::dom_struct;
+use js::context::{JSContext, NoGC};
 use js::rust::HandleObject;
+use rustc_hash::FxHashMap;
+use script_bindings::match_domstring_ascii;
+use script_bindings::reflector::{
+    Reflector, reflect_dom_object_with_cx, reflect_dom_object_with_proto,
+};
+use servo_base::id::{DomExceptionId, DomExceptionIndex};
+use servo_constellation_traits::DomException;
 
 use crate::dom::bindings::codegen::Bindings::DOMExceptionBinding::{
     DOMExceptionConstants, DOMExceptionMethods,
 };
 use crate::dom::bindings::error::Error;
-use crate::dom::bindings::reflector::{
-    Reflector, reflect_dom_object, reflect_dom_object_with_proto,
-};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::serializable::Serializable;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::structuredclone::StructuredData;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::CanGc;
 
 #[repr(u16)]
-#[allow(clippy::enum_variant_names)]
+#[expect(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug, Eq, JSTraceable, MallocSizeOf, Ord, PartialEq, PartialOrd)]
 pub(crate) enum DOMErrorName {
     IndexSizeError = DOMExceptionConstants::INDEX_SIZE_ERR,
@@ -49,16 +49,20 @@ pub(crate) enum DOMErrorName {
     TimeoutError = DOMExceptionConstants::TIMEOUT_ERR,
     InvalidNodeTypeError = DOMExceptionConstants::INVALID_NODE_TYPE_ERR,
     DataCloneError = DOMExceptionConstants::DATA_CLONE_ERR,
+    DataError,
+    TransactionInactiveError,
+    ReadOnlyError,
+    VersionError,
     EncodingError,
     NotReadableError,
-    DataError,
     OperationError,
     NotAllowedError,
+    ConstraintError,
 }
 
 impl DOMErrorName {
     pub(crate) fn from(s: &DOMString) -> Option<DOMErrorName> {
-        match s.as_ref() {
+        match_domstring_ascii!(s,
             "IndexSizeError" => Some(DOMErrorName::IndexSizeError),
             "HierarchyRequestError" => Some(DOMErrorName::HierarchyRequestError),
             "WrongDocumentError" => Some(DOMErrorName::WrongDocumentError),
@@ -81,13 +85,17 @@ impl DOMErrorName {
             "TimeoutError" => Some(DOMErrorName::TimeoutError),
             "InvalidNodeTypeError" => Some(DOMErrorName::InvalidNodeTypeError),
             "DataCloneError" => Some(DOMErrorName::DataCloneError),
+            "DataError" => Some(DOMErrorName::DataError),
+            "TransactionInactiveError" => Some(DOMErrorName::TransactionInactiveError),
+            "ReadOnlyError" => Some(DOMErrorName::ReadOnlyError),
+            "VersionError" => Some(DOMErrorName::VersionError),
             "EncodingError" => Some(DOMErrorName::EncodingError),
             "NotReadableError" => Some(DOMErrorName::NotReadableError),
-            "DataError" => Some(DOMErrorName::DataError),
             "OperationError" => Some(DOMErrorName::OperationError),
             "NotAllowedError" => Some(DOMErrorName::NotAllowedError),
+            "ConstraintError" => Some(DOMErrorName::ConstraintError),
             _ => None,
-        }
+        )
     }
 }
 
@@ -114,7 +122,7 @@ impl DOMException {
             DOMErrorName::InvalidStateError => "The object is in an invalid state.",
             DOMErrorName::SyntaxError => "The string did not match the expected pattern.",
             DOMErrorName::InvalidModificationError => "The object can not be modified in this way.",
-            DOMErrorName::NamespaceError => "The operation is not allowed by Namespaces in XML.",
+            DOMErrorName::NamespaceError => "The operation is incorrect with regard to namespaces.",
             DOMErrorName::InvalidAccessError => {
                 "The object does not support the operation or argument."
             },
@@ -129,17 +137,29 @@ impl DOMException {
                 "The supplied node is incorrect or has an incorrect ancestor for this operation."
             },
             DOMErrorName::DataCloneError => "The object can not be cloned.",
+            DOMErrorName::DataError => "Provided data is inadequate.",
+            DOMErrorName::TransactionInactiveError => {
+                "A request was placed against a transaction which is currently not active, or which is finished."
+            },
+            DOMErrorName::ReadOnlyError => {
+                "The mutating operation was attempted in a \"readonly\" transaction."
+            },
+            DOMErrorName::VersionError => {
+                "An attempt was made to open a database using a lower version than the existing version."
+            },
             DOMErrorName::EncodingError => {
                 "The encoding operation (either encoded or decoding) failed."
             },
             DOMErrorName::NotReadableError => "The I/O read operation failed.",
-            DOMErrorName::DataError => "Provided data is inadequate.",
             DOMErrorName::OperationError => {
                 "The operation failed for an operation-specific reason."
             },
             DOMErrorName::NotAllowedError => {
                 r#"The request is not allowed by the user agent or the platform in the current context,
                 possibly because the user denied permission."#
+            },
+            DOMErrorName::ConstraintError => {
+                "A mutation operation in a transaction failed because a constraint was not satisfied."
             },
         };
 
@@ -158,31 +178,31 @@ impl DOMException {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
         code: DOMErrorName,
-        can_gc: CanGc,
     ) -> DomRoot<DOMException> {
         let (message, name) = DOMException::get_error_data_by_code(code);
 
-        reflect_dom_object(
+        reflect_dom_object_with_cx(
             Box::new(DOMException::new_inherited(message, name)),
             global,
-            can_gc,
+            cx,
         )
     }
 
     pub(crate) fn new_with_custom_message(
+        cx: &mut JSContext,
         global: &GlobalScope,
         code: DOMErrorName,
         message: String,
-        can_gc: CanGc,
     ) -> DomRoot<DOMException> {
         let (_, name) = DOMException::get_error_data_by_code(code);
 
-        reflect_dom_object(
+        reflect_dom_object_with_cx(
             Box::new(DOMException::new_inherited(DOMString::from(message), name)),
             global,
-            can_gc,
+            cx,
         )
     }
 
@@ -193,23 +213,23 @@ impl DOMException {
 }
 
 impl DOMExceptionMethods<crate::DomTypeHolder> for DOMException {
-    // https://webidl.spec.whatwg.org/#dom-domexception-domexception
+    /// <https://webidl.spec.whatwg.org/#dom-domexception-domexception>
     fn Constructor(
+        cx: &mut JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
         message: DOMString,
         name: DOMString,
     ) -> Result<DomRoot<DOMException>, Error> {
         Ok(reflect_dom_object_with_proto(
+            cx,
             Box::new(DOMException::new_inherited(message, name)),
             global,
             proto,
-            can_gc,
         ))
     }
 
-    // https://webidl.spec.whatwg.org/#dom-domexception-code
+    /// <https://webidl.spec.whatwg.org/#dom-domexception-code>
     fn Code(&self) -> u16 {
         match DOMErrorName::from(&self.name) {
             Some(code) if code <= DOMErrorName::DataCloneError => code as u16,
@@ -217,12 +237,12 @@ impl DOMExceptionMethods<crate::DomTypeHolder> for DOMException {
         }
     }
 
-    // https://webidl.spec.whatwg.org/#dom-domexception-name
+    /// <https://webidl.spec.whatwg.org/#dom-domexception-name>
     fn Name(&self) -> DOMString {
         self.name.clone()
     }
 
-    // https://webidl.spec.whatwg.org/#dom-domexception-message
+    /// <https://webidl.spec.whatwg.org/#dom-domexception-message>
     fn Message(&self) -> DOMString {
         self.message.clone()
     }
@@ -232,8 +252,8 @@ impl Serializable for DOMException {
     type Index = DomExceptionIndex;
     type Data = DomException;
 
-    // https://webidl.spec.whatwg.org/#idl-DOMException
-    fn serialize(&self) -> Result<(DomExceptionId, Self::Data), ()> {
+    /// <https://webidl.spec.whatwg.org/#idl-DOMException>
+    fn serialize(&self, _no_gc: &NoGC) -> Result<(DomExceptionId, Self::Data), ()> {
         let serialized = DomException {
             message: self.message.to_string(),
             name: self.name.to_string(),
@@ -241,26 +261,26 @@ impl Serializable for DOMException {
         Ok((DomExceptionId::new(), serialized))
     }
 
-    // https://webidl.spec.whatwg.org/#idl-DOMException
+    /// <https://webidl.spec.whatwg.org/#idl-DOMException>
     fn deserialize(
+        cx: &mut JSContext,
         owner: &GlobalScope,
         serialized: Self::Data,
-        can_gc: CanGc,
     ) -> Result<DomRoot<Self>, ()>
     where
         Self: Sized,
     {
         Ok(Self::new_with_custom_message(
+            cx,
             owner,
-            DOMErrorName::from(&DOMString::from_string(serialized.name)).ok_or(())?,
+            DOMErrorName::from(&DOMString::from(serialized.name)).ok_or(())?,
             serialized.message,
-            can_gc,
         ))
     }
 
     fn serialized_storage<'a>(
         data: StructuredData<'a, '_>,
-    ) -> &'a mut Option<HashMap<DomExceptionId, Self::Data>> {
+    ) -> &'a mut Option<FxHashMap<DomExceptionId, Self::Data>> {
         match data {
             StructuredData::Reader(reader) => &mut reader.exceptions,
             StructuredData::Writer(writer) => &mut writer.exceptions,

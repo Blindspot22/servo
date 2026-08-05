@@ -4,30 +4,31 @@
 
 // https://html.spec.whatwg.org/multipage/#windoworworkerglobalscope
 
-typedef (DOMString or Function) TimerHandler;
+typedef (TrustedScript or DOMString or Function) TimerHandler;
 
 [Exposed=(Window,Worker)]
 interface mixin WindowOrWorkerGlobalScope {
   [Replaceable] readonly attribute USVString origin;
+
+  undefined reportError(any e);
 
   // base64 utility methods
   [Throws] DOMString btoa(DOMString data);
   [Throws] DOMString atob(DOMString data);
 
   // timers
-  long setTimeout(TimerHandler handler, optional long timeout = 0, any... arguments);
+  [Throws] long setTimeout(TimerHandler handler, optional long timeout = 0, any... arguments);
   undefined clearTimeout(optional long handle = 0);
-  long setInterval(TimerHandler handler, optional long timeout = 0, any... arguments);
+  [Throws] long setInterval(TimerHandler handler, optional long timeout = 0, any... arguments);
   undefined clearInterval(optional long handle = 0);
 
   // microtask queuing
   undefined queueMicrotask(VoidFunction callback);
 
   // ImageBitmap
-  [Pref="dom_imagebitmap_enabled"]
   Promise<ImageBitmap> createImageBitmap(ImageBitmapSource image, optional ImageBitmapOptions options = {});
-  // Promise<ImageBitmap> createImageBitmap(
-  //   ImageBitmapSource image, long sx, long sy, long sw, long sh, optional ImageBitmapOptions options);
+  Promise<ImageBitmap> createImageBitmap(ImageBitmapSource image, long sx, long sy, long sw, long sh,
+                                         optional ImageBitmapOptions options = {});
 
   // structured cloning
   [Throws]
@@ -47,8 +48,17 @@ partial interface mixin WindowOrWorkerGlobalScope {
 
 // https://www.w3.org/TR/trusted-types/#extensions-to-the-windoworworkerglobalscope-interface
 partial interface mixin WindowOrWorkerGlobalScope {
-  [Pref="dom_trusted_types_enabled"]
   readonly attribute TrustedTypePolicyFactory trustedTypes;
+};
+
+// https://fetch.spec.whatwg.org/#fetch-method
+partial interface mixin WindowOrWorkerGlobalScope {
+  [NewObject] Promise<Response> fetch(RequestInfo input, optional RequestInit init = {});
+};
+
+// https://w3c.github.io/ServiceWorker/#global-caches-attribute
+partial interface mixin WindowOrWorkerGlobalScope {
+  [Pref="dom_serviceworker_enabled", SecureContext, SameObject] readonly attribute CacheStorage caches;
 };
 
 Window includes WindowOrWorkerGlobalScope;

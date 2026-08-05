@@ -5,7 +5,6 @@
 use std::ffi::{CStr, CString};
 use std::ptr;
 
-use base::text::{UnicodeBlock, UnicodeBlockMethod};
 use fontconfig_sys::constants::{
     FC_FAMILY, FC_FILE, FC_FONTFORMAT, FC_INDEX, FC_SLANT, FC_SLANT_ITALIC, FC_SLANT_OBLIQUE,
     FC_WEIGHT, FC_WEIGHT_BOLD, FC_WEIGHT_EXTRABLACK, FC_WEIGHT_REGULAR, FC_WIDTH,
@@ -19,23 +18,24 @@ use fontconfig_sys::{
     FcObjectSetCreate, FcObjectSetDestroy, FcPattern, FcPatternAddString, FcPatternCreate,
     FcPatternDestroy, FcPatternGetInteger, FcPatternGetString, FcResultMatch, FcSetSystem,
 };
+use fonts_traits::{FontTemplate, FontTemplateDescriptor, LocalFontIdentifier};
+use icu_locid::subtags::language;
 use libc::{c_char, c_int};
 use log::debug;
+use servo_base::text::{UnicodeBlock, UnicodeBlockMethod};
 use style::Atom;
 use style::values::computed::font::GenericFontFamily;
 use style::values::computed::{FontStretch, FontStyle, FontWeight};
 use unicode_script::Script;
 
-use super::LocalFontIdentifier;
 use crate::font::map_platform_values_to_style_values;
-use crate::font_template::{FontTemplate, FontTemplateDescriptor};
 use crate::platform::add_noto_fallback_families;
 use crate::{
     EmojiPresentationPreference, FallbackFontSelectionOptions, FontIdentifier,
     LowercaseFontFamilyName,
 };
 
-pub fn for_each_available_family<F>(mut callback: F)
+pub(crate) fn for_each_available_family<F>(mut callback: F)
 where
     F: FnMut(String),
 {
@@ -54,23 +54,31 @@ where
             }
 
             // Skip bitmap fonts. They aren't supported by FreeType.
-            let fontformat = c_str_to_string(format as *const c_char);
-            if fontformat != "TrueType" && fontformat != "CFF" && fontformat != "Type 1" {
+            let fontformat = CStr::from_ptr(format as *const c_char);
+            if !matches!(fontformat.to_bytes(), b"TrueType" | b"CFF" | b"Type 1") {
                 continue;
             }
 
             while FcPatternGetString(*font, FC_FAMILY.as_ptr() as *mut c_char, v, &mut family) ==
                 FcResultMatch
             {
-                let family_name = c_str_to_string(family as *const c_char);
-                callback(family_name);
+                let family_name = match CStr::from_ptr(family as *const c_char).to_str() {
+                    Ok(family_name) => family_name,
+                    Err(error) => {
+                        log::error!(
+                            "Ignoring font family because its name contains invalid UTF-8: {error:?}"
+                        );
+                        continue;
+                    },
+                };
+                callback(family_name.to_owned());
                 v += 1;
             }
         }
     }
 }
 
-pub fn for_each_variation<F>(family_name: &str, mut callback: F)
+pub(crate) fn for_each_variation<F>(family_name: &str, mut callback: F)
 where
     F: FnMut(FontTemplate),
 {
@@ -79,17 +87,32 @@ where
         let mut font_set = FcConfigGetFonts(config, FcSetSystem);
         let font_set_array_ptr = &mut font_set;
         let pattern = FcPatternCreate();
-        assert!(!pattern.is_null());
-        let family_name_cstr: CString = CString::new(family_name).unwrap();
+        debug_assert!(!pattern.is_null());
+        if pattern.is_null() {
+            log::error!("Failed to create FcPattern");
+            return;
+        }
+
+        let Ok(family_name_cstr) = CString::new(family_name) else {
+            return;
+        };
         let ok = FcPatternAddString(
             pattern,
             FC_FAMILY.as_ptr() as *mut c_char,
             family_name_cstr.as_ptr() as *const FcChar8,
         );
-        assert_ne!(ok, 0);
+        debug_assert_ne!(ok, 0);
+        if ok == 0 {
+            log::error!("Failed to create FcPattern");
+            return;
+        }
 
         let object_set = FcObjectSetCreate();
-        assert!(!object_set.is_null());
+        debug_assert!(!object_set.is_null());
+        if object_set.is_null() {
+            log::error!("Failed to create FcObjectSet");
+            return;
+        }
 
         FcObjectSetAdd(object_set, FC_FILE.as_ptr() as *mut c_char);
         FcObjectSetAdd(object_set, FC_INDEX.as_ptr() as *mut c_char);
@@ -122,9 +145,19 @@ where
                 continue;
             };
 
+            let path = match CStr::from_ptr(path as *const c_char).to_str() {
+                Ok(path) => path,
+                Err(error) => {
+                    log::error!(
+                        "Ignoring font variation from the {family_name:?} family because file path contains invalid UTF-8: {error:?}"
+                    );
+                    continue;
+                },
+            };
             let local_font_identifier = LocalFontIdentifier {
-                path: Atom::from(c_str_to_string(path as *const c_char)),
-                variation_index: index as i32,
+                path: Atom::from(path),
+                face_index: (index & 0xFFFF) as u16,
+                named_instance_index: (index >> 16) as u16,
             };
             let descriptor = FontTemplateDescriptor::new(weight, stretch, style);
 
@@ -148,17 +181,23 @@ pub fn fallback_font_families(options: FallbackFontSelectionOptions) -> Vec<&'st
         families.push("Noto Color Emoji");
     }
 
-    add_noto_fallback_families(options, &mut families);
-
-    if matches!(
-        Script::from(options.character),
-        Script::Bopomofo | Script::Han
-    ) {
-        families.push("WenQuanYi Micro Hei");
-    }
+    add_noto_fallback_families(options.clone(), &mut families);
 
     if let Some(block) = options.character.block() {
         match block {
+            // In Japanese typography, it is not common to use different fonts
+            // for Kanji(Han), Hiragana, and Katakana within the same document.
+            // We uniformly fallback to Japanese fonts when the document language is Japanese.
+            _ if options.language == language!("ja") => {
+                families.push("TakaoPGothic");
+            },
+            _ if matches!(
+                Script::from(options.character),
+                Script::Bopomofo | Script::Han
+            ) && options.language != language!("ja") =>
+            {
+                families.push("WenQuanYi Micro Hei");
+            },
             UnicodeBlock::HalfwidthandFullwidthForms |
             UnicodeBlock::EnclosedIdeographicSupplement => families.push("WenQuanYi Micro Hei"),
             UnicodeBlock::Hiragana |
@@ -181,19 +220,19 @@ pub fn fallback_font_families(options: FallbackFontSelectionOptions) -> Vec<&'st
     families
 }
 
-pub fn default_system_generic_font_family(generic: GenericFontFamily) -> LowercaseFontFamilyName {
+pub(crate) fn default_system_generic_font_family(
+    generic: GenericFontFamily,
+) -> LowercaseFontFamilyName {
     let generic_string = match generic {
-        GenericFontFamily::None | GenericFontFamily::Serif => "serif",
-        GenericFontFamily::SansSerif => "sans-serif",
-        GenericFontFamily::Monospace => "monospace",
-        GenericFontFamily::Cursive => "cursive",
-        GenericFontFamily::Fantasy => "fantasy",
-        GenericFontFamily::SystemUi => "sans-serif",
+        GenericFontFamily::None | GenericFontFamily::Serif => c"serif",
+        GenericFontFamily::SansSerif => c"sans-serif",
+        GenericFontFamily::Monospace => c"monospace",
+        GenericFontFamily::Cursive => c"cursive",
+        GenericFontFamily::Fantasy => c"fantasy",
+        GenericFontFamily::SystemUi => c"sans-serif",
     };
 
-    let generic_name_c = CString::new(generic_string).unwrap();
-    let generic_name_ptr = generic_name_c.as_ptr();
-
+    let generic_name_ptr = generic_string.as_ptr();
     unsafe {
         let pattern = FcNameParse(generic_name_ptr as *mut FcChar8);
         FcConfigSubstitute(ptr::null_mut(), pattern, FcMatchPattern);
@@ -210,7 +249,10 @@ pub fn default_system_generic_font_family(generic: GenericFontFamily) -> Lowerca
                 0,
                 &mut match_string,
             );
-            let family_name = c_str_to_string(match_string as *const c_char);
+            let family_name = CStr::from_ptr(match_string as *const c_char)
+                .to_str()
+                .expect("Font family name contains invalid UTF-8")
+                .to_owned();
 
             FcPatternDestroy(family_match);
             FcPatternDestroy(pattern);
@@ -288,11 +330,4 @@ fn font_weight_from_fontconfig_pattern(pattern: *mut FcPattern) -> Option<FontWe
 
     let mapped_weight = map_platform_values_to_style_values(&mapping, weight as f64);
     Some(FontWeight::from_float(mapped_weight as f32))
-}
-
-/// Creates a String from the given null-terminated buffer.
-/// Panics if the buffer does not contain UTF-8.
-unsafe fn c_str_to_string(s: *const c_char) -> String {
-    let c_str = unsafe { CStr::from_ptr(s) };
-    std::str::from_utf8(c_str.to_bytes()).unwrap().to_owned()
 }

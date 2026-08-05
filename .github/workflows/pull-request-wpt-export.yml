@@ -4,6 +4,10 @@ on:
     types: ['opened', 'synchronize', 'reopened', 'edited', 'closed']
     branches: ['main']
 
+concurrency:
+  group: ${{ github.head_ref }}
+  cancel-in-progress: false
+
 jobs:
   upstream:
     # Run job only on servo/servo
@@ -18,7 +22,7 @@ jobs:
           cd servo
           git fetch origin pull/${{ github.event.pull_request.number}}/head:pr --depth ${{ env.PR_FETCH_DEPTH }}
       - name: Check out wpt
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: wpt
           repository: 'web-platform-tests/wpt'

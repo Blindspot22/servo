@@ -6,32 +6,36 @@ use std::cell::Cell;
 
 use dom_struct::dom_struct;
 use html5ever::local_name;
+use js::context::JSContext;
+use script_bindings::cell::DomRefCell;
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
 
-use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::ElementInternalsBinding::{
     ElementInternalsMethods, ValidityStateFlags,
 };
 use crate::dom::bindings::codegen::UnionTypes::FileOrUSVStringOrFormData;
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::{Reflector, reflect_dom_object};
-use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
+use crate::dom::bindings::root::{Dom, DomRoot, LayoutDom, MutNullableDom, ToLayoutOptional};
 use crate::dom::bindings::str::{DOMString, USVString};
+use crate::dom::customstateset::CustomStateSet;
 use crate::dom::element::Element;
 use crate::dom::file::File;
-use crate::dom::htmlelement::HTMLElement;
-use crate::dom::htmlformelement::{FormDatum, FormDatumValue, HTMLFormElement};
+use crate::dom::html::htmlelement::HTMLElement;
+use crate::dom::html::htmlformelement::{
+    FormDatum, FormDatumUnrooted, FormDatumValue, HTMLFormElement,
+};
 use crate::dom::node::{Node, NodeTraits};
 use crate::dom::nodelist::NodeList;
 use crate::dom::shadowroot::ShadowRoot;
 use crate::dom::validation::{Validatable, is_barred_by_datalist_ancestor};
 use crate::dom::validitystate::{ValidationFlags, ValidityState};
-use crate::script_runtime::CanGc;
 
-#[derive(Clone, JSTraceable, MallocSizeOf)]
+#[derive(JSTraceable, MallocSizeOf)]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 enum SubmissionValue {
-    File(DomRoot<File>),
-    FormData(Vec<FormDatum>),
+    File(Dom<File>),
+    FormData(Vec<FormDatumUnrooted>),
     USVString(USVString),
     None,
 }
@@ -41,14 +45,18 @@ impl From<Option<&FileOrUSVStringOrFormData>> for SubmissionValue {
         match value {
             None => SubmissionValue::None,
             Some(FileOrUSVStringOrFormData::File(file)) => {
-                SubmissionValue::File(DomRoot::from_ref(file))
+                SubmissionValue::File(Dom::from_ref(file))
             },
             Some(FileOrUSVStringOrFormData::USVString(usv_string)) => {
                 SubmissionValue::USVString(usv_string.clone())
             },
-            Some(FileOrUSVStringOrFormData::FormData(form_data)) => {
-                SubmissionValue::FormData(form_data.datums())
-            },
+            Some(FileOrUSVStringOrFormData::FormData(form_data)) => SubmissionValue::FormData(
+                form_data
+                    .datums()
+                    .into_iter()
+                    .map(|data| data.into())
+                    .collect(),
+            ),
         }
     }
 }
@@ -69,6 +77,9 @@ pub(crate) struct ElementInternals {
     state: DomRefCell<SubmissionValue>,
     form_owner: MutNullableDom<HTMLFormElement>,
     labels_node_list: MutNullableDom<NodeList>,
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-elementinternals-states>
+    states: MutNullableDom<CustomStateSet>,
 }
 
 impl ElementInternals {
@@ -85,15 +96,16 @@ impl ElementInternals {
             state: DomRefCell::new(SubmissionValue::None),
             form_owner: MutNullableDom::new(None),
             labels_node_list: MutNullableDom::new(None),
+            states: MutNullableDom::new(None),
         }
     }
 
-    pub(crate) fn new(element: &HTMLElement, can_gc: CanGc) -> DomRoot<ElementInternals> {
+    pub(crate) fn new(cx: &mut JSContext, element: &HTMLElement) -> DomRoot<ElementInternals> {
         let global = element.owner_window();
-        reflect_dom_object(
+        reflect_dom_object_with_cx(
             Box::new(ElementInternals::new_inherited(element)),
             &*global,
-            can_gc,
+            cx,
         )
     }
 
@@ -107,14 +119,6 @@ impl ElementInternals {
 
     fn set_custom_validity_error_message(&self, message: DOMString) {
         *self.custom_validity_error_message.borrow_mut() = message;
-    }
-
-    fn set_submission_value(&self, value: SubmissionValue) {
-        *self.submission_value.borrow_mut() = value;
-    }
-
-    fn set_state(&self, value: SubmissionValue) {
-        *self.state.borrow_mut() = value;
     }
 
     pub(crate) fn set_form_owner(&self, form: Option<&HTMLFormElement>) {
@@ -149,7 +153,7 @@ impl ElementInternals {
         }
 
         if let SubmissionValue::FormData(datums) = &*self.submission_value.borrow() {
-            entry_list.extend(datums.iter().cloned());
+            entry_list.extend(datums.iter().map(|data| data.root()));
             return;
         }
         let name = self
@@ -181,10 +185,17 @@ impl ElementInternals {
         }
     }
 
-    pub(crate) fn is_invalid(&self) -> bool {
+    pub(crate) fn is_invalid(&self, cx: &mut JSContext) -> bool {
         self.is_target_form_associated() &&
             self.is_instance_validatable() &&
-            !self.satisfies_constraints()
+            !self.satisfies_constraints(cx)
+    }
+
+    pub(crate) fn custom_states_for_layout<'a>(&'a self) -> Option<LayoutDom<'a, CustomStateSet>> {
+        #[expect(unsafe_code)]
+        unsafe {
+            self.states.to_layout()
+        }
     }
 }
 
@@ -213,17 +224,19 @@ impl ElementInternalsMethods<crate::DomTypeHolder> for ElementInternals {
     ) -> ErrorResult {
         // Steps 1-2: If element is not a form-associated custom element, then throw a "NotSupportedError" DOMException
         if !self.is_target_form_associated() {
-            return Err(Error::NotSupported);
+            return Err(Error::NotSupported(Some(
+                "The target element is not a form-associated custom element".to_owned(),
+            )));
         }
 
         // Step 3: Set target element's submission value
-        self.set_submission_value(value.as_ref().into());
+        *self.submission_value.borrow_mut() = value.as_ref().into();
 
         match maybe_state {
             // Step 4: If the state argument of the function is omitted, set element's state to its submission value
-            None => self.set_state(value.as_ref().into()),
+            None => *self.state.borrow_mut() = value.as_ref().into(),
             // Steps 5-6: Otherwise, set element's state to state
-            Some(state) => self.set_state(state.as_ref().into()),
+            Some(state) => *self.state.borrow_mut() = state.as_ref().into(),
         }
         Ok(())
     }
@@ -231,14 +244,17 @@ impl ElementInternalsMethods<crate::DomTypeHolder> for ElementInternals {
     /// <https://html.spec.whatwg.org/multipage#dom-elementinternals-setvalidity>
     fn SetValidity(
         &self,
+        cx: &mut JSContext,
         flags: &ValidityStateFlags,
         message: Option<DOMString>,
         anchor: Option<&HTMLElement>,
-        can_gc: CanGc,
     ) -> ErrorResult {
-        // Steps 1-2: Check form-associated custom element
+        // Step 1. Let element be this's target element.
+        // Step 2: If element is not a form-associated custom element, then throw a "NotSupportedError" DOMException.
         if !self.is_target_form_associated() {
-            return Err(Error::NotSupported);
+            return Err(Error::NotSupported(Some(
+                "The target element is not a form-associated custom element".to_owned(),
+            )));
         }
 
         // Step 3: If flags contains one or more true values and message is not given or is the empty
@@ -246,15 +262,15 @@ impl ElementInternalsMethods<crate::DomTypeHolder> for ElementInternals {
         let bits: ValidationFlags = flags.into();
         if !bits.is_empty() && !message.as_ref().map_or_else(|| false, |m| !m.is_empty()) {
             return Err(Error::Type(
-                "Setting an element to invalid requires a message string as the second argument."
-                    .to_string(),
+                c"Setting an element to invalid requires a message string as the second argument."
+                    .to_owned(),
             ));
         }
 
         // Step 4: For each entry `flag` → `value` of `flags`, set element's validity flag with the name
         // `flag` to `value`.
-        self.validity_state().update_invalid_flags(bits);
-        self.validity_state().update_pseudo_classes(can_gc);
+        self.validity_state(cx).update_invalid_flags(bits);
+        self.validity_state(cx).update_pseudo_classes(cx);
 
         // Step 5: Set element's validation message to the empty string if message is not given
         // or all of element's validity flags are false, or to message otherwise.
@@ -273,21 +289,28 @@ impl ElementInternalsMethods<crate::DomTypeHolder> for ElementInternals {
             self.set_custom_validity_error_message(DOMString::new());
         }
 
-        // Step 7: Set element's validation anchor to null if anchor is not given.
-        match anchor {
-            None => self.validation_anchor.set(None),
-            Some(a) => {
-                if a == &*self.target_element ||
-                    !self
-                        .target_element
-                        .upcast::<Node>()
-                        .is_shadow_including_inclusive_ancestor_of(a.upcast::<Node>())
+        let anchor = match anchor {
+            // Step 7: If anchor is not given, then set it to element.
+            None => &self.target_element,
+            // Step 8. Otherwise, if anchor is not a shadow-including inclusive descendant of element,
+            // then throw a "NotFoundError" DOMException.
+            Some(anchor) => {
+                if !self
+                    .target_element
+                    .upcast::<Node>()
+                    .is_shadow_including_inclusive_ancestor_of(anchor.upcast::<Node>())
                 {
-                    return Err(Error::NotFound);
+                    return Err(Error::NotFound(Some(
+                        "The anchor element is not a shadow-including inclusive descendant of the target element".to_owned(),
+                    )));
                 }
-                self.validation_anchor.set(Some(a));
+                anchor
             },
-        }
+        };
+
+        // Step 9. Set element's validation anchor to anchor.
+        self.validation_anchor.set(Some(anchor));
+
         Ok(())
     }
 
@@ -296,29 +319,35 @@ impl ElementInternalsMethods<crate::DomTypeHolder> for ElementInternals {
         // This check isn't in the spec but it's in WPT tests and it maintains
         // consistency with other methods that do specify it
         if !self.is_target_form_associated() {
-            return Err(Error::NotSupported);
+            return Err(Error::NotSupported(Some(
+                "The target element is not a form-associated custom element".to_owned(),
+            )));
         }
         Ok(self.validation_message.borrow().clone())
     }
 
     /// <https://html.spec.whatwg.org/multipage#dom-elementinternals-validity>
-    fn GetValidity(&self) -> Fallible<DomRoot<ValidityState>> {
+    fn GetValidity(&self, cx: &mut JSContext) -> Fallible<DomRoot<ValidityState>> {
         if !self.is_target_form_associated() {
-            return Err(Error::NotSupported);
+            return Err(Error::NotSupported(Some(
+                "The target element is not a form-associated custom element".to_owned(),
+            )));
         }
-        Ok(self.validity_state())
+        Ok(self.validity_state(cx))
     }
 
     /// <https://html.spec.whatwg.org/multipage#dom-elementinternals-labels>
-    fn GetLabels(&self, can_gc: CanGc) -> Fallible<DomRoot<NodeList>> {
+    fn GetLabels(&self, cx: &mut JSContext) -> Fallible<DomRoot<NodeList>> {
         if !self.is_target_form_associated() {
-            return Err(Error::NotSupported);
+            return Err(Error::NotSupported(Some(
+                "The target element is not a form-associated custom element".to_owned(),
+            )));
         }
         Ok(self.labels_node_list.or_init(|| {
             NodeList::new_labels_list(
+                cx,
                 self.target_element.upcast::<Node>().owner_doc().window(),
                 &self.target_element,
-                can_gc,
             )
         }))
     }
@@ -326,7 +355,9 @@ impl ElementInternalsMethods<crate::DomTypeHolder> for ElementInternals {
     /// <https://html.spec.whatwg.org/multipage#dom-elementinternals-willvalidate>
     fn GetWillValidate(&self) -> Fallible<bool> {
         if !self.is_target_form_associated() {
-            return Err(Error::NotSupported);
+            return Err(Error::NotSupported(Some(
+                "The target element is not a form-associated custom element".to_owned(),
+            )));
         }
         Ok(self.is_instance_validatable())
     }
@@ -334,25 +365,42 @@ impl ElementInternalsMethods<crate::DomTypeHolder> for ElementInternals {
     /// <https://html.spec.whatwg.org/multipage#dom-elementinternals-form>
     fn GetForm(&self) -> Fallible<Option<DomRoot<HTMLFormElement>>> {
         if !self.is_target_form_associated() {
-            return Err(Error::NotSupported);
+            return Err(Error::NotSupported(Some(
+                "The target element is not a form-associated custom element".to_owned(),
+            )));
         }
         Ok(self.form_owner.get())
     }
 
     /// <https://html.spec.whatwg.org/multipage#dom-elementinternals-checkvalidity>
-    fn CheckValidity(&self, can_gc: CanGc) -> Fallible<bool> {
+    fn CheckValidity(&self, cx: &mut JSContext) -> Fallible<bool> {
         if !self.is_target_form_associated() {
-            return Err(Error::NotSupported);
+            return Err(Error::NotSupported(Some(
+                "The target element is not a form-associated custom element".to_owned(),
+            )));
         }
-        Ok(self.check_validity(can_gc))
+        Ok(self.check_validity(cx))
     }
 
     /// <https://html.spec.whatwg.org/multipage#dom-elementinternals-reportvalidity>
-    fn ReportValidity(&self, can_gc: CanGc) -> Fallible<bool> {
+    fn ReportValidity(&self, cx: &mut JSContext) -> Fallible<bool> {
         if !self.is_target_form_associated() {
-            return Err(Error::NotSupported);
+            return Err(Error::NotSupported(Some(
+                "The target element is not a form-associated custom element".to_owned(),
+            )));
         }
-        Ok(self.report_validity(can_gc))
+        Ok(self.report_validity(cx))
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-elementinternals-states>
+    fn States(&self, cx: &mut JSContext) -> DomRoot<CustomStateSet> {
+        self.states.or_init(|| {
+            CustomStateSet::new(
+                cx,
+                &self.target_element.owner_window(),
+                &self.target_element,
+            )
+        })
     }
 }
 
@@ -363,13 +411,13 @@ impl Validatable for ElementInternals {
         self.target_element.upcast::<Element>()
     }
 
-    fn validity_state(&self) -> DomRoot<ValidityState> {
+    fn validity_state(&self, cx: &mut JSContext) -> DomRoot<ValidityState> {
         debug_assert!(self.is_target_form_associated());
         self.validity_state.or_init(|| {
             ValidityState::new(
+                cx,
                 &self.target_element.owner_window(),
                 self.target_element.upcast(),
-                CanGc::note(),
             )
         })
     }

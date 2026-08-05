@@ -9,16 +9,16 @@
 
 import datetime
 import os
+from os import PathLike
 import os.path as path
 import pathlib
 import shutil
 import stat
+import subprocess
 import sys
 
 from time import time
-from typing import Optional
-
-import notifypy
+from typing import Optional, Union, Any
 
 from mach.decorators import (
     CommandArgument,
@@ -32,34 +32,77 @@ import servo.platform.macos
 import servo.util
 import servo.visual_studio
 
-from servo.command_base import BuildType, CommandBase, call, check_call
+from servo.command_base import BuildType, CommandBase, check_call
 from servo.gstreamer import windows_dlls, windows_plugins, package_gstreamer_dylibs
 from servo.platform.build_target import BuildTarget
 
-SUPPORTED_ASAN_TARGETS = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu",
-                          "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+from python.servo.platform.build_target import SanitizerKind
+
+SUPPORTED_ASAN_TARGETS = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-unknown-linux-ohos",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+]
+
+SUPPORTED_TSAN_TARGETS = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+]
+
+
+def get_rustc_llvm_version() -> Optional[list[int]]:
+    """Determine the LLVM version of `rustc` and return it as a List[major, minor, patch, ...]
+
+    In some cases we want to ensure that the LLVM version of rustc and clang match, e.g.
+    when using ASAN for both C/C++ and Rust code, we want to use the same ASAN implementation.
+    This function assumes that rustc points to the rust compiler we are interested in, which should
+    be valid in both rustup managed environment and on nix.
+    """
+    try:
+        result = subprocess.run(["rustc", "--version", "--verbose"], encoding="utf-8", capture_output=True)
+        result.check_returncode()
+        for line in result.stdout.splitlines():
+            line_lowercase = line.lower()
+            if line_lowercase.startswith("llvm version:"):
+                llvm_version = line_lowercase.strip("llvm version:")
+                llvm_version = llvm_version.strip()
+                version = llvm_version.split(".")
+                print(f"Info: rustc is using LLVM version {'.'.join(version)}")
+                return list(map(int, version))
+        else:
+            print(f"Error: Couldn't find LLVM version in output of `rustc --version --verbose`: `{result.stdout}`")
+    except Exception as e:
+        print(f"Error: Failed to determine rustc version: {e}")
+    return None
 
 
 @CommandProvider
 class MachCommands(CommandBase):
-    @Command('build', description='Build Servo', category='build')
-    @CommandArgument('--jobs', '-j',
-                     default=None,
-                     help='Number of jobs to run in parallel')
-    @CommandArgument('--no-package',
-                     action='store_true',
-                     help='For Android, disable packaging into a .apk after building')
-    @CommandArgument('--verbose', '-v',
-                     action='store_true',
-                     help='Print verbose output')
-    @CommandArgument('--very-verbose', '-vv',
-                     action='store_true',
-                     help='Print very verbose output')
-    @CommandArgument('params', nargs='...',
-                     help="Command-line arguments to be passed through to Cargo")
+    @Command("build", description="Build Servo", category="build")
+    @CommandArgument("--jobs", "-j", default=None, help="Number of jobs to run in parallel")
+    @CommandArgument(
+        "--no-package", action="store_true", help="For Android, disable packaging into a .apk after building"
+    )
+    @CommandArgument("--verbose", "-v", action="store_true", help="Print verbose output")
+    @CommandArgument("--very-verbose", "-vv", action="store_true", help="Print very verbose output")
+    @CommandArgument("params", nargs="...", help="Command-line arguments to be passed through to Cargo")
     @CommandBase.common_command_arguments(build_configuration=True, build_type=True, package_configuration=True)
-    def build(self, build_type: BuildType, jobs=None, params=None, no_package=False,
-              verbose=False, very_verbose=False, with_asan=False, flavor=None, **kwargs):
+    def build(
+        self,
+        build_type: BuildType,
+        jobs: str | None = None,
+        params: list[str] | None = None,
+        no_package: bool = False,
+        verbose: bool = False,
+        very_verbose: bool = False,
+        sanitizer: SanitizerKind = SanitizerKind.NONE,
+        flavor: str | None = None,
+        **kwargs: Any,
+    ) -> int:
         opts = params or []
 
         if build_type.is_release():
@@ -75,122 +118,125 @@ class MachCommands(CommandBase):
             opts += ["-v"]
         if very_verbose:
             opts += ["-vv"]
+        self.config["build"]["sanitizer"] = sanitizer
 
         env = self.build_env()
         self.ensure_bootstrapped()
-        self.ensure_clobbered()
 
         host = servo.platform.host_triple()
         target_triple = self.target.triple()
 
-        if with_asan:
-            if target_triple not in SUPPORTED_ASAN_TARGETS:
-                print("AddressSanitizer is currently not supported on this platform\n",
-                      "See https://doc.rust-lang.org/beta/unstable-book/compiler-flags/sanitizer.html")
-                sys.exit(1)
-
-            # do not use crown (clashes with different rust version)
-            env["RUSTC"] = "rustc"
-
-            # Enable usage of unstable rust flags
-            env["RUSTC_BOOTSTRAP"] = "1"
-
-            # Enable asan
-            env["RUSTFLAGS"] = env.get("RUSTFLAGS", "") + " -Zsanitizer=address"
-            opts += ["-Zbuild-std"]
+        if self.enable_code_coverage:
+            print("Building with code coverage instrumentation...")
+            # We don't want coverage for build-scripts and proc macros.
             kwargs["target_override"] = target_triple
-            # TODO: Investigate sanitizers in C/C++ code:
-            # env.setdefault("CFLAGS", "")
-            # env.setdefault("CXXFLAGS", "")
-            # env["CFLAGS"] += " -fsanitize=address"
-            # env["CXXFLAGS"] += " -fsanitize=address"
+            this_dir = pathlib.Path(os.path.dirname(__file__))
+            servo_root_dir = this_dir.parent.parent
+            coverage_workspace_wrapper = servo_root_dir.joinpath("etc/coverage_workspace_wrapper.py")
+            if not coverage_workspace_wrapper.exists():
+                print(
+                    f"Could not find rustc workspace wrapper script at expected location: {coverage_workspace_wrapper}"
+                )
+            env["RUSTC_WORKSPACE_WRAPPER"] = str(coverage_workspace_wrapper)
 
-            # asan replaces system allocator with asan allocator
-            # we need to make sure that we do not replace it with jemalloc
-            self.features.append("servo_allocator/use-system-allocator")
-
+        if sanitizer.is_some():
+            self.build_sanitizer_env(env, opts, kwargs, target_triple, sanitizer)
         build_start = time()
 
-        if host != target_triple and 'windows' in target_triple:
-            if os.environ.get('VisualStudioVersion') or os.environ.get('VCINSTALLDIR'):
-                print("Can't cross-compile for Windows inside of a Visual Studio shell.\n"
-                      "Please run `python mach build [arguments]` to bypass automatic "
-                      "Visual Studio shell, and make sure the VisualStudioVersion and "
-                      "VCINSTALLDIR environment variables are not set.")
+        if host != target_triple and "windows" in target_triple:
+            if os.environ.get("VisualStudioVersion") or os.environ.get("VCINSTALLDIR"):
+                print(
+                    "Can't cross-compile for Windows inside of a Visual Studio shell.\n"
+                    "Please run `python mach build [arguments]` to bypass automatic "
+                    "Visual Studio shell, and make sure the VisualStudioVersion and "
+                    "VCINSTALLDIR environment variables are not set."
+                )
                 sys.exit(1)
 
         # Gather Cargo build timings (https://doc.rust-lang.org/cargo/reference/timings.html).
         opts = ["--timings"] + opts
 
+        crown_enabled = "enabled" if kwargs.get("use_crown", False) else "disabled (no JS garbage collection linting)"
+        print(f"Building `{build_type.directory_name()}` build with crown {crown_enabled}.")
         if very_verbose:
-            print(["Calling", "cargo", "build"] + opts)
             for key in env:
                 print((key, env[key]))
 
-        status = self.run_cargo_build_like_command(
-            "rustc", opts, env=env, verbose=verbose, **kwargs)
+        status = self.run_cargo_build_like_command("rustc", opts, env=env, verbose=verbose, **kwargs)
 
         if status == 0:
-            built_binary = self.get_binary_path(build_type, asan=with_asan)
-
             if not no_package and self.target.needs_packaging():
-                rv = Registrar.dispatch("package", context=self.context, build_type=build_type, flavor=flavor)
-                if rv:
-                    return rv
+                return_value = Registrar.dispatch(
+                    "package", context=self.context, build_type=build_type, flavor=flavor, sanitizer=sanitizer
+                )
+                if return_value:
+                    return return_value
 
-            if "windows" in target_triple:
-                if not copy_windows_dlls_to_build_directory(built_binary, self.target):
-                    status = 1
+            return_value = self.run_post_build_tasks(build_type, sanitizer)
+            if return_value:
+                return return_value
 
-            elif "darwin" in target_triple:
-                servo_bin_dir = os.path.dirname(built_binary)
-                assert os.path.exists(servo_bin_dir)
-
-                if self.enable_media:
-                    library_target_directory = path.join(path.dirname(built_binary), "lib/")
-                    if not package_gstreamer_dylibs(built_binary, library_target_directory, self.target):
-                        return 1
-
-                # On the Mac, set a lovely icon. This makes it easier to pick out the Servo binary in tools
-                # like Instruments.app.
-                try:
-                    import Cocoa
-                    icon_path = path.join(self.get_top_dir(), "resources", "servo_1024.png")
-                    icon = Cocoa.NSImage.alloc().initWithContentsOfFile_(icon_path)
-                    if icon is not None:
-                        Cocoa.NSWorkspace.sharedWorkspace().setIcon_forFile_options_(icon,
-                                                                                     built_binary,
-                                                                                     0)
-                except ImportError:
-                    pass
-
-        # Generate Desktop Notification if elapsed-time > some threshold value
-
+        # Print how long the build took
         elapsed = time() - build_start
         elapsed_delta = datetime.timedelta(seconds=int(elapsed))
         build_message = f"{'Succeeded' if status == 0 else 'Failed'} in {elapsed_delta}"
-        self.notify("Servo build", build_message)
         print(build_message)
-
+        assert isinstance(status, int)
         return status
 
-    @Command('clean',
-             description='Clean the target/ and Python virtual environment directories',
-             category='build')
-    @CommandArgument('--manifest-path',
-                     default=None,
-                     help='Path to the manifest to the package to clean')
-    @CommandArgument('--verbose', '-v',
-                     action='store_true',
-                     help='Print verbose output')
-    @CommandArgument('params', nargs='...',
-                     help="Command-line arguments to be passed through to Cargo")
-    def clean(self, manifest_path=None, params=[], verbose=False):
+    @Command("run-post-build-tasks", description="Run only the post-build tasks", category="build")
+    @CommandBase.common_command_arguments(build_configuration=True, build_type=True)
+    def run_post_build_tasks_cmd(
+        self,
+        build_type: BuildType,
+        sanitizer: SanitizerKind = SanitizerKind.NONE,
+        **_kwargs: Any,
+    ) -> int:
+        return self.run_post_build_tasks(build_type, sanitizer)
+
+    def run_post_build_tasks(self, build_type: BuildType, sanitizer: SanitizerKind = SanitizerKind.NONE) -> int:
+        target_triple = self.target.triple()
+
+        built_binary = self.get_binary_path(build_type, sanitizer=sanitizer)
+        binary_dir = os.path.dirname(built_binary)
+        assert os.path.exists(binary_dir)
+
+        if "windows" in target_triple:
+            if not copy_windows_dlls_to_build_directory(built_binary, self.target):
+                return 1
+
+        elif "darwin" in target_triple:
+            servo_bin_dir = os.path.dirname(built_binary)
+            assert os.path.exists(servo_bin_dir)
+
+            if self.enable_media:
+                library_target_directory = path.join(path.dirname(built_binary), "lib/")
+                if not package_gstreamer_dylibs(built_binary, library_target_directory, self.target):
+                    return 1
+
+            # On the Mac, set a lovely icon. This makes it easier to pick out the Servo binary in tools
+            # like Instruments.app.
+            try:
+                import Cocoa  # pyrefly: ignore[missing-import]
+
+                icon_path = path.join(self.get_top_dir(), "resources", "servo_1024.png")
+                icon = Cocoa.NSImage.alloc().initWithContentsOfFile_(icon_path)
+                if icon is not None:
+                    Cocoa.NSWorkspace.sharedWorkspace().setIcon_forFile_options_(icon, built_binary, 0)
+            except ImportError:
+                pass
+        return 0
+
+    @Command("clean", description="Clean the target/ and Python virtual environment directories", category="build")
+    @CommandArgument("--manifest-path", default=None, help="Path to the manifest to the package to clean")
+    @CommandArgument("--verbose", "-v", action="store_true", help="Print verbose output")
+    @CommandArgument("params", nargs="...", help="Command-line arguments to be passed through to Cargo")
+    def clean(self, manifest_path: str | None = None, params: list[str] = [], verbose: bool = False) -> None:
         self.ensure_bootstrapped()
 
-        virtualenv_path = path.join(self.get_top_dir(), '.venv')
+        virtualenv_path = path.join(self.get_top_dir(), ".venv")
         if path.exists(virtualenv_path):
-            print('Removing virtualenv directory: %s' % virtualenv_path)
+            print("Removing virtualenv directory: %s" % virtualenv_path)
             shutil.rmtree(virtualenv_path)
 
         opts = ["--manifest-path", manifest_path or path.join(self.context.topdir, "Cargo.toml")]
@@ -199,56 +245,75 @@ class MachCommands(CommandBase):
         opts += params
         return check_call(["cargo", "clean"] + opts, env=self.build_env(), verbose=verbose)
 
-    def notify(self, title: str, message: str):
-        """Generate desktop notification when build is complete and the
-        elapsed build time was longer than 30 seconds.
+    def build_sanitizer_env(
+        self, env: dict, opts: list[str], kwargs: Any, target_triple: str, sanitizer: SanitizerKind = SanitizerKind.NONE
+    ) -> None:
+        if sanitizer.is_none():
+            return
+        # do not use crown (clashes with different rust version)
+        env["RUSTC"] = "rustc"
+        # Enable usage of unstable rust flags
+        env["RUSTC_BOOTSTRAP"] = "1"
+        # std library should also be instrumented
+        opts += ["-Zbuild-std"]
+        # We need to always set the target triple, even when building for host.
+        kwargs["target_override"] = target_triple
+        # When sanitizers are used we also want framepointers to help with backtraces.
+        if "force-frame-pointers" not in env["RUSTFLAGS"]:
+            env["RUSTFLAGS"] += " -C force-frame-pointers=yes"
 
-        If notify-command is set in the [tools] section of the configuration,
-        that is used instead."""
-        notify_command = self.config["tools"].get("notify-command")
-
-        # notifypy does not know how to send transient notifications, so we use a custom
-        # notifier on Linux. If transient notifications are not used, then notifications
-        # pile up in the notification center and must be cleared manually.
-        class LinuxNotifier(notifypy.BaseNotifier):
-            def __init__(self, **kwargs):
-                pass
-
-            def send_notification(self, **kwargs):
-                try:
-                    import dbus
-                    bus = dbus.SessionBus()
-                    notify_obj = bus.get_object("org.freedesktop.Notifications", "/org/freedesktop/Notifications")
-                    method = notify_obj.get_dbus_method("Notify", "org.freedesktop.Notifications")
-                    method(
-                        kwargs.get("application_name"),
-                        0,  # Don't replace previous notification.
-                        kwargs.get("notification_icon", ""),
-                        kwargs.get("notification_title"),
-                        kwargs.get("notification_subtitle"),
-                        [],  # actions
-                        {"transient": True},  # hints
-                        -1  # timeout
-                    )
-                except Exception as exception:
-                    print(f"[Warning] Could not generate notification: {exception}",
-                          file=sys.stderr)
-                return True
-
-        if notify_command:
-            if call([notify_command, title, message]) != 0:
-                print("[Warning] Could not generate notification: "
-                      f"Could not run '{notify_command}'.", file=sys.stderr)
+        # Note: We want to use the same clang/LLVM version as rustc.
+        rustc_llvm_version = get_rustc_llvm_version()
+        if rustc_llvm_version is None:
+            raise RuntimeError("Unable to determine necessary clang version for Sanitizer support")
+        llvm_major: int = rustc_llvm_version[0]
+        target_clang = f"clang-{llvm_major}"
+        target_cxx = f"clang++-{llvm_major}"
+        if shutil.which(target_clang) is None or shutil.which(target_cxx) is None:
+            env.setdefault("TARGET_CC", "clang")
+            env.setdefault("TARGET_CXX", "clang++")
         else:
-            try:
-                notifier = LinuxNotifier if sys.platform.startswith("linux") else None
-                notification = notifypy.Notify(use_custom_notifier=notifier)
-                notification.title = title
-                notification.message = message
-                notification.icon = path.join(self.get_top_dir(), "resources", "servo_64.png")
-                notification.send(block=False)
-            except notifypy.exceptions.UnsupportedPlatform as e:
-                print(f"[Warning] Could not generate notification: {e}", file=sys.stderr)
+            # libasan can be compatible across multiple compiler versions and has a
+            # runtime check, which would fail if we used incompatible compilers, so
+            # we can try and fallback to the default clang.
+            env.setdefault("TARGET_CC", target_clang)
+            env.setdefault("TARGET_CXX", target_cxx)
+        # By default, build mozjs from source to enable Sanitizers in mozjs.
+        env.setdefault("MOZJS_FROM_SOURCE", "1")
+
+        # We need to use `TARGET_CFLAGS`, since we don't want to compile host dependencies with ASAN,
+        # since that causes issues when building build-scripts / proc macros.
+        # The actual flags will be appended below depending on the sanitizer kind.
+        env.setdefault("TARGET_CFLAGS", "")
+        env.setdefault("TARGET_CXXFLAGS", "")
+        env.setdefault("RUSTFLAGS", "")
+
+        if sanitizer.is_asan():
+            if target_triple not in SUPPORTED_ASAN_TARGETS:
+                print(
+                    "AddressSanitizer is currently not supported on this platform\n",
+                    "See https://doc.rust-lang.org/beta/unstable-book/compiler-flags/sanitizer.html",
+                )
+                sys.exit(1)
+
+            # Enable asan
+            env["RUSTFLAGS"] += " -Zsanitizer=address"
+            env["TARGET_CFLAGS"] += " -fsanitize=address"
+            env["TARGET_CXXFLAGS"] += " -fsanitize=address"
+
+            # asan replaces system allocator with asan allocator
+            # we need to make sure that we do not replace it with jemalloc
+            self.features.append("servo-allocator/use-system-allocator")
+        elif sanitizer.is_tsan():
+            if target_triple not in SUPPORTED_TSAN_TARGETS:
+                print(
+                    "ThreadSanitizer is currently not supported on this platform\n",
+                    "See https://doc.rust-lang.org/beta/unstable-book/compiler-flags/sanitizer.html",
+                )
+                sys.exit(1)
+            env["RUSTFLAGS"] += " -Zsanitizer=thread"
+            env["TARGET_CFLAGS"] += " -fsanitize=thread"
+            env["TARGET_CXXFLAGS"] += " -fsanitize=thread"
 
 
 def copy_windows_dlls_to_build_directory(servo_binary: str, target: BuildTarget) -> bool:
@@ -260,7 +325,7 @@ def copy_windows_dlls_to_build_directory(servo_binary: str, target: BuildTarget)
 
     # Copy in the built EGL and GLES libraries from where they were built to
     # the final build dirctory
-    def find_and_copy_built_dll(dll_name):
+    def find_and_copy_built_dll(dll_name: str) -> None:
         try:
             file_to_copy = next(pathlib.Path(build_path).rglob(dll_name))
             shutil.copy(file_to_copy, servo_exe_dir)
@@ -282,7 +347,7 @@ def copy_windows_dlls_to_build_directory(servo_binary: str, target: BuildTarget)
     return True
 
 
-def package_gstreamer_dlls(servo_exe_dir: str, target: BuildTarget):
+def package_gstreamer_dlls(servo_exe_dir: str, target: BuildTarget) -> bool:
     gst_root = servo.platform.get().gstreamer_root(target)
     if not gst_root:
         print("Could not find GStreamer installation directory.")
@@ -321,8 +386,8 @@ def package_gstreamer_dlls(servo_exe_dir: str, target: BuildTarget):
     return not missing
 
 
-def package_msvc_dlls(servo_exe_dir: str, target: BuildTarget):
-    def copy_file(dll_path: Optional[str]) -> bool:
+def package_msvc_dlls(servo_exe_dir: str, target: BuildTarget) -> bool:
+    def copy_file(dll_path: Union[PathLike[str], str]) -> bool:
         if not dll_path or not os.path.exists(dll_path):
             print(f"WARNING: Could not find DLL at {dll_path}", file=sys.stderr)
             return False
@@ -338,11 +403,12 @@ def package_msvc_dlls(servo_exe_dir: str, target: BuildTarget):
         "x86_64": "x64",
         "i686": "x86",
         "aarch64": "arm64",
-    }[target.triple().split('-')[0]]
+    }[target.triple().split("-")[0]]
 
     for msvc_redist_dir in servo.visual_studio.find_msvc_redist_dirs(vs_platform):
-        if copy_file(os.path.join(msvc_redist_dir, "msvcp140.dll")) and \
-           copy_file(os.path.join(msvc_redist_dir, "vcruntime140.dll")):
+        if copy_file(os.path.join(msvc_redist_dir, "msvcp140.dll")) and copy_file(
+            os.path.join(msvc_redist_dir, "vcruntime140.dll")
+        ):
             break
 
     # Different SDKs install the file into different directory structures within the

@@ -2,33 +2,42 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-import os
-import sys
+# fmt: off
+
+from __future__ import annotations
+
 import json
+import os
 import re
+import sys
+from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 SCRIPT_PATH = os.path.abspath(os.path.dirname(__file__))
-SERVO_ROOT = os.path.abspath(os.path.join(SCRIPT_PATH, "..", "..", ".."))
+SCRIPT_BINDINGS_ROOT = os.path.abspath(os.path.join(SCRIPT_PATH, ".."))
 
 FILTER_PATTERN = re.compile("// skip-unless ([A-Z_]+)\n")
 
+if TYPE_CHECKING:
+    from configuration import Configuration
+    from WebIDL import Parser
 
-def main():
+def main() -> None:
     os.chdir(os.path.join(os.path.dirname(__file__)))
-    sys.path.insert(0, os.path.join(SERVO_ROOT, "third_party", "WebIDL"))
-    sys.path.insert(0, os.path.join(SERVO_ROOT, "third_party", "ply"))
+    sys.path.insert(0, os.path.join(SCRIPT_BINDINGS_ROOT, "third_party", "WebIDL", "parser"))
+    sys.path.insert(0, os.path.join(SCRIPT_BINDINGS_ROOT, "third_party", "ply"))
 
     css_properties_json, out_dir = sys.argv[1:]
     # Four dotdots: /path/to/target(4)/debug(3)/build(2)/style-*(1)/out
     # Do not ascend above the target dir, because it may not be called target
     # or even have a parent (see CARGO_TARGET_DIR).
     doc_servo = os.path.join(out_dir, "..", "..", "..", "..", "doc")
-    webidls_dir = os.path.join(SCRIPT_PATH, "..", "webidls")
+    webidls_dir = os.path.join(SCRIPT_BINDINGS_ROOT, "webidls")
     config_file = "Bindings.conf"
 
     import WebIDL
-    from Configuration import Configuration
-    from CodegenRust import CGBindingRoot, CGConcreteBindingRoot
+    from codegen import CGBindingRoot, CGConcreteBindingRoot
+    from configuration import Configuration
 
     parser = WebIDL.Parser(make_dir(os.path.join(out_dir, "cache")))
     webidls = [name for name in os.listdir(webidls_dir) if name.endswith(".webidl")]
@@ -49,6 +58,7 @@ def main():
     config = Configuration(config_file, parser_results)
     make_dir(os.path.join(out_dir, "Bindings"))
     make_dir(os.path.join(out_dir, "ConcreteBindings"))
+    make_dir(os.path.join(out_dir, "WebGPUConcreteBindings"))
 
     for name, filename in [
         ("PrototypeList", "PrototypeList.rs"),
@@ -61,15 +71,19 @@ def main():
         ("ConcreteInheritTypes", "ConcreteInheritTypes.rs"),
         ("Bindings", "Bindings/mod.rs"),
         ("Bindings", "ConcreteBindings/mod.rs"),
+        ("Bindings", "WebGPUConcreteBindings/mod.rs"),
         ("UnionTypes", "GenericUnionTypes.rs"),
         ("ConcreteUnionTypes", "UnionTypes.rs"),
         ("DomTypes", "DomTypes.rs"),
         ("DomTypeHolder", "DomTypeHolder.rs"),
+        ("ContentEventHandlerNames", "ContentEventHandlerNames.rs"),
     ]:
         generate(config, name, os.path.join(out_dir, filename))
     make_dir(doc_servo)
     generate(config, "SupportedDomApis", os.path.join(doc_servo, "apis.html"))
 
+    all_interface_descriptors = set(d.interface.identifier.name.replace('\'','') for d in config.descriptors)
+    s = set(item for item in config.sub_crates["script_webgpu"])
     for webidl in webidls:
         filename = os.path.join(webidls_dir, webidl)
         prefix = "Bindings/%sBinding" % webidl[:-len(".webidl")]
@@ -78,28 +92,37 @@ def main():
             with open(os.path.join(out_dir, prefix + ".rs"), "wb") as f:
                 f.write(module.encode("utf-8"))
         prefix = "ConcreteBindings/%sBinding" % webidl[:-len(".webidl")]
-        module = CGConcreteBindingRoot(config, prefix, filename).define()
+        module = CGConcreteBindingRoot(config, prefix, filename, only_interfaces = all_interface_descriptors -s).define()
+        if module:
+            with open(os.path.join(out_dir, prefix + ".rs"), "wb") as f:
+                f.write(module.encode("utf-8"))
+
+    for webidl in webidls:
+        filename = os.path.join(webidls_dir, webidl)
+        prefix = "ConcreteBindings/%sBinding" % webidl[:-len(".webidl")]
+        module = CGConcreteBindingRoot(config, prefix, filename, only_interfaces = s, generic=True).define()
+        prefix = "WebGPUConcreteBindings/%sBinding" % webidl[:-len(".webidl")]
         if module:
             with open(os.path.join(out_dir, prefix + ".rs"), "wb") as f:
                 f.write(module.encode("utf-8"))
 
 
-def make_dir(path):
+def make_dir(path: str)-> str:
     if not os.path.exists(path):
         os.makedirs(path)
     return path
 
 
-def generate(config, name, filename):
-    from CodegenRust import GlobalGenRoots
+def generate(config: Configuration, name: str, filename: str) -> None:
+    from codegen import GlobalGenRoots
     root = getattr(GlobalGenRoots, name)(config)
     code = root.define()
     with open(filename, "wb") as f:
         f.write(code.encode("utf-8"))
 
 
-def add_css_properties_attributes(css_properties_json, parser):
-    def map_preference_name(preference_name: str):
+def add_css_properties_attributes(css_properties_json: str, parser: Parser) -> None:
+    def map_preference_name(preference_name: str) -> str:
         """Map between Stylo preference names and Servo preference names as the
         `css-properties.json` file is generated by Stylo. This should be kept in sync with the
         preference mapping done in `components/servo_config/prefs.rs`, which handles the runtime version of
@@ -107,12 +130,15 @@ def add_css_properties_attributes(css_properties_json, parser):
         MAPPING = [
             ["layout.unimplemented", "layout_unimplemented"],
             ["layout.threads", "layout_threads"],
-            ["layout.flexbox.enabled", "layout_flexbox_enabled"],
             ["layout.columns.enabled", "layout_columns_enabled"],
             ["layout.grid.enabled", "layout_grid_enabled"],
-            ["layout.css.transition-behavior.enabled", "layout_css_transition_behavior_enabled"],
+            ["layout.css.alpha-color-function.enabled", "layout_css_alpha_color_function_enabled"],
+            ["layout.css.attr.enabled", "layout_css_attr_enabled"],
+            ["layout.css.ellipse-corners.enabled", "layout_css_ellipse_corners_enabled"],
+            ["layout.css.progress-function.enabled", "layout_css_progress_function_enabled"],
             ["layout.writing-mode.enabled", "layout_writing_mode_enabled"],
             ["layout.container-queries.enabled", "layout_container_queries_enabled"],
+            ["layout.variable_fonts.enabled", "layout_variable_fonts_enabled"]
         ]
         for mapping in MAPPING:
             if mapping[0] == preference_name:
@@ -132,36 +158,55 @@ def add_css_properties_attributes(css_properties_json, parser):
     parser.parse(idl, "CSSStyleDeclaration_generated.webidl")
 
 
-def attribute_names(property_name):
+def attribute_names(property_name: str) -> Iterator[str]:
     # https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-dashed-attribute
     if property_name != "float":
         yield property_name
     else:
         yield "_float"
 
-    # https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-camel-cased-attribute
+    # From https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-camel-cased-attribute
+    # The camel-cased attribute attribute, on getting, must return the result of invoking
+    # getPropertyValue() with the argument being the result of running the IDL attribute
+    # to CSS property algorithm for camel-cased attribute.
     if "-" in property_name:
-        yield "".join(camel_case(property_name))
+        yield "".join(camel_case(property_name, False))
 
-    # https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-webkit-cased-attribute
-    if property_name.startswith("-webkit-"):
-        yield "".join(camel_case(property_name), True)
+    # For each CSS property property that is a supported CSS property and that begins with
+    # the string -webkit-, the following partial interface applies where webkit-cased
+    # attribute is obtained by running the CSS property to IDL attribute algorithm for
+    # property, with the lowercase first flag set.
+    if property_name.startswith("-webkit"):
+        yield "".join(camel_case(property_name, True))
+
 
 
 # https://drafts.csswg.org/cssom/#css-property-to-idl-attribute
-def camel_case(chars, webkit_prefixed=False):
-    if webkit_prefixed:
-        chars = chars[1:]
-    next_is_uppercase = False
-    for c in chars:
-        if c == '-':
-            next_is_uppercase = True
-        elif next_is_uppercase:
-            next_is_uppercase = False
+def camel_case(property: str, lowercase_first: bool) -> Iterator[str]:
+    # The CSS property to IDL attribute algorithm for property, optionally with a
+    # *lowercase first* flag set, is as follows:
+    # Step 1. Let output be the empty string.
+    # Step 2. Let *uppercase next* be unset.
+    uppercase_next = False
+
+    # Step 3: If the *lowercase first* flag is set, remove the first character from property.
+    if lowercase_first:
+        property = property[1:]
+
+    # Step 4. For each character c in property:
+    for character in property:
+        # Step 4.1: If c is "-" (U+002D), let *uppercase next* be set.
+        if character == '-':
+            uppercase_next = True
+        # Step 4.2: Otherwise, if *uppercase next* is set, let *uppercase next* be unset and
+        #           append c converted to ASCII uppercase to output.
+        elif uppercase_next:
+            uppercase_next = False
             # Should be ASCII-uppercase, but all non-custom CSS property names are within ASCII
-            yield c.upper()
+            yield character.upper()
+        # Otherwise, append c to output.
         else:
-            yield c
+            yield character
 
 
 if __name__ == "__main__":

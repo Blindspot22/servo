@@ -9,7 +9,7 @@ typedef sequence<ClipboardItem> ClipboardItems;
 [SecureContext, Exposed=Window, Pref="dom_async_clipboard_enabled"]
 interface Clipboard : EventTarget {
   // Promise<ClipboardItems> read();
-  // Promise<DOMString> readText();
+  Promise<DOMString> readText();
   // Promise<undefined> write(ClipboardItems data);
   Promise<undefined> writeText(DOMString data);
 };
@@ -24,9 +24,9 @@ interface ClipboardItem {
   readonly attribute PresentationStyle presentationStyle;
   readonly attribute /* FrozenArray<DOMString> */ any types;
 
-  // Promise<Blob> getType(DOMString type);
+  [Throws] Promise<Blob> getType(DOMString type);
 
-  // static boolean supports(DOMString type);
+  static boolean supports(DOMString type);
 };
 
 enum PresentationStyle { "unspecified", "inline", "attachment" };

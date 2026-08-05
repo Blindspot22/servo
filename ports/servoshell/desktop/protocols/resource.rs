@@ -13,13 +13,10 @@ use std::io::BufReader;
 use std::pin::Pin;
 
 use headers::{ContentType, HeaderMapExt};
-use net::fetch::methods::{DoneChannel, FetchContext};
-use net::filemanager_thread::FILE_CHUNK_SIZE;
-use net::protocols::ProtocolHandler;
-use net_traits::ResourceFetchTiming;
-use net_traits::filemanager_thread::RelativePos;
-use net_traits::request::Request;
-use net_traits::response::{Response, ResponseBody};
+use servo::protocol_handler::{
+    DoneChannel, FILE_CHUNK_SIZE, FetchContext, NetworkError, ProtocolHandler, RelativePos,
+    Request, ResourceFetchTiming, Response, ResponseBody,
+};
 use tokio::sync::mpsc::unbounded_channel;
 
 #[derive(Default)]
@@ -33,26 +30,24 @@ impl ResourceProtocolHandler {
         path: &str,
     ) -> Pin<Box<dyn Future<Output = Response> + Send>> {
         if path.contains("..") || !path.starts_with("/") {
-            return Box::pin(std::future::ready(Response::network_internal_error(
-                "Invalid path",
+            return Box::pin(std::future::ready(Response::network_error(
+                NetworkError::ResourceLoadError("Invalid path".to_owned()),
             )));
         }
 
         let path = if let Some(path) = path.strip_prefix("/") {
             path
         } else {
-            return Box::pin(std::future::ready(Response::network_internal_error(
-                "Invalid path",
+            return Box::pin(std::future::ready(Response::network_error(
+                NetworkError::ResourceLoadError("Invalid path".to_owned()),
             )));
         };
 
-        let file_path = crate::resources::resources_dir_path()
-            .join("resource_protocol")
-            .join(path);
+        let file_path = crate::resources::resource_protocol_dir_path().join(path);
 
         if !file_path.exists() || file_path.is_dir() {
-            return Box::pin(std::future::ready(Response::network_internal_error(
-                "Invalid path",
+            return Box::pin(std::future::ready(Response::network_error(
+                NetworkError::ResourceLoadError("Invalid path".to_owned()),
             )));
         }
 
@@ -72,9 +67,9 @@ impl ResourceProtocolHandler {
             let (mut done_sender, done_receiver) = unbounded_channel();
             *done_chan = Some((done_sender.clone(), done_receiver));
 
-            *response.body.lock().unwrap() = ResponseBody::Receiving(vec![]);
+            *response.body.lock() = ResponseBody::Receiving(vec![]);
 
-            context.filemanager.lock().unwrap().fetch_file_in_chunks(
+            context.filemanager.fetch_file_in_chunks(
                 &mut done_sender,
                 reader,
                 response.body.clone(),
@@ -84,7 +79,9 @@ impl ResourceProtocolHandler {
 
             response
         } else {
-            Response::network_internal_error("Opening file failed")
+            Response::network_error(NetworkError::ResourceLoadError(
+                "Opening file failed".to_owned(),
+            ))
         };
 
         Box::pin(std::future::ready(response))

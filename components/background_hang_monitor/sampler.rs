@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::marker::PhantomData;
 use std::ptr;
 
 use background_hang_monitor_api::{HangProfile, HangProfileSymbol};
@@ -12,15 +13,8 @@ pub trait Sampler: Send {
     fn suspend_and_sample_thread(&self) -> Result<NativeStack, ()>;
 }
 
-#[allow(dead_code)]
-pub struct DummySampler;
-
-impl DummySampler {
-    #[allow(dead_code)]
-    pub fn new_boxed() -> Box<dyn Sampler> {
-        Box::new(DummySampler)
-    }
-}
+// Implementing this type on `PhantomData` allows avoiding dead code warnings.
+pub(crate) type DummySampler = PhantomData<()>;
 
 impl Sampler for DummySampler {
     fn suspend_and_sample_thread(&self) -> Result<NativeStack, ()> {
@@ -28,41 +22,31 @@ impl Sampler for DummySampler {
     }
 }
 
-// Several types in this file are currently not used in a Linux or Windows build.
-#[allow(dead_code)]
-pub type Address = *const u8;
-
-/// The registers used for stack unwinding
-#[allow(dead_code)]
-pub struct Registers {
-    /// Instruction pointer.
-    pub instruction_ptr: Address,
-    /// Stack pointer.
-    pub stack_ptr: Address,
-    /// Frame pointer.
-    pub frame_ptr: Address,
-}
-
-#[allow(dead_code)]
 pub struct NativeStack {
     instruction_ptrs: [*mut std::ffi::c_void; MAX_NATIVE_FRAMES],
-    #[allow(dead_code)]
     stack_ptrs: [*mut std::ffi::c_void; MAX_NATIVE_FRAMES],
-    #[allow(dead_code)]
     count: usize,
 }
 
-impl NativeStack {
-    #[allow(dead_code)]
-    pub fn new() -> Self {
+impl Default for NativeStack {
+    fn default() -> Self {
         NativeStack {
             instruction_ptrs: [ptr::null_mut(); MAX_NATIVE_FRAMES],
             stack_ptrs: [ptr::null_mut(); MAX_NATIVE_FRAMES],
             count: 0,
         }
     }
+}
 
-    #[allow(dead_code)]
+impl NativeStack {
+    #[cfg_attr(
+        any(
+            target_os = "windows",
+            target_env = "ohos",
+            all(target_os = "linux", target_arch = "aarch64")
+        ),
+        expect(dead_code)
+    )]
     pub fn process_register(
         &mut self,
         instruction_ptr: *mut std::ffi::c_void,
@@ -86,10 +70,15 @@ impl NativeStack {
                 continue;
             }
             backtrace::resolve(*ip, |symbol| {
-                // TODO: use the demangled or C++ demangled symbols if available.
                 let name = symbol
                     .name()
                     .map(|n| String::from_utf8_lossy(n.as_bytes()).to_string());
+                // demangle if possible -
+                // the `rustc_demangle` crate transparently supports both
+                // "legacy" (C++ style) and "v0" mangling formats.
+                #[cfg(feature = "sampler")]
+                let name = name.map(|n| rustc_demangle::demangle(&n).to_string());
+
                 let filename = symbol.filename().map(|n| n.to_string_lossy().to_string());
                 let lineno = symbol.lineno();
                 profile.backtrace.push(HangProfileSymbol {

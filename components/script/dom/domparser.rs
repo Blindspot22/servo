@@ -4,6 +4,7 @@
 
 use dom_struct::dom_struct;
 use js::rust::HandleObject;
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 use script_traits::DocumentActivity;
 
 use crate::document_loader::DocumentLoader;
@@ -14,14 +15,13 @@ use crate::dom::bindings::codegen::Bindings::DOMParserBinding::SupportedType::{
 };
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::DocumentReadyState;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
+use crate::dom::bindings::codegen::UnionTypes::TrustedHTMLOrString;
 use crate::dom::bindings::error::Fallible;
-use crate::dom::bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 use crate::dom::bindings::root::{Dom, DomRoot};
-use crate::dom::bindings::str::DOMString;
 use crate::dom::document::{Document, DocumentSource, HasBrowsingContext, IsHTMLDocument};
 use crate::dom::servoparser::ServoParser;
+use crate::dom::trustedtypes::trustedhtml::TrustedHTML;
 use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct DOMParser {
@@ -37,12 +37,16 @@ impl DOMParser {
         }
     }
 
-    fn new(window: &Window, proto: Option<HandleObject>, can_gc: CanGc) -> DomRoot<DOMParser> {
+    fn new(
+        cx: &mut js::context::JSContext,
+        window: &Window,
+        proto: Option<HandleObject>,
+    ) -> DomRoot<DOMParser> {
         reflect_dom_object_with_proto(
+            cx,
             Box::new(DOMParser::new_inherited(window)),
             window,
             proto,
-            can_gc,
         )
     }
 }
@@ -50,20 +54,29 @@ impl DOMParser {
 impl DOMParserMethods<crate::DomTypeHolder> for DOMParser {
     /// <https://html.spec.whatwg.org/multipage/#dom-domparser-constructor>
     fn Constructor(
+        cx: &mut js::context::JSContext,
         window: &Window,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
     ) -> Fallible<DomRoot<DOMParser>> {
-        Ok(DOMParser::new(window, proto, can_gc))
+        Ok(DOMParser::new(cx, window, proto))
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-domparser-parsefromstring>
     fn ParseFromString(
         &self,
-        s: DOMString,
+        cx: &mut js::context::JSContext,
+        s: TrustedHTMLOrString,
         ty: DOMParserBinding::SupportedType,
-        can_gc: CanGc,
     ) -> Fallible<DomRoot<Document>> {
+        // Step 1. Let compliantString be the result of invoking the
+        // Get Trusted Type compliant string algorithm with TrustedHTML,
+        // this's relevant global object, string, "DOMParser parseFromString", and "script".
+        let compliant_string = TrustedHTML::get_trusted_type_compliant_string(
+            cx,
+            self.window.as_global_scope(),
+            s,
+            "DOMParser parseFromString",
+        )?;
         let url = self.window.get_url();
         let content_type = ty
             .as_str()
@@ -71,12 +84,17 @@ impl DOMParserMethods<crate::DomTypeHolder> for DOMParser {
             .expect("Supported type is not a MIME type");
         let doc = self.window.Document();
         let loader = DocumentLoader::new(&doc.loader());
-        match ty {
+        // Step 3. Switch on type:
+        let document = match ty {
             Text_html => {
+                // Step 2. Let document be a new Document, whose content type is type
+                // and URL is this's relevant global object's associated Document's URL.
                 let document = Document::new(
+                    cx,
                     &self.window,
                     HasBrowsingContext::No,
                     Some(url.clone()),
+                    None,
                     doc.origin().clone(),
                     IsHTMLDocument::HTMLDocument,
                     Some(content_type),
@@ -91,17 +109,31 @@ impl DOMParserMethods<crate::DomTypeHolder> for DOMParser {
                     false,
                     Some(doc.insecure_requests_policy()),
                     doc.has_trustworthy_ancestor_or_current_origin(),
-                    can_gc,
+                    doc.custom_element_reaction_stack(),
+                    doc.creation_sandboxing_flag_set(),
+                    doc.pipeline_id(),
+                    doc.image_cache(),
                 );
-                ServoParser::parse_html_document(&document, Some(s), url, can_gc);
-                document.set_ready_state(DocumentReadyState::Complete, can_gc);
-                Ok(document)
+                // Step switch-1. Parse HTML from a string given document and compliantString.
+                ServoParser::parse_html_document(
+                    cx,
+                    &document,
+                    Some(compliant_string),
+                    url,
+                    None,
+                    None,
+                );
+                document
             },
             Text_xml | Application_xml | Application_xhtml_xml | Image_svg_xml => {
+                // Step 2. Let document be a new Document, whose content type is type
+                // and URL is this's relevant global object's associated Document's URL.
                 let document = Document::new(
+                    cx,
                     &self.window,
                     HasBrowsingContext::No,
                     Some(url.clone()),
+                    None,
                     doc.origin().clone(),
                     IsHTMLDocument::NonHTMLDocument,
                     Some(content_type),
@@ -116,12 +148,19 @@ impl DOMParserMethods<crate::DomTypeHolder> for DOMParser {
                     false,
                     Some(doc.insecure_requests_policy()),
                     doc.has_trustworthy_ancestor_or_current_origin(),
-                    can_gc,
+                    doc.custom_element_reaction_stack(),
+                    doc.creation_sandboxing_flag_set(),
+                    doc.pipeline_id(),
+                    doc.image_cache(),
                 );
-                ServoParser::parse_xml_document(&document, Some(s), url, can_gc);
-                document.set_ready_state(DocumentReadyState::Complete, can_gc);
-                Ok(document)
+                // Step switch-1. Create an XML parser parser, associated with document,
+                // and with XML scripting support disabled.
+                ServoParser::parse_xml_document(cx, &document, Some(compliant_string), url, None);
+                document.set_ready_state(cx, DocumentReadyState::Complete);
+                document
             },
-        }
+        };
+        // Step 4. Return document.
+        Ok(document)
     }
 }

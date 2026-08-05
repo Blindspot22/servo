@@ -21,33 +21,34 @@ import logging
 import re
 import shutil
 import subprocess
-
+from dataclasses import field
 from typing import Callable, Optional
 
-from .common import \
-    CLOSING_EXISTING_UPSTREAM_PR, \
-    NO_SYNC_SIGNAL, \
-    NO_UPSTREAMBLE_CHANGES_COMMENT, \
-    OPENED_NEW_UPSTREAM_PR, \
-    UPDATED_EXISTING_UPSTREAM_PR, \
-    UPDATED_TITLE_IN_EXISTING_UPSTREAM_PR, \
-    UPSTREAMABLE_PATH, \
-    wpt_branch_name_from_servo_pr_number
-
+from .common import (
+    CLOSING_EXISTING_UPSTREAM_PR,
+    NO_SYNC_SIGNAL,
+    NO_UPSTREAMBLE_CHANGES_COMMENT,
+    OPENED_NEW_UPSTREAM_PR,
+    UPDATED_EXISTING_UPSTREAM_PR,
+    UPDATED_TITLE_IN_EXISTING_UPSTREAM_PR,
+    UPSTREAMABLE_PATH,
+    wpt_branch_name_from_servo_pr_number,
+)
 from .github import GithubRepository, PullRequest
-from .step import \
-    AsyncValue, \
-    ChangePRStep, \
-    CommentStep, \
-    CreateOrUpdateBranchForPRStep, \
-    MergePRStep, \
-    OpenPRStep, \
-    RemoveBranchForPRStep, \
-    Step
+from .step import (
+    AsyncValue,
+    ChangePRStep,
+    CommentStep,
+    CreateOrUpdateBranchForPRStep,
+    MergePRStep,
+    OpenPRStep,
+    RemoveBranchForPRStep,
+    Step,
+)
 
 
 class LocalGitRepo:
-    def __init__(self, path: str, sync: WPTSync):
+    def __init__(self, path: str, sync: WPTSync) -> None:
         self.path = path
         self.sync = sync
 
@@ -55,10 +56,11 @@ class LocalGitRepo:
         # git in advance and run the subprocess by its absolute path.
         self.git_path = shutil.which("git")
 
-    def run_without_encoding(self, *args, env: dict = {}):
+    def run_without_encoding(self, *args: str, env: dict = {}) -> bytes:
+        if self.git_path is None:
+            raise RuntimeError("Git executable not found in PATH")
         command_line = [self.git_path] + list(args)
-        logging.info("  → Execution (cwd='%s'): %s",
-                     self.path, " ".join(command_line))
+        logging.info("  → Execution (cwd='%s'): %s", self.path, " ".join(command_line))
 
         env.setdefault("GIT_AUTHOR_EMAIL", self.sync.github_email)
         env.setdefault("GIT_COMMITTER_EMAIL", self.sync.github_email)
@@ -66,20 +68,15 @@ class LocalGitRepo:
         env.setdefault("GIT_COMMITTER_NAME", self.sync.github_name)
 
         try:
-            return subprocess.check_output(
-                command_line, cwd=self.path, env=env, stderr=subprocess.STDOUT
-            )
+            return subprocess.check_output(command_line, cwd=self.path, env=env, stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as exception:
-            logging.warning("Process execution failed with output:\n%s",
-                            exception.output.decode("utf-8", errors="surrogateescape"))
+            logging.warning(
+                "Process execution failed with output:\n%s", exception.output.decode("utf-8", errors="surrogateescape")
+            )
             raise exception
 
-    def run(self, *args, env: dict = {}):
-        return (
-            self
-            .run_without_encoding(*args, env=env)
-            .decode("utf-8", errors="surrogateescape")
-        )
+    def run(self, *args: str, env: dict = {}) -> str:
+        return self.run_without_encoding(*args, env=env).decode("utf-8", errors="surrogateescape")
 
 
 @dataclasses.dataclass()
@@ -97,11 +94,19 @@ class SyncRun:
             servo_pr=self.servo_pr,
         )
 
-    def add_step(self, step) -> Optional[AsyncValue]:
+    def add_step(
+        self,
+        step: ChangePRStep
+        | CommentStep
+        | CreateOrUpdateBranchForPRStep
+        | MergePRStep
+        | OpenPRStep
+        | RemoveBranchForPRStep,
+    ) -> Optional[AsyncValue]:
         self.steps.append(step)
         return step.provides()
 
-    def run(self):
+    def run(self) -> None:
         # This loop always removes the first step and runs it, because
         # individual steps can modify the list of steps. For instance, if a
         # step fails, it might clear the remaining steps and replace them with
@@ -146,19 +151,25 @@ class WPTSync:
     github_name: str
     suppress_force_push: bool = False
 
-    def __post_init__(self):
+    servo: GithubRepository = field(init=False)
+    wpt: GithubRepository = field(init=False)
+    downstream_wpt: GithubRepository = field(init=False)
+    local_servo_repo: LocalGitRepo = field(init=False)
+    local_wpt_repo: LocalGitRepo = field(init=False)
+
+    def __post_init__(self) -> None:
         self.servo = GithubRepository(self, self.servo_repo, "main")
         self.wpt = GithubRepository(self, self.wpt_repo, "master")
         self.downstream_wpt = GithubRepository(self, self.downstream_wpt_repo, "master")
         self.local_servo_repo = LocalGitRepo(self.servo_path, self)
         self.local_wpt_repo = LocalGitRepo(self.wpt_path, self)
 
-    def run(self, payload: dict, step_callback=None) -> bool:
+    def run(self, payload: dict, step_callback: Callable[[Step], None] | None = None) -> bool:
         if "pull_request" not in payload:
             return True
 
         pull_data = payload["pull_request"]
-        if NO_SYNC_SIGNAL in pull_data.get("body", ""):
+        if NO_SYNC_SIGNAL in (pull_data.get("body") or ""):
             return True
 
         # Only look for an existing remote PR if the action is appropriate.
@@ -167,27 +178,19 @@ class WPTSync:
         if action not in ["opened", "synchronize", "reopened", "edited", "closed"]:
             return True
 
-        if (
-            action == "edited"
-            and "title" not in payload["changes"]
-            and "body" not in payload["changes"]
-        ):
+        if action == "edited" and "title" not in payload["changes"] and "body" not in payload["changes"]:
             return True
 
         try:
             servo_pr = self.servo.get_pull_request(pull_data["number"])
             downstream_wpt_branch = self.downstream_wpt.get_branch(
-                wpt_branch_name_from_servo_pr_number(servo_pr.number)
+                wpt_branch_name_from_servo_pr_number(str(servo_pr.number))
             )
-            upstream_pr = self.wpt.get_open_pull_request_for_branch(
-                self.github_username, downstream_wpt_branch
-            )
+            upstream_pr = self.wpt.get_open_pull_request_for_branch(self.github_username, downstream_wpt_branch)
             if upstream_pr:
-                logging.info(
-                    "  → Detected existing upstream PR %s", upstream_pr)
+                logging.info("  → Detected existing upstream PR %s", upstream_pr)
 
-            run = SyncRun(self, servo_pr, AsyncValue(
-                upstream_pr), step_callback)
+            run = SyncRun(self, servo_pr, AsyncValue(upstream_pr), step_callback)
 
             pull_data = payload["pull_request"]
             if payload["action"] in ["opened", "synchronize", "reopened"]:
@@ -206,54 +209,48 @@ class WPTSync:
             logging.error(exception, exc_info=True)
             return False
 
-    def handle_new_pull_request_contents(self, run: SyncRun, pull_data: dict):
+    def handle_new_pull_request_contents(self, run: SyncRun, pull_data: dict) -> None:
         num_commits = pull_data["commits"]
         head_sha = pull_data["head"]["sha"]
         is_upstreamable = (
-            len(
-                self.local_servo_repo.run(
-                    "diff", head_sha, f"{head_sha}~{num_commits}", "--", UPSTREAMABLE_PATH
-                )
-            )
-            > 0
+            len(self.local_servo_repo.run("diff", head_sha, f"{head_sha}~{num_commits}", "--", UPSTREAMABLE_PATH)) > 0
         )
         logging.info("  → PR is upstreamable: '%s'", is_upstreamable)
 
-        title = pull_data['title']
-        body = pull_data['body']
+        title = pull_data["title"]
+        body = pull_data["body"] or ""
         if run.upstream_pr.has_value():
             if is_upstreamable:
                 # In case this is adding new upstreamable changes to a PR that was closed
                 # due to a lack of upstreamable changes, force it to be reopened.
                 # Github refuses to reopen a PR that had a branch force pushed, so be sure
                 # to do this first.
-                run.add_step(ChangePRStep(
-                    run.upstream_pr.value(), "opened", title, body))
+                run.add_step(ChangePRStep(run.upstream_pr.value(), "opened", title, body))
                 # Push the relevant changes to the upstream branch.
-                run.add_step(CreateOrUpdateBranchForPRStep(
-                    pull_data, run.servo_pr))
-                run.add_step(CommentStep(
-                    run.servo_pr, UPDATED_EXISTING_UPSTREAM_PR))
+                run.add_step(CreateOrUpdateBranchForPRStep(pull_data, run.servo_pr))
+                run.add_step(CommentStep(run.servo_pr, UPDATED_EXISTING_UPSTREAM_PR))
             else:
                 # Close the upstream PR, since would contain no changes otherwise.
-                run.add_step(CommentStep(run.upstream_pr.value(),
-                             NO_UPSTREAMBLE_CHANGES_COMMENT))
+                run.add_step(CommentStep(run.upstream_pr.value(), NO_UPSTREAMBLE_CHANGES_COMMENT))
                 run.add_step(ChangePRStep(run.upstream_pr.value(), "closed"))
                 run.add_step(RemoveBranchForPRStep(pull_data))
-                run.add_step(CommentStep(
-                    run.servo_pr, CLOSING_EXISTING_UPSTREAM_PR))
+                run.add_step(CommentStep(run.servo_pr, CLOSING_EXISTING_UPSTREAM_PR))
 
         elif is_upstreamable:
             # Push the relevant changes to a new upstream branch.
-            branch = run.add_step(
-                CreateOrUpdateBranchForPRStep(pull_data, run.servo_pr))
+            branch = run.add_step(CreateOrUpdateBranchForPRStep(pull_data, run.servo_pr))
 
             # Create a pull request against the upstream repository for the new branch.
             assert branch
-            upstream_pr = run.add_step(OpenPRStep(
-                branch, self.wpt, title, body,
-                ["servo-export", "do not merge yet"],
-            ))
+            upstream_pr = run.add_step(
+                OpenPRStep(
+                    branch,
+                    self.wpt,
+                    title,
+                    body,
+                    ["servo-export", "do not merge yet"],
+                )
+            )
 
             assert upstream_pr
             run.upstream_pr = upstream_pr
@@ -261,17 +258,13 @@ class WPTSync:
             # Leave a comment to the new pull request in the original pull request.
             run.add_step(CommentStep(run.servo_pr, OPENED_NEW_UPSTREAM_PR))
 
-    def handle_edited_pull_request(self, run: SyncRun, pull_data: dict):
+    def handle_edited_pull_request(self, run: SyncRun, pull_data: dict) -> None:
         logging.info("Changing upstream PR title")
         if run.upstream_pr.has_value():
-            run.add_step(ChangePRStep(
-                run.upstream_pr.value(
-                ), "open", pull_data["title"], pull_data["body"]
-            ))
-            run.add_step(CommentStep(
-                run.servo_pr, UPDATED_TITLE_IN_EXISTING_UPSTREAM_PR))
+            run.add_step(ChangePRStep(run.upstream_pr.value(), "open", pull_data["title"], pull_data["body"]))
+            run.add_step(CommentStep(run.servo_pr, UPDATED_TITLE_IN_EXISTING_UPSTREAM_PR))
 
-    def handle_closed_pull_request(self, run: SyncRun, pull_data: dict):
+    def handle_closed_pull_request(self, run: SyncRun, pull_data: dict) -> None:
         logging.info("Processing closed PR")
         if not run.upstream_pr.has_value():
             # If we don't recognize this PR, it never contained upstreamable changes.
@@ -279,8 +272,7 @@ class WPTSync:
         if pull_data["merged"]:
             # Since the upstreamable changes have now been merged locally, merge the
             # corresponding upstream PR.
-            run.add_step(MergePRStep(
-                run.upstream_pr.value(), ["do not merge yet"]))
+            run.add_step(MergePRStep(run.upstream_pr.value(), ["do not merge yet"]))
         else:
             # If a PR with upstreamable changes is closed without being merged, we
             # don't want to merge the changes upstream either.

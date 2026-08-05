@@ -2,162 +2,98 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::net::TcpStream;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use devtools_traits::NetworkEvent;
 use serde::Serialize;
 
-use crate::actor::ActorRegistry;
-use crate::actors::network_event::{EventActor, NetworkEventActor, ResponseStartMsg};
-use crate::protocol::JsonPacketStream;
+use crate::actor::{ActorEncode, ActorRegistry};
+use crate::actors::browsing_context::BrowsingContextActor;
+use crate::actors::network_event::NetworkEventActor;
+use crate::actors::watcher::WatcherActor;
+use crate::protocol::DevtoolsConnection;
+use crate::resource::{ResourceArrayType, ResourceAvailable};
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct NetworkEventMsg {
-    from: String,
+pub(crate) struct Cause {
     #[serde(rename = "type")]
-    type_: String,
-    event_actor: EventActor,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct NetworkEventUpdateMsg {
-    from: String,
-    #[serde(rename = "type")]
-    type_: String,
-    update_type: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ResponseStartUpdateMsg {
-    from: String,
-    #[serde(rename = "type")]
-    type_: String,
-    update_type: String,
-    response: ResponseStartMsg,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct EventTimingsUpdateMsg {
-    total_time: u64,
-}
-
-#[derive(Serialize)]
-struct SecurityInfoUpdateMsg {
-    state: String,
+    pub type_: String,
+    pub loading_document_uri: Option<String>,
 }
 
 pub(crate) fn handle_network_event(
-    actors: Arc<Mutex<ActorRegistry>>,
-    console_actor_name: String,
-    netevent_actor_name: String,
-    mut connections: Vec<TcpStream>,
+    registry: Arc<ActorRegistry>,
+    network_event_name: String,
+    mut connections: Vec<DevtoolsConnection>,
     network_event: NetworkEvent,
 ) {
-    let mut actors = actors.lock().unwrap();
-    let actor = actors.find_mut::<NetworkEventActor>(&netevent_actor_name);
+    let network_event_actor = registry.find::<NetworkEventActor>(&network_event_name);
+    let browsing_context_actor =
+        registry.find::<BrowsingContextActor>(&network_event_actor.browsing_context_name);
+    let watcher_actor = registry.find::<WatcherActor>(&browsing_context_actor.watcher_name);
 
     match network_event {
         NetworkEvent::HttpRequest(httprequest) => {
-            // Store the request information in the actor
-            actor.add_request(httprequest);
+            network_event_actor.add_request(httprequest);
+            let msg = network_event_actor.encode(&registry);
+            let resource = network_event_actor.resource_updates(&registry);
 
-            // Send a networkEvent message to the client
-            let msg = NetworkEventMsg {
-                from: console_actor_name,
-                type_: "networkEvent".to_owned(),
-                event_actor: actor.event_actor(),
-            };
             for stream in &mut connections {
-                let _ = stream.write_json_packet(&msg);
+                watcher_actor.resource_array(
+                    msg.clone(),
+                    "network-event".to_string(),
+                    ResourceArrayType::Available,
+                    stream,
+                );
+
+                // Also push initial resource update (request headers, cookies)
+                watcher_actor.resource_array(
+                    resource.clone(),
+                    "network-event".to_string(),
+                    ResourceArrayType::Updated,
+                    stream,
+                );
+            }
+        },
+
+        NetworkEvent::HttpRequestUpdate(httprequest) => {
+            network_event_actor.add_request(httprequest);
+            let resource = network_event_actor.resource_updates(&registry);
+
+            for stream in &mut connections {
+                watcher_actor.resource_array(
+                    resource.clone(),
+                    "network-event".to_string(),
+                    ResourceArrayType::Updated,
+                    stream,
+                );
             }
         },
         NetworkEvent::HttpResponse(httpresponse) => {
-            // Store the response information in the actor
-            actor.add_response(httpresponse);
+            network_event_actor.add_response(httpresponse);
+            let resource = network_event_actor.resource_updates(&registry);
 
-            let msg = NetworkEventUpdateMsg {
-                from: netevent_actor_name.clone(),
-                type_: "networkEventUpdate".to_owned(),
-                update_type: "requestHeaders".to_owned(),
-            };
             for stream in &mut connections {
-                let _ = stream.write_merged_json_packet(&msg, &actor.request_headers());
+                watcher_actor.resource_array(
+                    resource.clone(),
+                    "network-event".to_string(),
+                    ResourceArrayType::Updated,
+                    stream,
+                );
             }
-
-            let msg = NetworkEventUpdateMsg {
-                from: netevent_actor_name.clone(),
-                type_: "networkEventUpdate".to_owned(),
-                update_type: "requestCookies".to_owned(),
-            };
-            for stream in &mut connections {
-                let _ = stream.write_merged_json_packet(&msg, &actor.request_cookies());
-            }
-
-            // Send a networkEventUpdate (responseStart) to the client
-            let msg = ResponseStartUpdateMsg {
-                from: netevent_actor_name.clone(),
-                type_: "networkEventUpdate".to_owned(),
-                update_type: "responseStart".to_owned(),
-                response: actor.response_start(),
-            };
+        },
+        NetworkEvent::SecurityInfo(update) => {
+            network_event_actor.add_security_info(update.security_info);
+            let resource = network_event_actor.resource_updates(&registry);
 
             for stream in &mut connections {
-                let _ = stream.write_json_packet(&msg);
-            }
-            let msg = NetworkEventUpdateMsg {
-                from: netevent_actor_name.clone(),
-                type_: "networkEventUpdate".to_owned(),
-                update_type: "eventTimings".to_owned(),
-            };
-            let extra = EventTimingsUpdateMsg {
-                total_time: actor.total_time().as_millis() as u64,
-            };
-            for stream in &mut connections {
-                let _ = stream.write_merged_json_packet(&msg, &extra);
-            }
-
-            let msg = NetworkEventUpdateMsg {
-                from: netevent_actor_name.clone(),
-                type_: "networkEventUpdate".to_owned(),
-                update_type: "securityInfo".to_owned(),
-            };
-            let extra = SecurityInfoUpdateMsg {
-                state: "insecure".to_owned(),
-            };
-            for stream in &mut connections {
-                let _ = stream.write_merged_json_packet(&msg, &extra);
-            }
-
-            let msg = NetworkEventUpdateMsg {
-                from: netevent_actor_name.clone(),
-                type_: "networkEventUpdate".to_owned(),
-                update_type: "responseContent".to_owned(),
-            };
-            for stream in &mut connections {
-                let _ = stream.write_merged_json_packet(&msg, &actor.response_content());
-            }
-
-            let msg = NetworkEventUpdateMsg {
-                from: netevent_actor_name.clone(),
-                type_: "networkEventUpdate".to_owned(),
-                update_type: "responseCookies".to_owned(),
-            };
-            for stream in &mut connections {
-                let _ = stream.write_merged_json_packet(&msg, &actor.response_cookies());
-            }
-
-            let msg = NetworkEventUpdateMsg {
-                from: netevent_actor_name,
-                type_: "networkEventUpdate".to_owned(),
-                update_type: "responseHeaders".to_owned(),
-            };
-            for stream in &mut connections {
-                let _ = stream.write_merged_json_packet(&msg, &actor.response_headers());
+                watcher_actor.resource_array(
+                    resource.clone(),
+                    "network-event".to_string(),
+                    ResourceArrayType::Updated,
+                    stream,
+                );
             }
         },
     }

@@ -27,7 +27,6 @@ interface mixin WebGL2RenderingContextBase
   const GLenum STENCIL                                       = 0x1802;
   const GLenum RED                                           = 0x1903;
   const GLenum RGB8                                          = 0x8051;
-  const GLenum RGBA8                                         = 0x8058;
   const GLenum RGB10_A2                                      = 0x8059;
   const GLenum TEXTURE_BINDING_3D                            = 0x806A;
   const GLenum UNPACK_SKIP_IMAGES                            = 0x806D;
@@ -322,9 +321,9 @@ interface mixin WebGL2RenderingContextBase
   //void texImage3D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height,
   //                GLsizei depth, GLint border, GLenum format, GLenum type,
   //                TexImageSource source); // May throw DOMException
-  //[Throws]
-  //void texImage3D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height,
-  //                GLsizei depth, GLint border, GLenum format, GLenum type, [AllowShared] ArrayBufferView? srcData);
+  [Throws]
+  undefined texImage3D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height,
+                  GLsizei depth, GLint border, GLenum format, GLenum type, /*[AllowShared]*/ ArrayBufferView? srcData);
   //[Throws]
   //void texImage3D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height,
   //                GLsizei depth, GLint border, GLenum format, GLenum type, [AllowShared] ArrayBufferView srcData,

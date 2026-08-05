@@ -7,7 +7,7 @@ use std::future::{Future, ready};
 use std::io::{BufReader, Seek, SeekFrom};
 use std::pin::Pin;
 
-use headers::{ContentType, HeaderMapExt, Range};
+use headers::{ContentLength, ContentRange, ContentType, HeaderMapExt, Range};
 use http::Method;
 use net_traits::request::Request;
 use net_traits::response::{Response, ResponseBody};
@@ -25,24 +25,22 @@ use crate::protocols::{
 pub struct FileProtocolHander {}
 
 impl ProtocolHandler for FileProtocolHander {
-    fn load(
-        &self,
-        request: &mut Request,
+    fn load<'a>(
+        &'a self,
+        request: &'a mut Request,
         done_chan: &mut DoneChannel,
         context: &FetchContext,
-    ) -> Pin<Box<dyn Future<Output = Response> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = Response> + Send + 'a>> {
         let url = request.current_url();
 
         if request.method != Method::GET {
-            return Box::pin(ready(Response::network_error(NetworkError::Internal(
-                "Unexpected method for file".into(),
-            ))));
+            return Box::pin(ready(Response::network_error(NetworkError::InvalidMethod)));
         }
         let response = if let Ok(file_path) = url.to_file_path() {
             if file_path.is_dir() {
-                return Box::pin(ready(local_directory_listing::fetch(
-                    request, url, file_path,
-                )));
+                return Box::pin(async move {
+                    local_directory_listing::fetch(request, url, file_path).await
+                });
             }
 
             if let Ok(file) = File::open(file_path.clone()) {
@@ -66,15 +64,29 @@ impl ProtocolHandler for FileProtocolHander {
                 };
                 let mut reader = BufReader::with_capacity(FILE_CHUNK_SIZE, file);
                 if reader.seek(SeekFrom::Start(range.start as u64)).is_err() {
-                    return Box::pin(ready(Response::network_error(NetworkError::Internal(
-                        "Unexpected method for file".into(),
-                    ))));
+                    return Box::pin(ready(Response::network_error(NetworkError::InvalidMethod)));
                 }
 
                 // Set response status to 206 if Range header is present.
                 // At this point we should have already validated the header.
                 if is_range_request {
                     partial_content(&mut response);
+                }
+
+                // Set Content-Length and Content-Range headers when end is determinable.
+                let end_byte = range.end.map(|e| e as u64).or(file_size);
+                if let Some(end_byte) = end_byte {
+                    let start_byte = range.start as u64;
+
+                    response
+                        .headers
+                        .typed_insert(ContentLength(end_byte - start_byte));
+                    if is_range_request &&
+                        let Ok(content_range) =
+                            ContentRange::bytes(start_byte..end_byte, file_size)
+                    {
+                        response.headers.typed_insert(content_range);
+                    }
                 }
 
                 // Set Content-Type header.
@@ -86,9 +98,9 @@ impl ProtocolHandler for FileProtocolHander {
                 let (mut done_sender, done_receiver) = unbounded_channel();
                 *done_chan = Some((done_sender.clone(), done_receiver));
 
-                *response.body.lock().unwrap() = ResponseBody::Receiving(vec![]);
+                *response.body.lock() = ResponseBody::Receiving(vec![]);
 
-                context.filemanager.lock().unwrap().fetch_file_in_chunks(
+                context.filemanager.fetch_file_in_chunks(
                     &mut done_sender,
                     reader,
                     response.body.clone(),
@@ -98,10 +110,12 @@ impl ProtocolHandler for FileProtocolHander {
 
                 response
             } else {
-                Response::network_error(NetworkError::Internal("Opening file failed".into()))
+                Response::network_error(NetworkError::ResourceLoadError(
+                    "Opening file failed".into(),
+                ))
             }
         } else {
-            Response::network_error(NetworkError::Internal(
+            Response::network_error(NetworkError::ResourceLoadError(
                 "Constructing file path failed".into(),
             ))
         };

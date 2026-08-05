@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 // https://dom.spec.whatwg.org/#interface-xpathresult
-[Exposed=Window, Pref="dom_xpath_enabled"]
+[Exposed=Window]
 interface XPathResult {
   const unsigned short ANY_TYPE = 0;
   const unsigned short NUMBER_TYPE = 1;
@@ -21,7 +21,7 @@ interface XPathResult {
   [Throws] readonly attribute DOMString stringValue;
   [Throws] readonly attribute boolean booleanValue;
   [Throws] readonly attribute Node? singleNodeValue;
-  [Throws] readonly attribute boolean invalidIteratorState;
+  readonly attribute boolean invalidIteratorState;
   [Throws] readonly attribute unsigned long snapshotLength;
 
   [Throws] Node? iterateNext();

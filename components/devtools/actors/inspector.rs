@@ -4,33 +4,35 @@
 
 //! Liberally derived from the [Firefox JS implementation](http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/inspector.js).
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::net::TcpStream;
+use std::sync::Arc;
 
-use devtools_traits::DevtoolScriptControlMsg;
-use devtools_traits::DevtoolScriptControlMsg::GetRootNode;
-use ipc_channel::ipc::{self, IpcSender};
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{self, Map, Value};
 
-use crate::StreamId;
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
-use crate::actors::browsing_context::BrowsingContextActor;
-use crate::actors::inspector::highlighter::{HighlighterActor, HighlighterMsg};
-use crate::actors::inspector::node::NodeInfoToProtocol;
+use crate::actor::{Actor, ActorError, ActorRegistry, new_actor_name};
+use crate::actors::inspector::highlighter::HighlighterActor;
 use crate::actors::inspector::page_style::{PageStyleActor, PageStyleMsg};
 use crate::actors::inspector::walker::{WalkerActor, WalkerMsg};
-use crate::protocol::JsonPacketStream;
+use crate::protocol::ClientRequest;
+use crate::{ActorMsg, StreamId};
 
 pub mod accessibility;
+pub mod accessible_walker;
 pub mod css_properties;
 pub mod highlighter;
 pub mod layout;
 pub mod node;
 pub mod page_style;
+pub mod simulator;
 pub mod style_rule;
 pub mod walker;
+
+#[derive(Serialize)]
+struct GetHighlighterReply {
+    from: String,
+    highlighter: ActorMsg,
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,140 +53,79 @@ struct SupportsHighlightersReply {
     value: bool,
 }
 
-#[derive(Serialize)]
-struct GetHighlighterReply {
-    from: String,
-    highlighter: HighlighterMsg,
-}
-
-pub struct InspectorActor {
-    pub name: String,
-    pub walker: RefCell<Option<String>>,
-    pub page_style: RefCell<Option<String>>,
-    pub highlighter: RefCell<Option<String>>,
-    pub script_chan: IpcSender<DevtoolScriptControlMsg>,
-    pub browsing_context: String,
+#[derive(MallocSizeOf)]
+pub(crate) struct InspectorActor {
+    name: String,
+    highlighter_name: String,
+    page_style_name: String,
+    pub(crate) walker_name: String,
 }
 
 impl Actor for InspectorActor {
-    fn name(&self) -> String {
-        self.name.clone()
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn handle_message(
         &self,
+        request: ClientRequest,
         registry: &ActorRegistry,
         msg_type: &str,
         _msg: &Map<String, Value>,
-        stream: &mut TcpStream,
         _id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
-        let browsing_context = registry.find::<BrowsingContextActor>(&self.browsing_context);
-        let pipeline = browsing_context.active_pipeline_id.get();
-        Ok(match msg_type {
-            "getWalker" => {
-                let (tx, rx) = ipc::channel().unwrap();
-                self.script_chan.send(GetRootNode(pipeline, tx)).unwrap();
-                let root_info = rx.recv().unwrap().ok_or(())?;
-
-                let name = self
-                    .walker
-                    .borrow()
-                    .clone()
-                    .unwrap_or_else(|| registry.new_name("walker"));
-
-                let root = root_info.encode(
-                    registry,
-                    false,
-                    self.script_chan.clone(),
-                    pipeline,
-                    name.clone(),
-                );
-
-                if self.walker.borrow().is_none() {
-                    let walker = WalkerActor {
-                        name,
-                        script_chan: self.script_chan.clone(),
-                        pipeline,
-                        root_node: root.clone(),
-                        mutations: RefCell::new(vec![]),
-                    };
-                    let mut walker_name = self.walker.borrow_mut();
-                    *walker_name = Some(walker.name());
-                    registry.register_later(Box::new(walker));
-                }
-
-                let msg = GetWalkerReply {
-                    from: self.name(),
-                    walker: WalkerMsg {
-                        actor: self.walker.borrow().clone().unwrap(),
-                        root,
-                    },
+    ) -> Result<(), ActorError> {
+        match msg_type {
+            "getPageStyle" => {
+                let msg = GetPageStyleReply {
+                    from: self.name().into(),
+                    page_style: registry.encode::<PageStyleActor, _>(&self.page_style_name),
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
 
-            "getPageStyle" => {
-                if self.page_style.borrow().is_none() {
-                    let style = PageStyleActor {
-                        name: registry.new_name("page-style"),
-                        script_chan: self.script_chan.clone(),
-                        pipeline,
-                    };
-                    let mut page_style = self.page_style.borrow_mut();
-                    *page_style = Some(style.name());
-                    registry.register_later(Box::new(style));
-                }
-
-                let msg = GetPageStyleReply {
-                    from: self.name(),
-                    page_style: PageStyleMsg {
-                        actor: self.page_style.borrow().clone().unwrap(),
-                        traits: HashMap::from([
-                            ("fontStretchLevel4".into(), true),
-                            ("fontStyleLevel4".into(), true),
-                            ("fontVariations".into(), true),
-                            ("fontWeightLevel4".into(), true),
-                        ]),
-                    },
+            "getHighlighterByType" => {
+                let msg = GetHighlighterReply {
+                    from: self.name().into(),
+                    highlighter: registry.encode::<HighlighterActor, _>(&self.highlighter_name),
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
+            },
+
+            "getWalker" => {
+                let msg = GetWalkerReply {
+                    from: self.name().into(),
+                    walker: registry.encode::<WalkerActor, _>(&self.walker_name),
+                };
+                request.reply_final(&msg)?
             },
 
             "supportsHighlighters" => {
                 let msg = SupportsHighlightersReply {
-                    from: self.name(),
+                    from: self.name().into(),
                     value: true,
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
 
-            "getHighlighterByType" => {
-                if self.highlighter.borrow().is_none() {
-                    let highlighter_actor = HighlighterActor {
-                        name: registry.new_name("highlighter"),
-                        pipeline,
-                        script_sender: self.script_chan.clone(),
-                    };
-                    let mut highlighter = self.highlighter.borrow_mut();
-                    *highlighter = Some(highlighter_actor.name());
-                    registry.register_later(Box::new(highlighter_actor));
-                }
+            _ => return Err(ActorError::UnrecognizedPacketType),
+        };
+        Ok(())
+    }
+}
 
-                let msg = GetHighlighterReply {
-                    from: self.name(),
-                    highlighter: HighlighterMsg {
-                        actor: self.highlighter.borrow().clone().unwrap(),
-                    },
-                };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
-            },
+impl InspectorActor {
+    pub fn register(registry: &ActorRegistry, browsing_context_name: String) -> Arc<Self> {
+        let highlighter_actor = HighlighterActor::register(registry, browsing_context_name.clone());
+        let page_style_actor = PageStyleActor::register(registry);
+        let walker_actor = WalkerActor::register(registry, browsing_context_name);
 
-            _ => ActorMessageStatus::Ignored,
-        })
+        let actor = Self {
+            name: new_actor_name::<InspectorActor>(),
+            highlighter_name: highlighter_actor.name().into(),
+            page_style_name: page_style_actor.name().into(),
+            walker_name: walker_actor.name().into(),
+        };
+
+        registry.register::<Self>(actor)
     }
 }

@@ -15,7 +15,6 @@
   [PutForwards=href, LegacyUnforgeable, CrossOriginReadable, CrossOriginWritable]
     readonly attribute Location location;
   readonly attribute History history;
-  [Pref="dom_customelements_enabled"]
   readonly attribute CustomElementRegistry customElements;
   //[Replaceable] readonly attribute BarProp locationbar;
   //[Replaceable] readonly attribute BarProp menubar;
@@ -49,6 +48,7 @@
 
   // the user agent
   readonly attribute Navigator navigator;
+  [Replaceable] readonly attribute Navigator clientInformation;
   //[Replaceable] readonly attribute External external;
   //readonly attribute ApplicationCache applicationCache;
 
@@ -103,6 +103,7 @@ dictionary ScrollToOptions : ScrollOptions {
 partial interface Window {
   [Exposed=(Window), NewObject] MediaQueryList matchMedia(DOMString query);
   [SameObject, Replaceable] readonly attribute Screen screen;
+  [Pref="dom_visual_viewport_enabled", SameObject, Replaceable] readonly attribute VisualViewport? visualViewport;
 
   // browsing context
   undefined moveTo(long x, long y);
@@ -128,20 +129,12 @@ partial interface Window {
 
   // client
   [Replaceable] readonly attribute long screenX;
+  [Replaceable] readonly attribute long screenLeft;
   [Replaceable] readonly attribute long screenY;
+  [Replaceable] readonly attribute long screenTop;
   [Replaceable] readonly attribute long outerWidth;
   [Replaceable] readonly attribute long outerHeight;
   [Replaceable] readonly attribute double devicePixelRatio;
-};
-
-// Proprietary extensions.
-partial interface Window {
-  [Pref="dom_servo_helpers_enabled"]
-  undefined debug(DOMString arg);
-  [Pref="dom_servo_helpers_enabled"]
-  undefined gc();
-  [Pref="dom_servo_helpers_enabled"]
-  undefined js_backtrace();
 };
 
 // WebDriver extensions
@@ -149,22 +142,21 @@ partial interface Window {
   // Shouldn't be public, but just to make things work for now
   undefined webdriverCallback(optional any result);
   undefined webdriverException(optional any result);
-  undefined webdriverTimeout();
   Element? webdriverElement(DOMString id);
-  Element? webdriverFrame(DOMString id);
-  Window? webdriverWindow(DOMString id);
+  WindowProxy? webdriverFrame(DOMString id);
+  WindowProxy webdriverWindow(DOMString id);
   ShadowRoot? webdriverShadowRoot(DOMString id);
 };
 
 // https://html.spec.whatwg.org/multipage/#dom-sessionstorage
 interface mixin WindowSessionStorage {
-  readonly attribute Storage sessionStorage;
+  [Throws] readonly attribute Storage sessionStorage;
 };
 Window includes WindowSessionStorage;
 
 // https://html.spec.whatwg.org/multipage/#dom-localstorage
 interface mixin WindowLocalStorage {
-  readonly attribute Storage localStorage;
+  [Throws] readonly attribute Storage localStorage;
 };
 Window includes WindowLocalStorage;
 
@@ -188,4 +180,13 @@ partial interface Window {
 
 dictionary WindowPostMessageOptions : StructuredSerializeOptions {
    USVString targetOrigin = "/";
+};
+
+// https://fetch.spec.whatwg.org/#fetch-method
+dictionary DeferredRequestInit : RequestInit {
+  DOMHighResTimeStamp activateAfter;
+};
+
+partial interface Window {
+  [NewObject, SecureContext, Throws] FetchLaterResult fetchLater(RequestInfo input, optional DeferredRequestInit init = {});
 };

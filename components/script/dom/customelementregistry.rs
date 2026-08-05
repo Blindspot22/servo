@@ -5,50 +5,56 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::CStr;
+use std::ptr::NonNull;
 use std::rc::Rc;
 use std::{mem, ptr};
 
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Namespace, Prefix, ns};
-use js::conversions::ToJSValConvertible;
+use js::context::JSContext;
+use js::conversions::{FromJSValConvertible, ToJSValConvertible};
 use js::glue::UnwrapObjectStatic;
-use js::jsapi::{HandleValueArray, Heap, IsCallable, IsConstructor, JSAutoRealm, JSObject};
+use js::jsapi::{HandleValueArray, Heap, IsCallable, IsConstructor, JSObject};
 use js::jsval::{BooleanValue, JSVal, NullValue, ObjectValue, UndefinedValue};
-use js::rust::wrappers::{Construct1, JS_GetProperty, SameValue};
-use js::rust::{HandleObject, HandleValue, MutableHandleValue};
+use js::realm::{AutoRealm, CurrentRealm};
+use js::rust::wrappers2::{Construct1, JS_GetProperty, SameValue};
+use js::rust::{HandleObject, MutableHandleValue};
+use rustc_hash::FxBuildHasher;
+use script_bindings::cell::DomRefCell;
+use script_bindings::reflector::{DomObject, Reflector, reflect_dom_object_with_proto};
+use script_bindings::settings_stack::{run_a_callback, run_a_script};
+use style::attr::AttrValue;
 
 use super::bindings::trace::HashMapTracedValues;
+use crate::DomTypeHolder;
 use crate::dom::bindings::callback::{CallbackContainer, ExceptionHandling};
-use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::CustomElementRegistryBinding::{
     CustomElementConstructor, CustomElementRegistryMethods, ElementDefinitionOptions,
 };
 use crate::dom::bindings::codegen::Bindings::ElementBinding::ElementMethods;
 use crate::dom::bindings::codegen::Bindings::FunctionBinding::Function;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::Window_Binding::WindowMethods;
-use crate::dom::bindings::conversions::{
-    ConversionResult, FromJSValConvertible, StringificationBehavior,
-};
+use crate::dom::bindings::conversions::{ConversionResult, StringificationBehavior, get_property};
 use crate::dom::bindings::error::{
     Error, ErrorResult, Fallible, report_pending_exception, throw_dom_exception,
 };
-use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::{DomGlobal, DomObject, Reflector, reflect_dom_object};
-use crate::dom::bindings::root::{Dom, DomRoot};
-use crate::dom::bindings::settings_stack::is_execution_stack_empty;
+use crate::dom::bindings::inheritance::{Castable, DocumentFragmentTypeId, NodeTypeId};
+use crate::dom::bindings::reflector::DomGlobal;
+use crate::dom::bindings::root::{AsHandleValue, Dom, DomRoot, UnrootedDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
 use crate::dom::domexception::{DOMErrorName, DOMException};
 use crate::dom::element::Element;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::htmlelement::HTMLElement;
-use crate::dom::htmlformelement::{FormControl, HTMLFormElement};
-use crate::dom::node::{Node, NodeTraits, ShadowIncluding};
+use crate::dom::html::htmlelement::HTMLElement;
+use crate::dom::html::htmlformelement::{FormControl, HTMLFormElement};
+use crate::dom::iterators::ShadowIncluding;
+use crate::dom::node::{Node, NodeTraits};
 use crate::dom::promise::Promise;
+use crate::dom::shadowroot::ShadowRoot;
 use crate::dom::window::Window;
-use crate::microtask::Microtask;
-use crate::realms::{InRealm, enter_realm};
-use crate::script_runtime::{CanGc, JSContext};
+use crate::microtask::CustomElementReactionMicrotask;
+use crate::realms::enter_auto_realm;
 use crate::script_thread::ScriptThread;
 
 /// <https://dom.spec.whatwg.org/#concept-element-custom-element-state>
@@ -69,13 +75,25 @@ pub(crate) struct CustomElementRegistry {
 
     window: Dom<Window>,
 
-    #[ignore_malloc_size_of = "Rc"]
-    when_defined: DomRefCell<HashMapTracedValues<LocalName, Rc<Promise>>>,
+    #[conditional_malloc_size_of]
+    /// It is safe to use FxBuildHasher here as `LocalName` is an `Atom` in the string_cache.
+    /// These get a u32 hashed instead of a string.
+    /// <https://html.spec.whatwg.org/multipage/#when-defined-promise-map>
+    when_defined: DomRefCell<HashMapTracedValues<LocalName, Rc<Promise>, FxBuildHasher>>,
 
+    /// <https://html.spec.whatwg.org/multipage/#element-definition-is-running>
     element_definition_is_running: Cell<bool>,
 
-    #[ignore_malloc_size_of = "Rc"]
-    definitions: DomRefCell<HashMapTracedValues<LocalName, Rc<CustomElementDefinition>>>,
+    /// <https://html.spec.whatwg.org/multipage/#is-scoped>
+    is_scoped: Cell<bool>,
+
+    /// <https://html.spec.whatwg.org/multipage/#scoped-document-set>
+    scoped_document_set: DomRefCell<Vec<Dom<Document>>>,
+
+    #[conditional_malloc_size_of]
+    /// <https://html.spec.whatwg.org/multipage/#custom-element-definition-set>
+    definitions:
+        DomRefCell<HashMapTracedValues<LocalName, Rc<CustomElementDefinition>, FxBuildHasher>>,
 }
 
 impl CustomElementRegistry {
@@ -83,18 +101,34 @@ impl CustomElementRegistry {
         CustomElementRegistry {
             reflector_: Reflector::new(),
             window: Dom::from_ref(window),
-            when_defined: DomRefCell::new(HashMapTracedValues::new()),
+            when_defined: DomRefCell::new(HashMapTracedValues::new_fx()),
             element_definition_is_running: Cell::new(false),
-            definitions: DomRefCell::new(HashMapTracedValues::new()),
+            is_scoped: Cell::new(false),
+            scoped_document_set: DomRefCell::new(Vec::new()),
+            definitions: DomRefCell::new(HashMapTracedValues::new_fx()),
         }
     }
 
-    pub(crate) fn new(window: &Window, can_gc: CanGc) -> DomRoot<CustomElementRegistry> {
-        reflect_dom_object(
+    pub(crate) fn new(cx: &mut JSContext, window: &Window) -> DomRoot<CustomElementRegistry> {
+        CustomElementRegistry::new_with_proto(cx, window, None)
+    }
+
+    fn new_with_proto(
+        cx: &mut JSContext,
+        window: &Window,
+        proto: Option<HandleObject>,
+    ) -> DomRoot<CustomElementRegistry> {
+        reflect_dom_object_with_proto(
+            cx,
             Box::new(CustomElementRegistry::new_inherited(window)),
             window,
-            can_gc,
+            proto,
         )
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#is-scoped>
+    pub(crate) fn is_scoped(&self) -> bool {
+        self.is_scoped.get()
     }
 
     /// Cleans up any active promises
@@ -103,24 +137,9 @@ impl CustomElementRegistry {
         self.when_defined.borrow_mut().0.clear()
     }
 
-    /// <https://html.spec.whatwg.org/multipage/#look-up-a-custom-element-definition>
-    pub(crate) fn lookup_definition(
-        &self,
-        local_name: &LocalName,
-        is: Option<&LocalName>,
-    ) -> Option<Rc<CustomElementDefinition>> {
-        self.definitions
-            .borrow()
-            .0
-            .values()
-            .find(|definition| {
-                // Step 4-5
-                definition.local_name == *local_name &&
-                    (definition.name == *local_name || Some(&definition.name) == is)
-            })
-            .cloned()
-    }
-
+    /// <https://html.spec.whatwg.org/multipage/#htmlconstructor>
+    /// Step 5. Let definition be the item in registry's custom element
+    /// definition set with constructor equal to NewTarget.
     pub(crate) fn lookup_definition_by_constructor(
         &self,
         constructor: HandleObject,
@@ -133,29 +152,91 @@ impl CustomElementRegistry {
             .cloned()
     }
 
+    /// <https://html.spec.whatwg.org/multipage/#look-up-a-custom-element-registry>
+    pub(crate) fn lookup_a_custom_element_registry(
+        node: &Node,
+    ) -> Option<DomRoot<CustomElementRegistry>> {
+        match node.type_id() {
+            // Step 1. If node is an Element object, then return node's custom element registry.
+            NodeTypeId::Element(_) => node
+                .downcast::<Element>()
+                .expect("Nodes with element type must be an element")
+                .custom_element_registry(),
+            // Step 2. If node is a ShadowRoot object, then return node's custom element registry.
+            NodeTypeId::DocumentFragment(DocumentFragmentTypeId::ShadowRoot) => node
+                .downcast::<ShadowRoot>()
+                .expect("Nodes with ShadowRoot type must be a ShadowRoot")
+                .custom_element_registry(),
+            // Step 3. If node is a Document object, then return node's custom element registry.
+            NodeTypeId::Document(_) => node
+                .downcast::<Document>()
+                .expect("Nodes with document type must be a document")
+                .custom_element_registry(),
+            // Step 4. Return null.
+            _ => None,
+        }
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#look-up-a-custom-element-definition>
+    pub(crate) fn lookup_custom_element_definition(
+        registry: Option<&CustomElementRegistry>,
+        namespace: &Namespace,
+        local_name: &LocalName,
+        is: Option<&LocalName>,
+    ) -> Option<Rc<CustomElementDefinition>> {
+        // Step 1. If registry is null, then return null.
+        let registry = registry?;
+
+        // Step 2. If namespace is not the HTML namespace, then return null.
+        if *namespace != ns!(html) {
+            return None;
+        }
+
+        // Step 3. If registry's custom element definition set contains an item
+        // with name and local name both equal to localName, then return that
+        // item.
+        // Step 4. If registry's custom element definition set contains an item
+        // with name equal to is and local name equal to localName, then return
+        // that item.
+        // Step 5. Return null.
+        registry
+            .definitions
+            .borrow()
+            .0
+            .values()
+            .find(|definition| {
+                definition.local_name == *local_name &&
+                    (definition.name == *local_name || Some(&definition.name) == is)
+            })
+            .cloned()
+    }
+
+    /// <https://dom.spec.whatwg.org/#is-a-global-custom-element-registry>
+    pub(crate) fn is_a_global_element_registry(registry: Option<&CustomElementRegistry>) -> bool {
+        // Null or a CustomElementRegistry object registry is a global custom element registry
+        // if registry is non-null and registry's is scoped is false.
+        registry.is_some_and(|r| !r.is_scoped())
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#dom-customelementregistry-define>
     /// Steps 10.1, 10.2
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn check_prototype(
         &self,
+        cx: &mut JSContext,
         constructor: HandleObject,
         mut prototype: MutableHandleValue,
     ) -> ErrorResult {
         unsafe {
             // Step 10.1
-            if !JS_GetProperty(
-                *GlobalScope::get_cx(),
-                constructor,
-                c"prototype".as_ptr(),
-                prototype.reborrow(),
-            ) {
+            if !JS_GetProperty(cx, constructor, c"prototype".as_ptr(), prototype.reborrow()) {
                 return Err(Error::JSFailed);
             }
 
             // Step 10.2
             if !prototype.is_object() {
                 return Err(Error::Type(
-                    "constructor.prototype is not an object".to_owned(),
+                    c"constructor.prototype is not an object".to_owned(),
                 ));
             }
         }
@@ -165,14 +246,16 @@ impl CustomElementRegistry {
     /// <https://html.spec.whatwg.org/multipage/#dom-customelementregistry-define>
     /// This function includes both steps 14.3 and 14.4 which add the callbacks to a map and
     /// process them.
-    #[allow(unsafe_code)]
-    unsafe fn get_callbacks(&self, prototype: HandleObject) -> Fallible<LifecycleCallbacks> {
-        let cx = GlobalScope::get_cx();
-
+    fn get_callbacks(
+        &self,
+        cx: &mut JSContext,
+        prototype: HandleObject,
+    ) -> Fallible<LifecycleCallbacks> {
         // Step 4
         Ok(LifecycleCallbacks {
             connected_callback: get_callback(cx, prototype, c"connectedCallback")?,
             disconnected_callback: get_callback(cx, prototype, c"disconnectedCallback")?,
+            connected_move_callback: get_callback(cx, prototype, c"connectedMoveCallback")?,
             adopted_callback: get_callback(cx, prototype, c"adoptedCallback")?,
             attribute_changed_callback: get_callback(cx, prototype, c"attributeChangedCallback")?,
 
@@ -185,14 +268,13 @@ impl CustomElementRegistry {
 
     /// <https://html.spec.whatwg.org/multipage/#dom-customelementregistry-define>
     /// Step 14.13: Add form associated callbacks to LifecycleCallbacks
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     unsafe fn add_form_associated_callbacks(
         &self,
+        cx: &mut JSContext,
         prototype: HandleObject,
         callbacks: &mut LifecycleCallbacks,
     ) -> ErrorResult {
-        let cx = self.window.get_cx();
-
         callbacks.form_associated_callback =
             get_callback(cx, prototype, c"formAssociatedCallback")?;
         callbacks.form_reset_callback = get_callback(cx, prototype, c"formResetCallback")?;
@@ -203,129 +285,78 @@ impl CustomElementRegistry {
         Ok(())
     }
 
-    #[allow(unsafe_code)]
-    fn get_observed_attributes(&self, constructor: HandleObject) -> Fallible<Vec<DOMString>> {
-        let cx = GlobalScope::get_cx();
-        rooted!(in(*cx) let mut observed_attributes = UndefinedValue());
-        if unsafe {
-            !JS_GetProperty(
-                *cx,
-                constructor,
-                c"observedAttributes".as_ptr(),
-                observed_attributes.handle_mut(),
-            )
-        } {
-            return Err(Error::JSFailed);
-        }
-
-        if observed_attributes.is_undefined() {
-            return Ok(Vec::new());
-        }
-
-        let conversion = unsafe {
-            FromJSValConvertible::from_jsval(
-                *cx,
-                observed_attributes.handle(),
-                StringificationBehavior::Default,
-            )
-        };
-        match conversion {
-            Ok(ConversionResult::Success(attributes)) => Ok(attributes),
-            Ok(ConversionResult::Failure(error)) => Err(Error::Type(error.into())),
-            _ => Err(Error::JSFailed),
-        }
-    }
-
-    /// <https://html.spec.whatwg.org/multipage/#dom-customelementregistry-define>
-    /// Step 14.11: Get the value of `formAssociated`.
-    #[allow(unsafe_code)]
-    fn get_form_associated_value(&self, constructor: HandleObject) -> Fallible<bool> {
-        let cx = self.window.get_cx();
-        rooted!(in(*cx) let mut form_associated_value = UndefinedValue());
-        if unsafe {
-            !JS_GetProperty(
-                *cx,
-                constructor,
-                c"formAssociated".as_ptr(),
-                form_associated_value.handle_mut(),
-            )
-        } {
-            return Err(Error::JSFailed);
-        }
-
-        if form_associated_value.is_undefined() {
-            return Ok(false);
-        }
-
-        let conversion =
-            unsafe { FromJSValConvertible::from_jsval(*cx, form_associated_value.handle(), ()) };
-        match conversion {
-            Ok(ConversionResult::Success(flag)) => Ok(flag),
-            Ok(ConversionResult::Failure(error)) => Err(Error::Type(error.into())),
-            _ => Err(Error::JSFailed),
+    /// <https://html.spec.whatwg.org/multipage/#upgrade-particular-elements-within-a-document>
+    fn upgrade_particular_elements_within_a_document(
+        &self,
+        cx: &JSContext,
+        document: &Document,
+        definition: &Rc<CustomElementDefinition>,
+        local_name: &LocalName,
+        name: &LocalName,
+    ) {
+        // Step 1. Let upgradeCandidates be all elements that are shadow-including
+        // descendants of document, whose custom element registry is registry, whose
+        // namespace is the HTML namespace, and whose local name is localName,
+        // in shadow-including tree order. Additionally, if name is not localName,
+        // only include elements whose is value is equal to name.
+        for candidate in document
+            .upcast::<Node>()
+            .traverse_preorder_non_rooting(cx, ShadowIncluding::Yes)
+            .filter_map(UnrootedDom::downcast::<Element>)
+        {
+            // Note: If the registry is scoped, only include elements whose custom
+            // element registry is explicitly set to this registry. Otherwise,
+            // include elements with no explicit registry (they inherit the
+            // document's global registry) as well.
+            let registry_matches = if self.is_scoped.get() {
+                candidate
+                    .custom_element_registry()
+                    .is_some_and(|registry| *registry == *self)
+            } else {
+                candidate
+                    .custom_element_registry()
+                    .is_none_or(|registry| *registry == *self)
+            };
+            if *candidate.local_name() == *local_name &&
+                *candidate.namespace() == ns!(html) &&
+                registry_matches &&
+                (*name == *local_name || candidate.get_is().as_ref() == Some(name))
+            {
+                // Step 2. For each element element of upgradeCandidates: enqueue a
+                // custom element upgrade reaction given element and definition.
+                ScriptThread::enqueue_upgrade_reaction(cx, &candidate, definition.clone());
+            }
         }
     }
 
-    /// <https://html.spec.whatwg.org/multipage/#dom-customelementregistry-define>
-    /// Step 14.7: Get `disabledFeatures` value
-    #[allow(unsafe_code)]
-    fn get_disabled_features(&self, constructor: HandleObject) -> Fallible<Vec<DOMString>> {
-        let cx = self.window.get_cx();
-        rooted!(in(*cx) let mut disabled_features = UndefinedValue());
-        if unsafe {
-            !JS_GetProperty(
-                *cx,
-                constructor,
-                c"disabledFeatures".as_ptr(),
-                disabled_features.handle_mut(),
-            )
-        } {
-            return Err(Error::JSFailed);
-        }
-
-        if disabled_features.is_undefined() {
-            return Ok(Vec::new());
-        }
-
-        let conversion = unsafe {
-            FromJSValConvertible::from_jsval(
-                *cx,
-                disabled_features.handle(),
-                StringificationBehavior::Default,
-            )
-        };
-        match conversion {
-            Ok(ConversionResult::Success(attributes)) => Ok(attributes),
-            Ok(ConversionResult::Failure(error)) => Err(Error::Type(error.into())),
-            _ => Err(Error::JSFailed),
-        }
+    pub(crate) fn add_scoped_document(&self, document: &Document) {
+        self.scoped_document_set
+            .borrow_mut()
+            .push(Dom::from_ref(document));
     }
 }
 
 /// <https://html.spec.whatwg.org/multipage/#dom-customelementregistry-define>
 /// Step 14.4: Get `callbackValue` for all `callbackName` in `lifecycleCallbacks`.
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn get_callback(
-    cx: JSContext,
+    cx: &mut JSContext,
     prototype: HandleObject,
     name: &CStr,
 ) -> Fallible<Option<Rc<Function>>> {
-    rooted!(in(*cx) let mut callback = UndefinedValue());
+    rooted!(&in(cx) let mut callback = UndefinedValue());
     unsafe {
         // Step 10.4.1
-        if !JS_GetProperty(
-            *cx,
-            prototype,
-            name.as_ptr() as *const _,
-            callback.handle_mut(),
-        ) {
+        if !JS_GetProperty(cx, prototype, name.as_ptr(), callback.handle_mut()) {
             return Err(Error::JSFailed);
         }
 
         // Step 10.4.2
         if !callback.is_undefined() {
             if !callback.is_object() || !IsCallable(callback.to_object()) {
-                return Err(Error::Type("Lifecycle callback is not callable".to_owned()));
+                return Err(Error::Type(
+                    c"Lifecycle callback is not callable".to_owned(),
+                ));
             }
             Ok(Some(Function::new(cx, callback.to_object())))
         } else {
@@ -335,79 +366,109 @@ fn get_callback(
 }
 
 impl CustomElementRegistryMethods<crate::DomTypeHolder> for CustomElementRegistry {
-    #[allow(unsafe_code)]
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    /// <https://html.spec.whatwg.org/multipage/#dom-customelementregistry>
+    fn Constructor(
+        cx: &mut JSContext,
+        window: &Window,
+        proto: Option<HandleObject>,
+    ) -> DomRoot<CustomElementRegistry> {
+        let registry = CustomElementRegistry::new_with_proto(cx, window, proto);
+
+        // Step 1: Set this's is scoped to true.
+        registry.is_scoped.set(true);
+        registry
+    }
+
+    #[expect(unsafe_code)]
     /// <https://html.spec.whatwg.org/multipage/#dom-customelementregistry-define>
     fn Define(
         &self,
+        cx: &mut JSContext,
         name: DOMString,
         constructor_: Rc<CustomElementConstructor>,
         options: &ElementDefinitionOptions,
-        can_gc: CanGc,
     ) -> ErrorResult {
-        let cx = GlobalScope::get_cx();
-        rooted!(in(*cx) let constructor = constructor_.callback());
-        let name = LocalName::from(&*name);
+        rooted!(&in(cx) let constructor = constructor_.callback());
+        let name = LocalName::from(name);
 
-        // Step 1
+        // Step 1. If IsConstructor(constructor) is false, then throw a TypeError.
         // We must unwrap the constructor as all wrappers are constructable if they are callable.
-        rooted!(in(*cx) let unwrapped_constructor = unsafe { UnwrapObjectStatic(constructor.get()) });
+        rooted!(&in(cx) let unwrapped_constructor = unsafe { UnwrapObjectStatic(constructor.get()) });
 
         if unwrapped_constructor.is_null() {
             // We do not have permission to access the unwrapped constructor.
-            return Err(Error::Security);
+            return Err(Error::Security(None));
         }
 
         if unsafe { !IsConstructor(unwrapped_constructor.get()) } {
             return Err(Error::Type(
-                "Second argument of CustomElementRegistry.define is not a constructor".to_owned(),
+                c"Second argument of CustomElementRegistry.define is not a constructor".to_owned(),
             ));
         }
 
-        // Step 2
+        // Step 2. If name is not a valid custom element name, then throw a "SyntaxError" DOMException.
         if !is_valid_custom_element_name(&name) {
-            return Err(Error::Syntax);
+            return Err(Error::Syntax(Some(format!(
+                "{} name is not a valid custom element name",
+                name
+            ))));
         }
 
-        // Step 3
+        // Step 3. If this's custom element definition set contains an item with name name,
+        // then throw a "NotSupportedError" DOMException.
         if self.definitions.borrow().contains_key(&name) {
-            return Err(Error::NotSupported);
+            return Err(Error::NotSupported(Some(format!(
+                "{} has already been defined as a custom element",
+                name
+            ))));
         }
 
-        // Step 4
+        // Step 4. If this's custom element definition set contains an
+        // item with constructor constructor, then throw a "NotSupportedError" DOMException.
         if self
             .definitions
             .borrow()
             .iter()
             .any(|(_, def)| def.constructor == constructor_)
         {
-            return Err(Error::NotSupported);
+            return Err(Error::NotSupported(None));
         }
 
-        // Step 6
+        // Step 6. Let extends be options["extends"] if it exists; otherwise null.
         let extends = &options.extends;
 
         // Steps 5, 7
         let local_name = if let Some(ref extended_name) = *extends {
-            // Step 7.1
-            if is_valid_custom_element_name(extended_name) {
-                return Err(Error::NotSupported);
+            // Step 7.1 If this's is scoped is true, then throw a "NotSupportedError" DOMException.
+            if self.is_scoped.get() {
+                return Err(Error::NotSupported(Some(
+                    "Scoped custom element registries cannot define customized built-in elements"
+                        .to_owned(),
+                )));
             }
 
-            // Step 7.2
-            if !is_extendable_element_interface(extended_name) {
-                return Err(Error::NotSupported);
+            // Step 7.2 If extends is a valid custom element name, then throw a "NotSupportedError" DOMException.
+            if is_valid_custom_element_name(&extended_name.str()) {
+                return Err(Error::NotSupported(None));
             }
 
-            LocalName::from(&**extended_name)
+            // Step 7.3 If the element interface for extends and the HTML namespace is HTMLUnknownElement
+            // (e.g., if extends does not indicate an element definition in this specification)
+            // then throw a "NotSupportedError" DOMException.
+            if !is_extendable_element_interface(&extended_name.str()) {
+                return Err(Error::NotSupported(None));
+            }
+
+            // Step 7.4 Set localName to extends.
+            LocalName::from(extended_name)
         } else {
-            // Step 7.3
+            // Step 5. Let localName be name.
             name.clone()
         };
 
         // Step 8
         if self.element_definition_is_running.get() {
-            return Err(Error::NotSupported);
+            return Err(Error::NotSupported(None));
         }
 
         // Step 9
@@ -417,10 +478,12 @@ impl CustomElementRegistryMethods<crate::DomTypeHolder> for CustomElementRegistr
         // `observedAttributes` with default values, but this is done later.
 
         // Steps 14.1 - 14.2: Get the value of the prototype.
-        rooted!(in(*cx) let mut prototype = UndefinedValue());
+        rooted!(&in(cx) let mut prototype = UndefinedValue());
         {
-            let _ac = JSAutoRealm::new(*cx, constructor.get());
-            if let Err(error) = self.check_prototype(constructor.handle(), prototype.handle_mut()) {
+            let mut realm = AutoRealm::new_from_handle(cx, constructor.handle());
+            if let Err(error) =
+                self.check_prototype(&mut realm, constructor.handle(), prototype.handle_mut())
+            {
                 self.element_definition_is_running.set(false);
                 return Err(error);
             }
@@ -431,10 +494,10 @@ impl CustomElementRegistryMethods<crate::DomTypeHolder> for CustomElementRegistr
         // we know whether this definition is going to be form-associated,
         // but the order of operations is specified and it's observable
         // if one of the callback getters throws an exception.
-        rooted!(in(*cx) let proto_object = prototype.to_object());
+        rooted!(&in(cx) let proto_object = prototype.to_object());
         let mut callbacks = {
-            let _ac = JSAutoRealm::new(*cx, proto_object.get());
-            match unsafe { self.get_callbacks(proto_object.handle()) } {
+            let mut realm = AutoRealm::new_from_handle(cx, proto_object.handle());
+            match self.get_callbacks(&mut realm, proto_object.handle()) {
                 Ok(callbacks) => callbacks,
                 Err(error) => {
                     self.element_definition_is_running.set(false);
@@ -445,10 +508,16 @@ impl CustomElementRegistryMethods<crate::DomTypeHolder> for CustomElementRegistr
 
         // Step 14.5: Handle the case where with `attributeChangedCallback` on `lifecycleCallbacks`
         // is not null.
-        let observed_attributes = if callbacks.attribute_changed_callback.is_some() {
-            let _ac = JSAutoRealm::new(*cx, constructor.get());
-            match self.get_observed_attributes(constructor.handle()) {
-                Ok(attributes) => attributes,
+        let observed_attributes: Vec<DOMString> = if callbacks.attribute_changed_callback.is_some()
+        {
+            let mut realm = AutoRealm::new_from_handle(cx, constructor.handle());
+            match get_property(
+                &mut realm,
+                constructor.handle(),
+                c"observedAttributes",
+                StringificationBehavior::Default,
+            ) {
+                Ok(attributes) => attributes.unwrap_or_default(),
                 Err(error) => {
                     self.element_definition_is_running.set(false);
                     return Err(error);
@@ -460,12 +529,20 @@ impl CustomElementRegistryMethods<crate::DomTypeHolder> for CustomElementRegistr
 
         // Steps 14.6 - 14.10: Handle `disabledFeatures`.
         let (disable_internals, disable_shadow) = {
-            let _ac = JSAutoRealm::new(*cx, constructor.get());
-            match self.get_disabled_features(constructor.handle()) {
-                Ok(sequence) => (
-                    sequence.iter().any(|s| *s == "internals"),
-                    sequence.iter().any(|s| *s == "shadow"),
-                ),
+            let mut realm = AutoRealm::new_from_handle(cx, constructor.handle());
+            match get_property::<Vec<DOMString>>(
+                &mut realm,
+                constructor.handle(),
+                c"disabledFeatures",
+                StringificationBehavior::Default,
+            ) {
+                Ok(sequence) => {
+                    let sequence = sequence.unwrap_or_default();
+                    (
+                        sequence.iter().any(|s| *s == "internals"),
+                        sequence.iter().any(|s| *s == "shadow"),
+                    )
+                },
                 Err(error) => {
                     self.element_definition_is_running.set(false);
                     return Err(error);
@@ -474,10 +551,10 @@ impl CustomElementRegistryMethods<crate::DomTypeHolder> for CustomElementRegistr
         };
 
         // Step 14.11 - 14.12: Handle `formAssociated`.
-        let form_associated = {
-            let _ac = JSAutoRealm::new(*cx, constructor.get());
-            match self.get_form_associated_value(constructor.handle()) {
-                Ok(flag) => flag,
+        let form_associated: bool = {
+            let mut realm = AutoRealm::new_from_handle(cx, constructor.handle());
+            match get_property(&mut realm, constructor.handle(), c"formAssociated", ()) {
+                Ok(flag) => flag.unwrap_or_default(),
                 Err(error) => {
                     self.element_definition_is_running.set(false);
                     return Err(error);
@@ -487,11 +564,13 @@ impl CustomElementRegistryMethods<crate::DomTypeHolder> for CustomElementRegistr
 
         // Steps 14.13: Add the `formAssociated` callbacks.
         if form_associated {
-            let _ac = JSAutoRealm::new(*cx, proto_object.get());
+            let mut realm = AutoRealm::new_from_handle(cx, proto_object.handle());
             unsafe {
-                if let Err(error) =
-                    self.add_form_associated_callbacks(proto_object.handle(), &mut callbacks)
-                {
+                if let Err(error) = self.add_form_associated_callbacks(
+                    &mut realm,
+                    proto_object.handle(),
+                    &mut callbacks,
+                ) {
                     self.element_definition_is_running.set(false);
                     return Err(error);
                 }
@@ -500,7 +579,11 @@ impl CustomElementRegistryMethods<crate::DomTypeHolder> for CustomElementRegistr
 
         self.element_definition_is_running.set(false);
 
-        // Step 15: Set up the new custom element definition.
+        // Step 15: Let definition be a new custom element definition with name name,
+        // local name localName, constructor constructor, observed attributes
+        // observedAttributes, lifecycle callbacks lifecycleCallbacks,
+        // form-associated formAssociated, disable internals disableInternals,
+        // and disable shadow disableShadow.
         let definition = Rc::new(CustomElementDefinition::new(
             name.clone(),
             local_name.clone(),
@@ -512,51 +595,55 @@ impl CustomElementRegistryMethods<crate::DomTypeHolder> for CustomElementRegistr
             disable_shadow,
         ));
 
-        // Step 16: Add definition to this CustomElementRegistry.
+        // Step 16: Append definition to this's custom element definition set.
         self.definitions
             .borrow_mut()
             .insert(name.clone(), definition.clone());
 
-        // Step 17: Let document be this CustomElementRegistry's relevant global object's
-        // associated Document.
-        let document = self.window.Document();
-
-        // Steps 18-19: Enqueue custom elements upgrade reaction for upgrade candidates.
-        for candidate in document
-            .upcast::<Node>()
-            .traverse_preorder(ShadowIncluding::Yes)
-            .filter_map(DomRoot::downcast::<Element>)
-        {
-            let is = candidate.get_is();
-            if *candidate.local_name() == local_name &&
-                *candidate.namespace() == ns!(html) &&
-                (extends.is_none() || is.as_ref() == Some(&name))
-            {
-                ScriptThread::enqueue_upgrade_reaction(&candidate, definition.clone());
+        // Step 17: If this's is scoped is true, then for each document of
+        // this's scoped document set: upgrade particular elements within a
+        // document given this, document, definition, and localName.
+        if self.is_scoped.get() {
+            for document in self.scoped_document_set.borrow().iter() {
+                self.upgrade_particular_elements_within_a_document(
+                    cx,
+                    document,
+                    &definition,
+                    &local_name,
+                    &local_name,
+                );
             }
+        } else {
+            // Step 18: Otherwise, upgrade particular elements within a document given
+            // this, this's relevant global object's associated Document, definition,
+            // localName, and name.
+            self.upgrade_particular_elements_within_a_document(
+                cx,
+                &self.window.Document(),
+                &definition,
+                &local_name,
+                &name,
+            );
         }
 
-        // Step 16, 16.3
+        // Step 19: If this's when-defined promise map[name] exists:
+        // Step 19.2: Remove this's when-defined promise map[name].
         let promise = self.when_defined.borrow_mut().remove(&name);
         if let Some(promise) = promise {
-            unsafe {
-                rooted!(in(*cx) let mut constructor = UndefinedValue());
-                definition
-                    .constructor
-                    .to_jsval(*cx, constructor.handle_mut());
-                promise.resolve_native(&constructor.get(), can_gc);
-            }
+            rooted!(&in(cx) let mut constructor = UndefinedValue());
+            definition
+                .constructor
+                .safe_to_jsval(cx, constructor.handle_mut());
+            // Step 19.1: Resolve this's when-defined promise map[name] with constructor.
+            promise.resolve_native(cx, &constructor.get());
         }
         Ok(())
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-customelementregistry-get>
-    #[allow(unsafe_code)]
-    fn Get(&self, cx: JSContext, name: DOMString, mut retval: MutableHandleValue) {
-        match self.definitions.borrow().get(&LocalName::from(&*name)) {
-            Some(definition) => unsafe {
-                definition.constructor.to_jsval(*cx, retval);
-            },
+    fn Get(&self, cx: &mut JSContext, name: DOMString, mut retval: MutableHandleValue) {
+        match self.definitions.borrow().get(&LocalName::from(name)) {
+            Some(definition) => definition.constructor.safe_to_jsval(cx, retval),
             None => retval.set(UndefinedValue()),
         }
     }
@@ -572,86 +659,158 @@ impl CustomElementRegistryMethods<crate::DomTypeHolder> for CustomElementRegistr
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-customelementregistry-whendefined>
-    #[allow(unsafe_code)]
-    fn WhenDefined(&self, name: DOMString, comp: InRealm, can_gc: CanGc) -> Rc<Promise> {
-        let name = LocalName::from(&*name);
+    fn WhenDefined(&self, realm: &mut CurrentRealm, name: DOMString) -> Rc<Promise> {
+        let name = LocalName::from(name);
 
         // Step 1
         if !is_valid_custom_element_name(&name) {
-            let promise = Promise::new_in_current_realm(comp, can_gc);
-            promise.reject_native(
-                &DOMException::new(
-                    self.window.as_global_scope(),
-                    DOMErrorName::SyntaxError,
-                    can_gc,
-                ),
-                can_gc,
+            let promise = Promise::new_in_realm(realm);
+            let error = DOMException::new(
+                realm,
+                self.window.as_global_scope(),
+                DOMErrorName::SyntaxError,
             );
+            promise.reject_native(realm, &error);
             return promise;
         }
 
         // Step 2
         if let Some(definition) = self.definitions.borrow().get(&LocalName::from(&*name)) {
-            unsafe {
-                let cx = GlobalScope::get_cx();
-                rooted!(in(*cx) let mut constructor = UndefinedValue());
-                definition
-                    .constructor
-                    .to_jsval(*cx, constructor.handle_mut());
-                let promise = Promise::new_in_current_realm(comp, can_gc);
-                promise.resolve_native(&constructor.get(), can_gc);
-                return promise;
+            rooted!(&in(*realm) let mut constructor = UndefinedValue());
+            definition
+                .constructor
+                .safe_to_jsval(realm, constructor.handle_mut());
+            let promise = Promise::new_in_realm(realm);
+            promise.resolve_native(realm, &constructor.get());
+            return promise;
+        }
+
+        // Steps 3, 4, 5, 6
+        let existing_promise = self.when_defined.borrow().get(&name).cloned();
+        existing_promise.unwrap_or_else(|| {
+            let promise = Promise::new_in_realm(realm);
+            self.when_defined.borrow_mut().insert(name, promise.clone());
+            promise
+        })
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-customelementregistry-upgrade>
+    fn Upgrade(&self, cx: &JSContext, node: &Node) {
+        // Step 1. For each shadow-including inclusive descendant candidate of
+        // root, in shadow-including tree order:
+        for node in node.traverse_preorder_non_rooting(cx, ShadowIncluding::Yes) {
+            // Step 1.1. If candidate is not an Element node, then continue.
+            let Some(element) = node.downcast::<Element>() else {
+                continue;
+            };
+            // Step 1.2. If candidate's custom element registry is not this,
+            // then continue.
+            if element
+                .custom_element_registry()
+                .is_some_and(|registry| *registry != *self)
+            {
+                continue;
+            }
+            // Step 1.3. Try to upgrade candidate.
+            try_upgrade_element(cx, element);
+        }
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-customelementregistry-initialize>
+    fn Initialize(&self, cx: &JSContext, root: &Node) -> ErrorResult {
+        // Step 1. If this's is scoped is false and either root is a Document node
+        // or root's node document's custom element registry is not this, then
+        // throw a "NotSupportedError" DOMException.
+        if !self.is_scoped.get() {
+            let is_document = root.is::<Document>();
+            let registry_mismatch = root
+                .owner_doc()
+                .custom_element_registry()
+                .is_some_and(|registry| *registry != *self);
+            if is_document || registry_mismatch {
+                return Err(Error::NotSupported(Some(
+                    "Initialize is not allowed on a non-scoped registry for this root".to_owned(),
+                )));
             }
         }
 
-        // Steps 3, 4, 5
-        let existing_promise = self.when_defined.borrow().get(&name).cloned();
-        let promise = existing_promise.unwrap_or_else(|| {
-            let promise = Promise::new_in_current_realm(comp, can_gc);
-            self.when_defined.borrow_mut().insert(name, promise.clone());
-            promise
-        });
-
-        // Step 6
-        promise
-    }
-    /// <https://html.spec.whatwg.org/multipage/#dom-customelementregistry-upgrade>
-    fn Upgrade(&self, node: &Node) {
-        // Spec says to make a list first and then iterate the list, but
-        // try-to-upgrade only queues upgrade reactions and doesn't itself
-        // modify the tree, so that's not an observable distinction.
-        node.traverse_preorder(ShadowIncluding::Yes).for_each(|n| {
-            if let Some(element) = n.downcast::<Element>() {
-                try_upgrade_element(element);
+        // Step 2. If root is a Document node whose custom element registry is null,
+        // then set root's custom element registry to this.
+        if let Some(document) = root.downcast::<Document>() {
+            if document.custom_element_registry().is_none() {
+                document.set_custom_element_registry(self);
             }
-        });
+        }
+        // Step 3. Otherwise, if root is a ShadowRoot node whose custom element registry
+        // is null, then set root's custom element registry to this.
+        else if let Some(shadow_root) = root.downcast::<ShadowRoot>() &&
+            shadow_root.custom_element_registry().is_none()
+        {
+            shadow_root.set_custom_element_registry(self);
+        }
+
+        // Step 4. For each inclusive descendant inclusiveDescendant of root, in tree order:
+        for node in root.traverse_preorder(ShadowIncluding::No) {
+            // Step 4.1. If inclusiveDescendant is not an Element node, then continue.
+            let Some(element) = node.downcast::<Element>() else {
+                continue;
+            };
+
+            // Step 4.2. If inclusiveDescendant's custom element registry is null:
+            if element.custom_element_registry().is_none() {
+                // Step 4.2.1. Set inclusiveDescendant's custom element registry to this.
+                element.set_custom_element_registry(Some(self), cx.no_gc());
+
+                // Step 4.2.2. If this's is scoped is true, then append
+                // inclusiveDescendant's node document to this's scoped document set.
+                if self.is_scoped.get() {
+                    let document = element.upcast::<Node>().owner_doc();
+                    self.scoped_document_set
+                        .borrow_mut()
+                        .push(Dom::from_ref(&document));
+                }
+            // Step 4.3. If inclusiveDescendant's custom element registry is not this, then continue.
+            } else if element
+                .custom_element_registry()
+                .is_none_or(|registry| *registry != *self)
+            {
+                continue;
+            }
+
+            // Step 4.4. Try to upgrade inclusiveDescendant.
+            try_upgrade_element(cx, element);
+        }
+        Ok(())
     }
 }
 
 #[derive(Clone, JSTraceable, MallocSizeOf)]
 pub(crate) struct LifecycleCallbacks {
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     connected_callback: Option<Rc<Function>>,
 
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
+    connected_move_callback: Option<Rc<Function>>,
+
+    #[conditional_malloc_size_of]
     disconnected_callback: Option<Rc<Function>>,
 
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     adopted_callback: Option<Rc<Function>>,
 
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     attribute_changed_callback: Option<Rc<Function>>,
 
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     form_associated_callback: Option<Rc<Function>>,
 
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     form_reset_callback: Option<Rc<Function>>,
 
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     form_disabled_callback: Option<Rc<Function>>,
 
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     form_state_restore_callback: Option<Rc<Function>>,
 }
 
@@ -673,7 +832,7 @@ pub(crate) struct CustomElementDefinition {
     pub(crate) local_name: LocalName,
 
     /// <https://html.spec.whatwg.org/multipage/#concept-custom-element-definition-constructor>
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     pub(crate) constructor: Rc<CustomElementConstructor>,
 
     /// <https://html.spec.whatwg.org/multipage/#concept-custom-element-definition-observed-attributes>
@@ -696,7 +855,7 @@ pub(crate) struct CustomElementDefinition {
 }
 
 impl CustomElementDefinition {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn new(
         name: LocalName,
         local_name: LocalName,
@@ -725,61 +884,64 @@ impl CustomElementDefinition {
         self.name == self.local_name
     }
 
-    /// <https://dom.spec.whatwg.org/#concept-create-element> Step 4.1
-    #[allow(unsafe_code)]
+    /// <https://dom.spec.whatwg.org/#concept-create-element> Step 5.1
+    #[expect(unsafe_code)]
     pub(crate) fn create_element(
         &self,
+        cx: &mut JSContext,
         document: &Document,
         prefix: Option<Prefix>,
-        can_gc: CanGc,
+        registry: Option<&CustomElementRegistry>,
     ) -> Fallible<DomRoot<Element>> {
         let window = document.window();
-        let cx = GlobalScope::get_cx();
-        // Step 4.1.1. Let C be definition’s constructor.
-        rooted!(in(*cx) let constructor = ObjectValue(self.constructor.callback()));
-        rooted!(in(*cx) let mut element = ptr::null_mut::<JSObject>());
+
+        // Step 5.1.1. Let C be definition’s constructor.
+        rooted!(&in(cx) let constructor = ObjectValue(self.constructor.callback()));
+        rooted!(&in(cx) let mut element = ptr::null_mut::<JSObject>());
         {
             // Go into the constructor's realm
-            let _ac = JSAutoRealm::new(*cx, self.constructor.callback());
-            // Step 4.1.2. Set result to the result of constructing C, with no arguments.
-            let args = HandleValueArray::empty();
-            if unsafe { !Construct1(*cx, constructor.handle(), &args, element.handle_mut()) } {
-                return Err(Error::JSFailed);
-            }
+            let mut realm = AutoRealm::new(cx, NonNull::new(self.constructor.callback()).unwrap());
+            let cx = &mut realm;
+
+            // Step 5.3.1. Set result to the result of constructing C, with no arguments.
+            // https://webidl.spec.whatwg.org/#construct-a-callback-function
+            run_a_script::<DomTypeHolder, _, _>(cx, window.upcast(), |cx| {
+                run_a_callback::<DomTypeHolder, _>(window.upcast(), || {
+                    let args = HandleValueArray::empty();
+                    if unsafe { !Construct1(cx, constructor.handle(), &args, element.handle_mut()) }
+                    {
+                        Err(Error::JSFailed)
+                    } else {
+                        Ok(())
+                    }
+                })
+            })?;
         }
 
-        // https://heycam.github.io/webidl/#construct-a-callback-function
-        // https://html.spec.whatwg.org/multipage/#clean-up-after-running-script
-        if is_execution_stack_empty() {
-            window
-                .as_global_scope()
-                .perform_a_microtask_checkpoint(can_gc);
-        }
-
-        rooted!(in(*cx) let element_val = ObjectValue(element.get()));
+        rooted!(&in(cx) let element_val = ObjectValue(element.get()));
         let element: DomRoot<Element> =
-            match unsafe { DomRoot::from_jsval(*cx, element_val.handle(), ()) } {
+            match FromJSValConvertible::safe_from_jsval(cx, element_val.handle(), ()) {
                 Ok(ConversionResult::Success(element)) => element,
                 Ok(ConversionResult::Failure(..)) => {
                     return Err(Error::Type(
-                        "Constructor did not return a DOM node".to_owned(),
+                        c"Constructor did not return a DOM node".to_owned(),
                     ));
                 },
                 _ => return Err(Error::JSFailed),
             };
 
-        // Step 4.1.3. Assert: result’s custom element state and custom element definition are initialized.
-        // Step 4.1.4. Assert: result’s namespace is the HTML namespace.
+        // Step 5.1.3.2 Assert: result’s custom element state and custom element definition are initialized.
+        // Step 5.1.3.3 Assert: result’s namespace is the HTML namespace.
         // Note: IDL enforces that result is an HTMLElement object, which all use the HTML namespace.
         // Note: the custom element definition is initialized by the caller if
         // this method returns a success value.
         assert!(element.is::<HTMLElement>());
 
-        // Step 4.1.5. If result’s attribute list is not empty, then throw a "NotSupportedError" DOMException.
-        // Step 4.1.6. If result has children, then throw a "NotSupportedError" DOMException.
-        // Step 4.1.7. If result’s parent is not null, then throw a "NotSupportedError" DOMException.
-        // Step 4.1.8. If result’s node document is not document, then throw a "NotSupportedError" DOMException.
-        // Step 4.1.9. If result’s local name is not equal to localName then throw a "NotSupportedError" DOMException.
+        // Step 5.1.3.4. If result’s attribute list is not empty, then throw a "NotSupportedError" DOMException.
+        // Step 5.1.3.5. If result has children, then throw a "NotSupportedError" DOMException.
+        // Step 5.1.3.6. If result’s parent is not null, then throw a "NotSupportedError" DOMException.
+        // Step 5.1.3.7. If result’s node document is not document, then throw a "NotSupportedError" DOMException.
+        // Step 5.1.3.8. If result’s local name is not equal to localName then throw a "NotSupportedError" DOMException.
         if element.HasAttributes() ||
             element.upcast::<Node>().children_count() > 0 ||
             element.upcast::<Node>().has_parent() ||
@@ -787,24 +949,31 @@ impl CustomElementDefinition {
             *element.namespace() != ns!(html) ||
             *element.local_name() != self.local_name
         {
-            return Err(Error::NotSupported);
+            return Err(Error::NotSupported(None));
         }
 
-        // Step 4.1.10. Set result’s namespace prefix to prefix.
+        // Step 5.1.3.9. Set result’s namespace prefix to prefix.
         element.set_prefix(prefix);
 
-        // Step 4.1.11. Set result’s is value to null.
+        // Step 5.1.3.10. Set result’s is value to null.
         // Element's `is` is None by default
 
+        // Step 5.1.3.11. Set result’s custom element registry to registry.
+        element.set_custom_element_registry(registry, cx.no_gc());
+
         Ok(element)
+    }
+
+    pub(crate) fn has_attribute_changed_callback(&self) -> bool {
+        self.callbacks.attribute_changed_callback.is_some()
     }
 }
 
 /// <https://html.spec.whatwg.org/multipage/#concept-upgrade-an-element>
 pub(crate) fn upgrade_element(
+    cx: &mut JSContext,
     definition: Rc<CustomElementDefinition>,
     element: &Element,
-    can_gc: CanGc,
 ) {
     // Step 1. If element's custom element state is not "undefined" or "uncustomized", then return.
     let state = element.get_custom_element_state();
@@ -813,21 +982,22 @@ pub(crate) fn upgrade_element(
     }
 
     // Step 2. Set element's custom element definition to definition.
-    element.set_custom_element_definition(Rc::clone(&definition));
+    element.set_custom_element_definition(Rc::clone(&definition), cx.no_gc());
 
     // Step 3. Set element's custom element state to "failed".
-    element.set_custom_element_state(CustomElementState::Failed);
+    element.set_custom_element_state(CustomElementState::Failed, cx.no_gc());
 
     // Step 4. For each attribute in element's attribute list, in order, enqueue a custom element callback reaction
     // with element, callback name "attributeChangedCallback", and « attribute's local name, null, attribute's value,
     // attribute's namespace ».
-    for attr in element.attrs().iter() {
+    let custom_element_reaction_stack = ScriptThread::custom_element_reaction_stack();
+    for attr in element.attrs().borrow().iter() {
         let local_name = attr.local_name().clone();
-        let value = DOMString::from(&**attr.value());
         let namespace = attr.namespace().clone();
-        ScriptThread::enqueue_callback_reaction(
+        custom_element_reaction_stack.enqueue_callback_reaction(
+            cx,
             element,
-            CallbackReaction::AttributeChanged(local_name, None, Some(value), namespace),
+            CallbackReaction::AttributeChanged(local_name, None, Some(&*attr.value()), namespace),
             Some(definition.clone()),
         );
     }
@@ -835,7 +1005,8 @@ pub(crate) fn upgrade_element(
     // Step 5. If element is connected, then enqueue a custom element callback reaction with element,
     // callback name "connectedCallback", and « ».
     if element.is_connected() {
-        ScriptThread::enqueue_callback_reaction(
+        custom_element_reaction_stack.enqueue_callback_reaction(
+            cx,
             element,
             CallbackReaction::Connected,
             Some(definition.clone()),
@@ -849,7 +1020,7 @@ pub(crate) fn upgrade_element(
         .push(ConstructionStackEntry::Element(DomRoot::from_ref(element)));
 
     // Steps 7-8, successful case
-    let result = run_upgrade_constructor(&definition, element, can_gc);
+    let result = run_upgrade_constructor(cx, &definition, element);
 
     // "regardless of whether the above steps threw an exception" step
     definition.construction_stack.borrow_mut().pop();
@@ -857,119 +1028,121 @@ pub(crate) fn upgrade_element(
     // Step 8 exception handling
     if let Err(error) = result {
         // Step 8.exception.1
-        element.clear_custom_element_definition();
+        element.clear_custom_element_definition(cx.no_gc());
 
         // Step 8.exception.2
         element.clear_reaction_queue();
 
         // Step 8.exception.3
         let global = GlobalScope::current().expect("No current global");
-        let cx = GlobalScope::get_cx();
-        let ar = enter_realm(&*global);
-        throw_dom_exception(cx, &global, error, can_gc);
-        report_pending_exception(cx, true, InRealm::Entered(&ar), can_gc);
+
+        let mut realm = enter_auto_realm(cx, &*global);
+        let cx = &mut realm.current_realm();
+
+        throw_dom_exception(cx, &global, error);
+        report_pending_exception(cx);
 
         return;
     }
 
     // Step 9: handle with form-associated custom element
-    if let Some(html_element) = element.downcast::<HTMLElement>() {
-        if html_element.is_form_associated_custom_element() {
-            // We know this element is is form-associated, so we can use the implementation of
-            // `FormControl` for HTMLElement, which makes that assumption.
-            // Step 9.1: Reset the form owner of element
-            html_element.reset_form_owner(can_gc);
-            if let Some(form) = html_element.form_owner() {
-                // Even though the tree hasn't structurally mutated,
-                // HTMLCollections need to be invalidated.
-                form.upcast::<Node>().rev_version();
-                // The spec tells us specifically to enqueue a formAssociated reaction
-                // here, but it also says to do that for resetting form owner in general,
-                // and we don't need two reactions.
-            }
+    if let Some(html_element) = element.downcast::<HTMLElement>() &&
+        html_element.is_form_associated_custom_element()
+    {
+        // We know this element is is form-associated, so we can use the implementation of
+        // `FormControl` for HTMLElement, which makes that assumption.
+        // Step 9.1: Reset the form owner of element
+        html_element.reset_form_owner(cx);
+        if let Some(form) = html_element.form_owner() {
+            // Even though the tree hasn't structurally mutated,
+            // HTMLCollections need to be invalidated.
+            form.upcast::<Node>().rev_version(cx.no_gc());
+            // The spec tells us specifically to enqueue a formAssociated reaction
+            // here, but it also says to do that for resetting form owner in general,
+            // and we don't need two reactions.
+        }
 
-            // Either enabled_state or disabled_state needs to be set,
-            // and the possibility of a disabled fieldset ancestor needs
-            // to be accounted for. (In the spec, being disabled is
-            // a fact that's true or false about a node at a given time,
-            // not a flag that belongs to the node and is updated,
-            // so it doesn't describe this check as an action.)
-            element.check_disabled_attribute();
-            element.check_ancestors_disabled_state_for_form_control();
-            element.update_read_write_state_from_readonly_attribute();
+        // Either enabled_state or disabled_state needs to be set,
+        // and the possibility of a disabled fieldset ancestor needs
+        // to be accounted for. (In the spec, being disabled is
+        // a fact that's true or false about a node at a given time,
+        // not a flag that belongs to the node and is updated,
+        // so it doesn't describe this check as an action.)
+        element.check_disabled_attribute();
+        element.check_ancestors_disabled_state_for_form_control();
+        element.update_read_write_state_from_readonly_attribute();
 
-            // Step 9.2: If element is disabled, then enqueue a custom element callback reaction
-            // with element.
-            if element.disabled_state() {
-                ScriptThread::enqueue_callback_reaction(
-                    element,
-                    CallbackReaction::FormDisabled(true),
-                    Some(definition.clone()),
-                )
-            }
+        // Step 9.2: If element is disabled, then enqueue a custom element callback reaction
+        // with element.
+        if element.disabled_state() {
+            custom_element_reaction_stack.enqueue_callback_reaction(
+                cx,
+                element,
+                CallbackReaction::FormDisabled(true),
+                Some(definition),
+            )
         }
     }
 
     // Step 10
-    element.set_custom_element_state(CustomElementState::Custom);
+    element.set_custom_element_state(CustomElementState::Custom, cx.no_gc());
 }
 
 /// <https://html.spec.whatwg.org/multipage/#concept-upgrade-an-element>
-/// Steps 8.1-8.3
-#[allow(unsafe_code)]
+/// Steps 9.1-9.4
+#[expect(unsafe_code)]
 fn run_upgrade_constructor(
+    cx: &mut JSContext,
     definition: &CustomElementDefinition,
     element: &Element,
-    can_gc: CanGc,
 ) -> ErrorResult {
     let constructor = &definition.constructor;
     let window = element.owner_window();
-    let cx = GlobalScope::get_cx();
-    rooted!(in(*cx) let constructor_val = ObjectValue(constructor.callback()));
-    rooted!(in(*cx) let mut element_val = UndefinedValue());
-    unsafe {
-        element.to_jsval(*cx, element_val.handle_mut());
-    }
-    rooted!(in(*cx) let mut construct_result = ptr::null_mut::<JSObject>());
+    rooted!(&in(cx) let constructor_val = ObjectValue(constructor.callback()));
+    rooted!(&in(cx) let mut element_val = UndefinedValue());
+    element.safe_to_jsval(cx, element_val.handle_mut());
+    rooted!(&in(cx) let mut construct_result = ptr::null_mut::<JSObject>());
     {
-        // Step 8.1. If definition's disable shadow is true and element's shadow root is non-null,
+        // Step 9.1. If definition's disable shadow is true and element's shadow root is non-null,
         // then throw a "NotSupportedError" DOMException.
         if definition.disable_shadow && element.is_shadow_host() {
-            return Err(Error::NotSupported);
+            return Err(Error::NotSupported(None));
         }
 
         // Go into the constructor's realm
-        let _ac = JSAutoRealm::new(*cx, constructor.callback());
+        let mut realm = AutoRealm::new(cx, NonNull::new(constructor.callback()).unwrap());
+        let cx = &mut *realm;
+
         let args = HandleValueArray::empty();
         // Step 8.2. Set element's custom element state to "precustomized".
-        element.set_custom_element_state(CustomElementState::Precustomized);
+        element.set_custom_element_state(CustomElementState::Precustomized, cx.no_gc());
 
-        if unsafe {
-            !Construct1(
-                *cx,
-                constructor_val.handle(),
-                &args,
-                construct_result.handle_mut(),
-            )
-        } {
-            return Err(Error::JSFailed);
-        }
+        // Step 9.3. Let constructResult be the result of constructing C, with no arguments.
+        // https://webidl.spec.whatwg.org/#construct-a-callback-function
+        run_a_script::<DomTypeHolder, _, _>(cx, window.upcast(), |cx| {
+            run_a_callback::<DomTypeHolder, _>(window.upcast(), || {
+                if unsafe {
+                    !Construct1(
+                        cx,
+                        constructor_val.handle(),
+                        &args,
+                        construct_result.handle_mut(),
+                    )
+                } {
+                    Err(Error::JSFailed)
+                } else {
+                    Ok(())
+                }
+            })
+        })?;
 
-        // https://heycam.github.io/webidl/#construct-a-callback-function
-        // https://html.spec.whatwg.org/multipage/#clean-up-after-running-script
-        if is_execution_stack_empty() {
-            window
-                .as_global_scope()
-                .perform_a_microtask_checkpoint(can_gc);
-        }
-
-        // Step 8.3. Let constructResult be the result of constructing C, with no arguments.
         let mut same = false;
-        rooted!(in(*cx) let construct_result_val = ObjectValue(construct_result.get()));
-        // Step 8.4. If SameValue(constructResult, element) is false, then throw a TypeError.
+        rooted!(&in(cx) let construct_result_val = ObjectValue(construct_result.get()));
+
+        // Step 9.4. If SameValue(constructResult, element) is false, then throw a TypeError.
         if unsafe {
             !SameValue(
-                *cx,
+                cx,
                 construct_result_val.handle(),
                 element_val.handle(),
                 &mut same,
@@ -979,7 +1152,7 @@ fn run_upgrade_constructor(
         }
         if !same {
             return Err(Error::Type(
-                "Returned element is not SameValue as the upgraded element".to_string(),
+                c"Returned element is not SameValue as the upgraded element".to_owned(),
             ));
         }
     }
@@ -987,68 +1160,83 @@ fn run_upgrade_constructor(
 }
 
 /// <https://html.spec.whatwg.org/multipage/#concept-try-upgrade>
-pub(crate) fn try_upgrade_element(element: &Element) {
-    // Step 1. Let definition be the result of looking up a custom element definition given element's node document,
-    // element's namespace, element's local name, and element's is value.
-    let document = element.owner_document();
-    let namespace = element.namespace();
-    let local_name = element.local_name();
-    let is = element.get_is();
-    if let Some(definition) =
-        document.lookup_custom_element_definition(namespace, local_name, is.as_ref())
-    {
-        // Step 2. If definition is not null, then enqueue a custom element upgrade reaction given
-        // element and definition.
-        ScriptThread::enqueue_upgrade_reaction(element, definition);
+pub(crate) fn try_upgrade_element(cx: &JSContext, element: &Element) {
+    // Step 1. Let definition be the result of looking up a custom element
+    // definition given element's custom element registry, element's namespace,
+    // element's local name, and element's is value.
+    let lookup_registry = {
+        // TODO: Remove this fallback when Node::adopt is aligned according to specs.
+        //       Currently elements carry stale global registry from another document.
+        let registry = element.custom_element_registry();
+        if registry
+            .as_ref()
+            .is_some_and(|registry| registry.is_scoped())
+        {
+            registry
+        } else {
+            element.owner_document().custom_element_registry()
+        }
+    };
+    if let Some(definition) = CustomElementRegistry::lookup_custom_element_definition(
+        lookup_registry.as_deref(),
+        element.namespace(),
+        element.local_name(),
+        element.get_is().as_ref(),
+    ) {
+        // Step 2. If definition is not null, then enqueue a custom element
+        // upgrade reaction given element and definition.
+        ScriptThread::enqueue_upgrade_reaction(cx, element, definition);
     }
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 pub(crate) enum CustomElementReaction {
-    Upgrade(#[ignore_malloc_size_of = "Rc"] Rc<CustomElementDefinition>),
+    Upgrade(#[conditional_malloc_size_of] Rc<CustomElementDefinition>),
     Callback(
-        #[ignore_malloc_size_of = "Rc"] Rc<Function>,
+        #[conditional_malloc_size_of] Rc<Function>,
         #[ignore_malloc_size_of = "mozjs"] Box<[Heap<JSVal>]>,
     ),
 }
 
 impl CustomElementReaction {
     /// <https://html.spec.whatwg.org/multipage/#invoke-custom-element-reactions>
-    #[allow(unsafe_code)]
-    pub(crate) fn invoke(&self, element: &Element, can_gc: CanGc) {
+    pub(crate) fn invoke(&self, cx: &mut JSContext, element: &Element) {
         // Step 2.1
         match *self {
             CustomElementReaction::Upgrade(ref definition) => {
-                upgrade_element(definition.clone(), element, can_gc)
+                upgrade_element(cx, definition.clone(), element)
             },
             CustomElementReaction::Callback(ref callback, ref arguments) => {
                 // We're rooted, so it's safe to hand out a handle to objects in Heap
-                let arguments = arguments
-                    .iter()
-                    .map(|arg| unsafe { HandleValue::from_raw(arg.handle()) })
-                    .collect();
-                rooted!(in(*GlobalScope::get_cx()) let mut value: JSVal);
+                let arguments = arguments.iter().map(|arg| arg.as_handle_value()).collect();
+                rooted!(&in(cx) let mut value: JSVal);
                 let _ = callback.Call_(
+                    cx,
                     element,
                     arguments,
                     value.handle_mut(),
                     ExceptionHandling::Report,
-                    can_gc,
                 );
             },
         }
     }
 }
 
-pub(crate) enum CallbackReaction {
+pub(crate) enum CallbackReaction<'a> {
     Connected,
     Disconnected,
     Adopted(DomRoot<Document>, DomRoot<Document>),
-    AttributeChanged(LocalName, Option<DOMString>, Option<DOMString>, Namespace),
+    AttributeChanged(
+        LocalName,
+        Option<&'a AttrValue>,
+        Option<&'a AttrValue>,
+        Namespace,
+    ),
     FormAssociated(Option<DomRoot<HTMLFormElement>>),
     FormDisabled(bool),
     FormReset,
+    ConnectedMove,
 }
 
 /// <https://html.spec.whatwg.org/multipage/#processing-the-backup-element-queue>
@@ -1059,8 +1247,12 @@ enum BackupElementQueueFlag {
 }
 
 /// <https://html.spec.whatwg.org/multipage/#custom-element-reactions-stack>
+/// # Safety
+/// This can be shared inside an Rc because one of those Rc copies lives
+/// inside ScriptThread, so the GC can always reach this structure.
 #[derive(JSTraceable, MallocSizeOf)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::allow_unrooted_in_rc)]
 pub(crate) struct CustomElementReactionStack {
     stack: DomRefCell<Vec<ElementQueue>>,
     backup_queue: ElementQueue,
@@ -1080,12 +1272,12 @@ impl CustomElementReactionStack {
         self.stack.borrow_mut().push(ElementQueue::new());
     }
 
-    pub(crate) fn pop_current_element_queue(&self, can_gc: CanGc) {
+    pub(crate) fn pop_current_element_queue(&self, cx: &mut JSContext) {
         rooted_vec!(let mut stack);
         mem::swap(&mut *stack, &mut *self.stack.borrow_mut());
 
         if let Some(current_queue) = stack.last() {
-            current_queue.invoke_reactions(can_gc);
+            current_queue.invoke_reactions(cx);
         }
         stack.pop();
 
@@ -1095,9 +1287,9 @@ impl CustomElementReactionStack {
 
     /// <https://html.spec.whatwg.org/multipage/#enqueue-an-element-on-the-appropriate-element-queue>
     /// Step 4
-    pub(crate) fn invoke_backup_element_queue(&self, can_gc: CanGc) {
+    pub(crate) fn invoke_backup_element_queue(&self, cx: &mut JSContext) {
         // Step 4.1
-        self.backup_queue.invoke_reactions(can_gc);
+        self.backup_queue.invoke_reactions(cx);
 
         // Step 4.2
         self.processing_backup_element_queue
@@ -1105,7 +1297,7 @@ impl CustomElementReactionStack {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#enqueue-an-element-on-the-appropriate-element-queue>
-    pub(crate) fn enqueue_element(&self, element: &Element) {
+    pub(crate) fn enqueue_element(&self, cx: &JSContext, element: &Element) {
         if let Some(current_queue) = self.stack.borrow().last() {
             // Step 2
             current_queue.append_element(element);
@@ -1123,25 +1315,27 @@ impl CustomElementReactionStack {
                 .set(BackupElementQueueFlag::Processing);
 
             // Step 4
-            ScriptThread::enqueue_microtask(Microtask::CustomElementReaction);
+            ScriptThread::enqueue_microtask(cx, Box::new(CustomElementReactionMicrotask::new()));
         }
     }
 
     /// <https://html.spec.whatwg.org/multipage/#enqueue-a-custom-element-callback-reaction>
-    #[allow(unsafe_code)]
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     pub(crate) fn enqueue_callback_reaction(
         &self,
+        cx: &mut JSContext,
         element: &Element,
         reaction: CallbackReaction,
         definition: Option<Rc<CustomElementDefinition>>,
     ) {
-        // Step 1
+        // Step 1. Let definition be element's custom element definition.
         let definition = match definition.or_else(|| element.get_custom_element_definition()) {
             Some(definition) => definition,
             None => return,
         };
 
-        // Step 2
+        // Step 2. Let callback be the value of the entry in definition's lifecycle callbacks with
+        // key callbackName.
         let (callback, args) = match reaction {
             CallbackReaction::Connected => {
                 (definition.callbacks.connected_callback.clone(), Vec::new())
@@ -1157,7 +1351,7 @@ impl CustomElementReactionStack {
                 (definition.callbacks.adopted_callback.clone(), args)
             },
             CallbackReaction::AttributeChanged(local_name, old_val, val, namespace) => {
-                // Step 4
+                // Step 5.
                 if !definition
                     .observed_attributes
                     .iter()
@@ -1166,38 +1360,30 @@ impl CustomElementReactionStack {
                     return;
                 }
 
-                let cx = GlobalScope::get_cx();
                 // We might be here during HTML parsing, rather than
                 // during Javscript execution, and so we typically aren't
                 // already in a realm here.
-                let _ac = JSAutoRealm::new(*cx, element.global().reflector().get_jsobject().get());
+                let mut realm = enter_auto_realm(cx, &*element.global());
+                let cx = &mut realm;
 
                 let local_name = DOMString::from(&*local_name);
-                rooted!(in(*cx) let mut name_value = UndefinedValue());
-                unsafe {
-                    local_name.to_jsval(*cx, name_value.handle_mut());
-                }
+                rooted!(&in(cx) let mut name_value = UndefinedValue());
+                local_name.safe_to_jsval(cx, name_value.handle_mut());
 
-                rooted!(in(*cx) let mut old_value = NullValue());
+                rooted!(&in(cx) let mut old_value = NullValue());
                 if let Some(old_val) = old_val {
-                    unsafe {
-                        old_val.to_jsval(*cx, old_value.handle_mut());
-                    }
+                    old_val.safe_to_jsval(cx, old_value.handle_mut());
                 }
 
-                rooted!(in(*cx) let mut value = NullValue());
+                rooted!(&in(cx) let mut value = NullValue());
                 if let Some(val) = val {
-                    unsafe {
-                        val.to_jsval(*cx, value.handle_mut());
-                    }
+                    val.safe_to_jsval(cx, value.handle_mut());
                 }
 
-                rooted!(in(*cx) let mut namespace_value = NullValue());
+                rooted!(&in(cx) let mut namespace_value = NullValue());
                 if namespace != ns!() {
                     let namespace = DOMString::from(&*namespace);
-                    unsafe {
-                        namespace.to_jsval(*cx, namespace_value.handle_mut());
-                    }
+                    namespace.safe_to_jsval(cx, namespace_value.handle_mut());
                 }
 
                 let args = vec![
@@ -1226,8 +1412,7 @@ impl CustomElementReactionStack {
                 (definition.callbacks.form_associated_callback.clone(), args)
             },
             CallbackReaction::FormDisabled(disabled) => {
-                let cx = GlobalScope::get_cx();
-                rooted!(in(*cx) let mut disabled_value = BooleanValue(disabled));
+                rooted!(&in(cx) let disabled_value = BooleanValue(disabled));
                 let args = vec![Heap::default()];
                 args[0].set(disabled_value.get());
                 (definition.callbacks.form_disabled_callback.clone(), args)
@@ -1235,33 +1420,79 @@ impl CustomElementReactionStack {
             CallbackReaction::FormReset => {
                 (definition.callbacks.form_reset_callback.clone(), Vec::new())
             },
+            CallbackReaction::ConnectedMove => {
+                let callback = definition.callbacks.connected_move_callback.clone();
+                // Step 3. If callbackName is "connectedMoveCallback" and callback is null:
+                if callback.is_none() {
+                    // Step 3.1. Let disconnectedCallback be the value of the entry in
+                    // definition's lifecycle callbacks with key "disconnectedCallback".
+                    let disconnected_callback = definition.callbacks.disconnected_callback.clone();
+
+                    // Step 3.2. Let connectedCallback be the value of the entry in
+                    // definition's lifecycle callbacks with key "connectedCallback".
+                    let connected_callback = definition.callbacks.connected_callback.clone();
+
+                    // Step 3.3. If connectedCallback and disconnectedCallback are null,
+                    // then return.
+                    if disconnected_callback.is_none() && connected_callback.is_none() {
+                        return;
+                    }
+
+                    // Step 3.4. Set callback to the following steps:
+                    // Step 3.4.1. If disconnectedCallback is not null, then call
+                    // disconnectedCallback with no arguments.
+                    if let Some(disconnected_callback) = disconnected_callback {
+                        element.push_callback_reaction(
+                            disconnected_callback,
+                            Box::new([]),
+                            cx.no_gc(),
+                        );
+                    }
+                    // Step 3.4.2. If connectedCallback is not null, then call
+                    // connectedCallback with no arguments.
+                    if let Some(connected_callback) = connected_callback {
+                        element.push_callback_reaction(
+                            connected_callback,
+                            Box::new([]),
+                            cx.no_gc(),
+                        );
+                    }
+
+                    self.enqueue_element(cx, element);
+                    return;
+                }
+
+                (callback, Vec::new())
+            },
         };
 
-        // Step 3
+        // Step 4. If callback is null, then return.
         let callback = match callback {
             Some(callback) => callback,
             None => return,
         };
 
-        // Step 5
-        element.push_callback_reaction(callback, args.into_boxed_slice());
+        // Step 6. Add a new callback reaction to element's custom element reaction queue, with
+        // callback function callback and arguments args.
+        element.push_callback_reaction(callback, args.into_boxed_slice(), cx.no_gc());
 
-        // Step 6
-        self.enqueue_element(element);
+        // Step 7. Enqueue an element on the appropriate element queue given element.
+        self.enqueue_element(cx, element);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#enqueue-a-custom-element-upgrade-reaction>
     pub(crate) fn enqueue_upgrade_reaction(
         &self,
+        cx: &JSContext,
         element: &Element,
         definition: Rc<CustomElementDefinition>,
     ) {
         // Step 1. Add a new upgrade reaction to element's custom element reaction queue,
         // with custom element definition definition.
-        element.push_upgrade_reaction(definition);
+        element.push_upgrade_reaction(definition, cx.no_gc());
 
         // Step 2. Enqueue an element on the appropriate element queue given element.
-        self.enqueue_element(element);
+        self.enqueue_element(cx, element);
     }
 }
 
@@ -1280,10 +1511,10 @@ impl ElementQueue {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#invoke-custom-element-reactions>
-    fn invoke_reactions(&self, can_gc: CanGc) {
+    fn invoke_reactions(&self, cx: &mut JSContext) {
         // Steps 1-2
         while let Some(element) = self.next_element() {
-            element.invoke_reactions(can_gc)
+            element.invoke_reactions(cx)
         }
         self.queue.borrow_mut().clear();
     }
@@ -1305,7 +1536,6 @@ impl ElementQueue {
 pub(crate) fn is_valid_custom_element_name(name: &str) -> bool {
     // Custom elment names must match:
     // PotentialCustomElementName ::= [a-z] (PCENChar)* '-' (PCENChar)*
-
     let mut chars = name.chars();
     if !chars.next().is_some_and(|c| c.is_ascii_lowercase()) {
         return false;

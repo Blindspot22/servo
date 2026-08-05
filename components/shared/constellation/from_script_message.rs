@@ -4,55 +4,69 @@
 
 //! Messages send from the ScriptThread to the Constellation.
 
-use std::collections::HashMap;
 use std::fmt;
 
-use base::Epoch;
-use base::id::{
-    BroadcastChannelRouterId, BrowsingContextId, HistoryStateId, MessagePortId,
-    MessagePortRouterId, PipelineId, ServiceWorkerId, ServiceWorkerRegistrationId, WebViewId,
-};
-use canvas_traits::canvas::{CanvasId, CanvasMsg};
+use content_security_policy::sandboxing_directive::SandboxingFlagSet;
 use devtools_traits::{DevtoolScriptControlMsg, ScriptToDevtoolsControlMsg, WorkerId};
+use embedder_traits::user_contents::UserContentManagerId;
 use embedder_traits::{
-    AnimationState, EmbedderMsg, FocusSequenceNumber, MediaSessionEvent, TouchEventResult,
-    ViewportDetails,
+    AnimationState, FocusSequenceNumber, JSValue, JavaScriptEvaluationError,
+    JavaScriptEvaluationId, MediaSessionEvent, ScriptToEmbedderChan, Theme, ViewportDetails,
+    WakeLockType,
 };
+use encoding_rs::Encoding;
 use euclid::default::Size2D as UntypedSize2D;
+use fonts_traits::SystemFontServiceProxySender;
 use http::{HeaderMap, Method};
-use ipc_channel::Error as IpcError;
-use ipc_channel::ipc::{IpcReceiver, IpcSender};
+use ipc_channel::ipc::IpcSender;
+use malloc_size_of_derive::MallocSizeOf;
 use net_traits::policy_container::PolicyContainer;
-use net_traits::request::{InsecureRequestsPolicy, Referrer, RequestBody};
-use net_traits::storage_thread::StorageType;
-use net_traits::{CoreResourceMsg, ReferrerPolicy, ResourceThreads};
+use net_traits::request::{Destination, InsecureRequestsPolicy, Referrer, RequestBody};
+use net_traits::{ReferrerPolicy, ResourceThreads};
+use paint_api::CrossProcessPaintApi;
 use profile_traits::mem::MemoryReportResult;
 use profile_traits::{mem, time as profile_time};
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use servo_url::{ImmutableOrigin, ServoUrl};
-use strum_macros::IntoStaticStr;
+use servo_base::Epoch;
+use servo_base::generic_channel::{GenericCallback, GenericReceiver, GenericSender, SendResult};
+use servo_base::id::{
+    BroadcastChannelRouterId, BrowsingContextId, HistoryStateId, MessagePortId,
+    MessagePortRouterId, PipelineId, ScriptEventLoopId, ServiceWorkerId,
+    ServiceWorkerRegistrationId, WebViewId,
+};
+use servo_canvas_traits::canvas::{CanvasId, CanvasMsg};
+use servo_canvas_traits::webgl::WebGLChan;
+use servo_url::{ImmutableOrigin, OriginSnapshot, ServoUrl};
+use storage_traits::StorageThreads;
+use storage_traits::webstorage_thread::WebStorageType;
+use strum::IntoStaticStr;
 #[cfg(feature = "webgpu")]
 use webgpu_traits::{WebGPU, WebGPUAdapterResponse};
-use webrender_api::ImageKey;
 
-use crate::structured_data::{BroadcastMsg, StructuredSerializedData};
+use crate::structured_data::{BroadcastChannelMsg, StructuredSerializedData};
 use crate::{
     LogEntry, MessagePortMsg, PortMessageTask, PortTransferInfo, TraversalDirection, WindowSizeType,
 };
 
+pub type ScriptToConstellationSender =
+    GenericSender<(WebViewId, PipelineId, ScriptToConstellationMessage)>;
+
 /// A Script to Constellation channel.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct ScriptToConstellationChan {
     /// Sender for communicating with constellation thread.
-    pub sender: IpcSender<(PipelineId, ScriptToConstellationMessage)>,
-    /// Used to identify the origin of the message.
+    pub sender: ScriptToConstellationSender,
+    /// Used to identify the origin `WebView` of the message.
+    pub webview_id: WebViewId,
+    /// Used to identify the origin `Pipeline` of the message.
     pub pipeline_id: PipelineId,
 }
 
 impl ScriptToConstellationChan {
     /// Send ScriptMsg and attach the pipeline_id to the message.
-    pub fn send(&self, msg: ScriptToConstellationMessage) -> Result<(), IpcError> {
-        self.sender.send((self.pipeline_id, msg))
+    pub fn send(&self, msg: ScriptToConstellationMessage) -> SendResult {
+        self.sender.send((self.webview_id, self.pipeline_id, msg))
     }
 }
 
@@ -65,7 +79,7 @@ pub enum LoadOrigin {
     /// A load originating in webdriver.
     WebDriver,
     /// A load originating in script.
-    Script(ImmutableOrigin),
+    Script(OriginSnapshot),
 }
 
 /// can be passed to `LoadUrl` to load a page with GET/POST
@@ -76,6 +90,8 @@ pub struct LoadData {
     pub load_origin: LoadOrigin,
     /// The URL.
     pub url: ServoUrl,
+    /// <https://html.spec.whatwg.org/multipage/#concept-document-about-base-url>
+    pub about_base_url: Option<ServoUrl>,
     /// The creator pipeline id if this is an about:blank load.
     pub creator_pipeline_id: Option<PipelineId>,
     /// The method.
@@ -92,8 +108,14 @@ pub struct LoadData {
     pub headers: HeaderMap,
     /// The data that will be used as the body of the request.
     pub data: Option<RequestBody>,
+    /// <https://fetch.spec.whatwg.org/#concept-request-reload-navigation-flag>
+    /// A request has an associated reload-navigation flag. Unless stated otherwise, it is unset.
+    pub reload_navigation: bool,
+    /// <https://fetch.spec.whatwg.org/#concept-request-history-navigation-flag>
+    /// A request has an associated history-navigation flag. Unless stated otherwise, it is unset.
+    pub history_navigation: bool,
     /// The result of evaluating a javascript scheme url.
-    pub js_eval_result: Option<JsEvalResult>,
+    pub js_eval_result: Option<String>,
     /// The referrer.
     pub referrer: Referrer,
     /// The referrer policy.
@@ -111,38 +133,44 @@ pub struct LoadData {
     pub has_trustworthy_ancestor_origin: bool,
     /// Servo internal: if crash details are present, trigger a crash error page with these details.
     pub crash: Option<String>,
-}
+    /// Destination, used for CSP checks
+    pub destination: Destination,
+    /// The "creation sandboxing flag set" that this Pipeline should use when it is created.
+    /// See <https://html.spec.whatwg.org/multipage/#determining-the-creation-sandboxing-flags>.
+    pub creation_sandboxing_flag_set: SandboxingFlagSet,
+    /// If this is a load operation for an `<iframe>` whose origin is same-origin with its
+    /// container documents origin then this is the encoding of the container document.
+    pub container_document_encoding: Option<&'static Encoding>,
 
-/// The result of evaluating a javascript scheme url.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub enum JsEvalResult {
-    /// The js evaluation had a non-string result, 204 status code.
-    /// <https://html.spec.whatwg.org/multipage/#navigate> 12.11
-    NoContent,
-    /// The js evaluation had a string result.
-    Ok(Vec<u8>),
+    /// If this request is for the initial about:blank document.
+    pub is_initial_about_blank: bool,
 }
 
 impl LoadData {
     /// Create a new `LoadData` object.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         load_origin: LoadOrigin,
         url: ServoUrl,
+        about_base_url: Option<ServoUrl>,
         creator_pipeline_id: Option<PipelineId>,
         referrer: Referrer,
         referrer_policy: ReferrerPolicy,
         inherited_secure_context: Option<bool>,
         inherited_insecure_requests_policy: Option<InsecureRequestsPolicy>,
         has_trustworthy_ancestor_origin: bool,
-    ) -> LoadData {
-        LoadData {
+        creation_sandboxing_flag_set: SandboxingFlagSet,
+    ) -> Self {
+        Self {
             load_origin,
             url,
+            about_base_url,
             creator_pipeline_id,
             method: Method::GET,
             headers: HeaderMap::new(),
             data: None,
+            reload_navigation: false,
+            history_navigation: false,
             js_eval_result: None,
             referrer,
             referrer_policy,
@@ -152,7 +180,28 @@ impl LoadData {
             crash: None,
             inherited_insecure_requests_policy,
             has_trustworthy_ancestor_origin,
+            destination: Destination::Document,
+            creation_sandboxing_flag_set,
+            container_document_encoding: None,
+            is_initial_about_blank: false,
         }
+    }
+
+    /// Create a new [`LoadData`] for a completely new top-level `WebView` that isn't created
+    /// via APIs like `window.open`. This is for `WebView`s completely unrelated to others.
+    pub fn new_for_new_unrelated_webview(url: ServoUrl) -> Self {
+        Self::new(
+            LoadOrigin::Constellation,
+            url,
+            None,
+            None,
+            Referrer::NoReferrer,
+            ReferrerPolicy::EmptyString,
+            None,
+            None,
+            false,
+            SandboxingFlagSet::empty(),
+        )
     }
 }
 
@@ -172,7 +221,7 @@ pub enum NavigationHistoryBehavior {
 }
 
 /// Entities required to spawn service workers
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct ScopeThings {
     /// script resource url
     pub script_url: ServoUrl,
@@ -181,9 +230,13 @@ pub struct ScopeThings {
     /// base resources required to create worker global scopes
     pub init: WorkerGlobalScopeInit,
     /// the port to receive devtools message from
-    pub devtools_chan: Option<IpcSender<ScriptToDevtoolsControlMsg>>,
+    pub devtools_chan: Option<GenericCallback<ScriptToDevtoolsControlMsg>>,
     /// service worker id
     pub worker_id: WorkerId,
+    /// the browsing context id of the page that registered the service worker
+    pub browsing_context_id: BrowsingContextId,
+    /// the webview id of the page that registered the service worker
+    pub webview_id: WebViewId,
 }
 
 /// Message that gets passed to service worker scope on postMessage
@@ -191,6 +244,7 @@ pub struct ScopeThings {
 pub struct DOMMessage {
     /// The origin of the message
     pub origin: ImmutableOrigin,
+    pub pipeline_id: PipelineId,
     /// The payload of the message
     pub data: StructuredSerializedData,
 }
@@ -198,14 +252,16 @@ pub struct DOMMessage {
 /// Channels to allow service worker manager to communicate with constellation and resource thread
 #[derive(Deserialize, Serialize)]
 pub struct SWManagerSenders {
-    /// Sender of messages to the constellation.
-    pub swmanager_sender: IpcSender<SWManagerMsg>,
-    /// Sender for communicating with resource thread.
-    pub resource_sender: IpcSender<CoreResourceMsg>,
+    /// [`ResourceThreads`] for initating fetches or using i/o.
+    pub resource_threads: ResourceThreads,
+    /// [`CrossProcessPaintApi`] for communicating with `Paint`.
+    pub paint_api: CrossProcessPaintApi,
+    /// The [`SystemFontServiceProxy`] used to communicate with the `SystemFontService`.
+    pub system_font_service_sender: SystemFontServiceProxySender,
     /// Sender of messages to the manager.
-    pub own_sender: IpcSender<ServiceWorkerMsg>,
+    pub own_sender: GenericSender<ServiceWorkerMsg>,
     /// Receiver of messages from the constellation.
-    pub receiver: IpcReceiver<ServiceWorkerMsg>,
+    pub receiver: GenericReceiver<ServiceWorkerMsg>,
 }
 
 /// Messages sent to Service Worker Manager thread
@@ -215,13 +271,19 @@ pub enum ServiceWorkerMsg {
     Timeout(ServoUrl),
     /// Message sent by constellation to forward to a running service worker
     ForwardDOMMessage(DOMMessage, ServoUrl),
-    /// <https://w3c.github.io/ServiceWorker/#schedule-job-algorithm>
-    ScheduleJob(Job),
+    ForwardWorkerMessage {
+        data: StructuredSerializedData,
+        url: ServoUrl,
+        source: ServiceWorkerId,
+        origin: ImmutableOrigin,
+    },
+    /// <https://w3c.github.io/ServiceWorker/#algorithms>
+    HandleAlgorithm(ServiceWorkerAlgorithm),
     /// Exit the service worker manager
     Exit,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
 /// <https://w3c.github.io/ServiceWorker/#dfn-job-type>
 pub enum JobType {
     /// <https://w3c.github.io/ServiceWorker/#register>
@@ -232,7 +294,7 @@ pub enum JobType {
     Update,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 /// The kind of error the job promise should be rejected with.
 pub enum JobError {
     /// <https://w3c.github.io/ServiceWorker/#reject-job-promise>
@@ -241,34 +303,80 @@ pub enum JobError {
     SecurityError,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 /// Messages sent from Job algorithms steps running in the SW manager,
 /// in order to resolve or reject the job promise.
 pub enum JobResult {
     /// <https://w3c.github.io/ServiceWorker/#reject-job-promise>
     RejectPromise(JobError),
     /// <https://w3c.github.io/ServiceWorker/#resolve-job-promise>
-    ResolvePromise(Job, JobResultValue),
+    ResolvePromise(JobResultValue),
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 /// Jobs are resolved with the help of various values.
 pub enum JobResultValue {
-    /// Data representing a serviceworker registration.
-    Registration {
-        /// The Id of the registration.
-        id: ServiceWorkerRegistrationId,
-        /// The installing worker, if any.
-        installing_worker: Option<ServiceWorkerId>,
-        /// The waiting worker, if any.
-        waiting_worker: Option<ServiceWorkerId>,
-        /// The active worker, if any.
-        active_worker: Option<ServiceWorkerId>,
+    Register(ServiceWorkerRegistrationInfo),
+    Unregister(bool),
+}
+
+/// <https://w3c.github.io/ServiceWorker/#dfn-service-worker-registration>
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct ServiceWorkerRegistrationInfo {
+    /// The Id of the registration.
+    pub id: ServiceWorkerRegistrationId,
+    /// <https://w3c.github.io/ServiceWorker/#dfn-installing-worker>
+    pub installing_worker: Option<ServiceWorkerId>,
+    /// <https://w3c.github.io/ServiceWorker/#dfn-waiting-worker>
+    pub waiting_worker: Option<ServiceWorkerId>,
+    /// <https://w3c.github.io/ServiceWorker/#dfn-active-worker>
+    pub active_worker: Option<ServiceWorkerId>,
+    /// <https://w3c.github.io/ServiceWorker/#service-worker-registration-storage-key>
+    pub storage_key: ImmutableOrigin,
+    /// <https://w3c.github.io/ServiceWorker/#dfn-scope-url>
+    pub scope_url: ServoUrl,
+    /// <https://w3c.github.io/ServiceWorker/#dfn-job-script-url>
+    pub script_url: ServoUrl,
+}
+
+/// <https://w3c.github.io/ServiceWorker/#algorithms>
+#[derive(Debug, Deserialize, Serialize)]
+pub enum ServiceWorkerAlgorithm {
+    /// <https://w3c.github.io/ServiceWorker/#start-register>
+    StartRegister(Job),
+    /// <https://w3c.github.io/ServiceWorker/#unregister>
+    Unregister(Job),
+    /// <https://w3c.github.io/ServiceWorker/#match-service-worker-registration>
+    MatchServiceWorkerRegistration {
+        storage_key: ImmutableOrigin,
+        client_url: ServoUrl,
+        result_handler: GenericCallback<ServiceWorkerAlgorithmResult>,
     },
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+/// <https://w3c.github.io/ServiceWorker/#algorithms>
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
+pub enum ServiceWorkerAlgorithmResult {
+    /// <https://w3c.github.io/ServiceWorker/#resolve-job-promise-algorithm>
+    /// <https://w3c.github.io/ServiceWorker/#reject-job-promise-algorithm>
+    Job(JobResult),
+
+    /// <https://w3c.github.io/ServiceWorker/#match-service-worker-registration>
+    MatchServiceWorkerRegistration(Option<ServiceWorkerRegistrationInfo>),
+
+    /// <https://w3c.github.io/ServiceWorker/#dom-client-postmessage-message-options>
+    /// Note: this is not algorithm; re-using algo channel for convenience.
+    MessageFromWorker {
+        message: StructuredSerializedData,
+        source: ServiceWorkerId,
+        scope_url: ServoUrl,
+        script_url: ServoUrl,
+        origin: ImmutableOrigin,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 /// <https://w3c.github.io/ServiceWorker/#dfn-job>
 pub struct Job {
     /// <https://w3c.github.io/ServiceWorker/#dfn-job-type>
@@ -278,11 +386,13 @@ pub struct Job {
     /// <https://w3c.github.io/ServiceWorker/#dfn-job-script-url>
     pub script_url: ServoUrl,
     /// <https://w3c.github.io/ServiceWorker/#dfn-job-client>
-    pub client: IpcSender<JobResult>,
+    pub client: GenericCallback<ServiceWorkerAlgorithmResult>,
     /// <https://w3c.github.io/ServiceWorker/#job-referrer>
     pub referrer: ServoUrl,
     /// Various data needed to process job.
     pub scope_things: Option<ScopeThings>,
+    /// <https://w3c.github.io/ServiceWorker/#job-storage-key>
+    pub storage_key: ImmutableOrigin,
 }
 
 impl Job {
@@ -291,9 +401,10 @@ impl Job {
         job_type: JobType,
         scope_url: ServoUrl,
         script_url: ServoUrl,
-        client: IpcSender<JobResult>,
+        client: GenericCallback<ServiceWorkerAlgorithmResult>,
         referrer: ServoUrl,
         scope_things: Option<ScopeThings>,
+        storage_key: ImmutableOrigin,
     ) -> Job {
         Job {
             job_type,
@@ -302,6 +413,7 @@ impl Job {
             client,
             referrer,
             scope_things,
+            storage_key,
         }
     }
 }
@@ -324,15 +436,6 @@ impl PartialEq for Job {
     }
 }
 
-/// Messages outgoing from the Service Worker Manager thread to constellation
-#[derive(Debug, Deserialize, Serialize)]
-pub enum SWManagerMsg {
-    /// Placeholder to keep the enum,
-    /// as it will be needed when implementing
-    /// <https://github.com/servo/servo/issues/24660>
-    PostMessageToClient,
-}
-
 /// Used to determine if a script has any pending asynchronous activity.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub enum DocumentState {
@@ -349,15 +452,6 @@ pub trait ServiceWorkerManagerFactory {
     fn create(sw_senders: SWManagerSenders, origin: ImmutableOrigin);
 }
 
-/// Whether the sandbox attribute is present for an iframe element
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum IFrameSandboxState {
-    /// Sandbox attribute is present
-    IFrameSandboxed,
-    /// Sandbox attribute is not present
-    IFrameUnsandboxed,
-}
-
 /// Specifies the information required to load an auxiliary browsing context.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct AuxiliaryWebViewCreationRequest {
@@ -368,7 +462,7 @@ pub struct AuxiliaryWebViewCreationRequest {
     /// The pipeline opener browsing context.
     pub opener_pipeline_id: PipelineId,
     /// Sender for the constellation’s response to our request.
-    pub response_sender: IpcSender<Option<AuxiliaryWebViewCreationResponse>>,
+    pub response_sender: GenericSender<Option<AuxiliaryWebViewCreationResponse>>,
 }
 
 /// Constellation’s response to auxiliary browsing context creation requests.
@@ -378,6 +472,8 @@ pub struct AuxiliaryWebViewCreationResponse {
     pub new_webview_id: WebViewId,
     /// The new pipeline ID.
     pub new_pipeline_id: PipelineId,
+    /// The [`UserContentManagerId`] for this new auxiliary browsing context.
+    pub user_content_manager_id: Option<UserContentManagerId>,
 }
 
 /// Specifies the information required to load an iframe.
@@ -398,6 +494,9 @@ pub struct IFrameLoadInfo {
     /// Whether this load should replace the current entry (reload). If true, the current
     /// entry will be replaced instead of a new entry being added.
     pub history_handling: NavigationHistoryBehavior,
+    /// A snapshot of the navigation-related parameters of the target
+    /// of this navigation.
+    pub target_snapshot_params: TargetSnapshotParams,
 }
 
 /// Specifies the information required to load a URL in an iframe.
@@ -409,41 +508,47 @@ pub struct IFrameLoadInfoWithData {
     pub load_data: LoadData,
     /// The old pipeline ID for this iframe, if a page was previously loaded.
     pub old_pipeline_id: Option<PipelineId>,
-    /// Sandbox type of this iframe
-    pub sandbox: IFrameSandboxState,
     /// The initial viewport size for this iframe.
     pub viewport_details: ViewportDetails,
+    /// The [`Theme`] to use within this iframe.
+    pub theme: Theme,
 }
 
 /// Resources required by workerglobalscopes
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct WorkerGlobalScopeInit {
     /// Chan to a resource thread
     pub resource_threads: ResourceThreads,
+    /// Chan to a storage thread
+    pub storage_threads: StorageThreads,
     /// Chan to the memory profiler
     pub mem_profiler_chan: mem::ProfilerChan,
     /// Chan to the time profiler
     pub time_profiler_chan: profile_time::ProfilerChan,
     /// To devtools sender
-    pub to_devtools_sender: Option<IpcSender<ScriptToDevtoolsControlMsg>>,
+    pub to_devtools_sender: Option<GenericCallback<ScriptToDevtoolsControlMsg>>,
     /// From devtools sender
-    pub from_devtools_sender: Option<IpcSender<DevtoolScriptControlMsg>>,
+    pub from_devtools_sender: Option<GenericSender<DevtoolScriptControlMsg>>,
     /// Messages to send to constellation
-    pub script_to_constellation_chan: ScriptToConstellationChan,
+    pub script_to_constellation_chan: ScriptToConstellationSender,
+    /// Messages to send to the Embedder
+    pub script_to_embedder_chan: ScriptToEmbedderChan,
     /// The worker id
     pub worker_id: WorkerId,
     /// The pipeline id
     pub pipeline_id: PipelineId,
     /// The origin
     pub origin: ImmutableOrigin,
-    /// The creation URL
-    pub creation_url: Option<ServoUrl>,
     /// True if secure context
     pub inherited_secure_context: Option<bool>,
+    /// Unminify Javascript.
+    pub unminify_js: bool,
+    /// Handle for communicating messages to the WebGL thread, if available.
+    pub webgl_chan: Option<WebGLChan>,
 }
 
 /// Common entities representing a network load origin
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct WorkerScriptLoadOrigin {
     /// referrer url
     pub referrer_url: Option<ServoUrl>,
@@ -464,9 +569,51 @@ pub struct IFrameSizeMsg {
     pub type_: WindowSizeType,
 }
 
+/// An enum that describe a type of keyboard scroll.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub enum KeyboardScroll {
+    /// Scroll the container one line up.
+    Up,
+    /// Scroll the container one line down.
+    Down,
+    /// Scroll the container one "line" left.
+    Left,
+    /// Scroll the container one "line" right.
+    Right,
+    /// Scroll the container one page up.
+    PageUp,
+    /// Scroll the container one page down.
+    PageDown,
+    /// Scroll the container to the vertical start.
+    Home,
+    /// Scroll the container to the vertical end.
+    End,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub enum ScreenshotReadinessResponse {
+    /// The Pipeline associated with this response, is ready for a screenshot at the
+    /// provided [`Epoch`].
+    Ready(Epoch),
+    /// The Pipeline associated with this response is no longer active and should be
+    /// ignored for the purposes of the screenshot.
+    NoLongerActive,
+}
+
+/// Identifies a category of events/notifications that a pipeline can register
+/// interest in with the constellation. When a pipeline has active listeners for
+/// events in a given category, it registers interest so the constellation only
+/// sends notifications to pipelines that care.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
+pub enum ConstellationInterest {
+    /// Interest in `storage` events (fired when another same-origin pipeline modifies storage).
+    StorageEvent,
+}
+
 /// Messages from the script to the constellation.
 #[derive(Deserialize, IntoStaticStr, Serialize)]
 pub enum ScriptToConstellationMessage {
+    ServiceWorkerAlgorithm(ServiceWorkerAlgorithm),
     /// Request to complete the transfer of a set of ports to a router.
     CompleteMessagePortTransfer(MessagePortRouterId, Vec<MessagePortId>),
     /// The results of attempting to complete the transfer of a batch of ports.
@@ -476,12 +623,12 @@ pub enum ScriptToConstellationMessage {
         /* The ids of ports transferred successfully */
         Vec<MessagePortId>,
         /* The ids, and buffers, of ports whose transfer failed */
-        HashMap<MessagePortId, PortTransferInfo>,
+        FxHashMap<MessagePortId, PortTransferInfo>,
     ),
     /// A new message-port was created or transferred, with corresponding control-sender.
     NewMessagePort(MessagePortRouterId, MessagePortId),
     /// A global has started managing message-ports
-    NewMessagePortRouter(MessagePortRouterId, IpcSender<MessagePortMsg>),
+    NewMessagePortRouter(MessagePortRouterId, GenericCallback<MessagePortMsg>),
     /// A global has stopped managing message-ports
     RemoveMessagePortRouter(MessagePortRouterId),
     /// A task requires re-routing to an already shipped message-port.
@@ -499,7 +646,7 @@ pub enum ScriptToConstellationMessage {
     /// A global has started managing broadcast-channels.
     NewBroadcastChannelRouter(
         BroadcastChannelRouterId,
-        IpcSender<BroadcastMsg>,
+        GenericCallback<BroadcastChannelMsg>,
         ImmutableOrigin,
     ),
     /// A global has stopped managing broadcast-channels.
@@ -510,13 +657,17 @@ pub enum ScriptToConstellationMessage {
     RemoveBroadcastChannelNameInRouter(BroadcastChannelRouterId, String, ImmutableOrigin),
     /// Broadcast a message to all same-origin broadcast channels,
     /// excluding the source of the broadcast.
-    ScheduleBroadcast(BroadcastChannelRouterId, BroadcastMsg),
-    /// Forward a message to the embedder.
-    ForwardToEmbedder(EmbedderMsg),
+    ScheduleBroadcast(BroadcastChannelRouterId, BroadcastChannelMsg),
+    /// Register this pipeline's interest in a category of notifications.
+    /// The constellation will only send notifications in this category to
+    /// pipelines that have registered interest.
+    RegisterInterest(ConstellationInterest),
+    /// Unregister this pipeline's interest in a category of notifications.
+    UnregisterInterest(ConstellationInterest),
     /// Broadcast a storage event to every same-origin pipeline.
     /// The strings are key, old value and new value.
     BroadcastStorageEvent(
-        StorageType,
+        WebStorageType,
         ServoUrl,
         Option<String>,
         Option<String>,
@@ -528,7 +679,7 @@ pub enum ScriptToConstellationMessage {
     /// 2D canvases may use the GPU and we don't want to give untrusted content access to the GPU.)
     CreateCanvasPaintThread(
         UntypedSize2D<u64>,
-        IpcSender<(IpcSender<CanvasMsg>, CanvasId, ImageKey)>,
+        GenericSender<Option<(GenericSender<CanvasMsg>, CanvasId)>>,
     ),
     /// Notifies the constellation that this pipeline is requesting focus.
     ///
@@ -542,29 +693,36 @@ pub enum ScriptToConstellationMessage {
     ///
     /// The second field is a sequence number that the constellation should use
     /// when sending a focus-related message to the sender pipeline next time.
-    Focus(Option<BrowsingContextId>, FocusSequenceNumber),
-    /// Requests the constellation to focus the specified browsing context.
-    FocusRemoteDocument(BrowsingContextId),
+    FocusAncestorBrowsingContextsForFocusingSteps(Option<BrowsingContextId>, FocusSequenceNumber),
+    /// Focus a remote `BrowsingContext` and run the focusing steps. This is used in two situations:
+    /// - When calling the DOM `focus()` API on a remote `Window` as well as from
+    ///   WebDriver. The difference between this and `FocusDocumentAsPartOfFocusingSteps` is that this
+    ///   version actually does run the focusing steps and may result in blur and focus events firing
+    ///   up the frame tree.
+    /// - When doing sequential focus navigation into and out of frames.
+    FocusRemoteBrowsingContext(BrowsingContextId, RemoteFocusOperation),
     /// Get the top-level browsing context info for a given browsing context.
-    GetTopForBrowsingContext(BrowsingContextId, IpcSender<Option<WebViewId>>),
+    GetTopForBrowsingContext(BrowsingContextId, GenericSender<Option<WebViewId>>),
     /// Get the browsing context id of the browsing context in which pipeline is
     /// embedded and the parent pipeline id of that browsing context.
     GetBrowsingContextInfo(
         PipelineId,
-        IpcSender<Option<(BrowsingContextId, Option<PipelineId>)>>,
+        GenericSender<Option<(BrowsingContextId, Option<PipelineId>)>>,
     ),
     /// Get the nth child browsing context ID for a given browsing context, sorted in tree order.
     GetChildBrowsingContextId(
         BrowsingContextId,
         usize,
-        IpcSender<Option<BrowsingContextId>>,
+        GenericSender<Option<BrowsingContextId>>,
     ),
+    /// Get the origin of the document corresponding to the given pipeline
+    GetDocumentOrigin(PipelineId, GenericSender<Option<String>>),
     /// All pending loads are complete, and the `load` event for this pipeline
     /// has been dispatched.
     LoadComplete,
     /// A new load has been requested, with an option to replace the current entry once loaded
     /// instead of adding a new entry.
-    LoadUrl(LoadData, NavigationHistoryBehavior),
+    LoadUrl(LoadData, NavigationHistoryBehavior, TargetSnapshotParams),
     /// Abort loading after sending a LoadUrl message.
     AbortLoadUrl,
     /// Post a message to the currently active window of a given browsing context.
@@ -590,7 +748,7 @@ pub enum ScriptToConstellationMessage {
     /// Inform the constellation of a replaced history state.
     ReplaceHistoryState(HistoryStateId, ServoUrl),
     /// Gets the length of the joint session history from the constellation.
-    JointSessionHistoryLength(IpcSender<u32>),
+    JointSessionHistoryLength(GenericSender<u32>),
     /// Notification that this iframe should be removed.
     /// Returns a list of pipelines which were closed.
     RemoveIFrame(BrowsingContextId, IpcSender<Vec<PipelineId>>),
@@ -606,14 +764,10 @@ pub enum ScriptToConstellationMessage {
     ActivateDocument,
     /// Set the document state for a pipeline (used by screenshot / reftests)
     SetDocumentState(DocumentState),
-    /// Update the layout epoch in the constellation (used by screenshot / reftests).
-    SetLayoutEpoch(Epoch, IpcSender<bool>),
     /// Update the pipeline Url, which can change after redirections.
     SetFinalUrl(ServoUrl),
-    /// Script has handled a touch event, and either prevented or allowed default actions.
-    TouchEventProcessed(TouchEventResult),
     /// A log entry, with the top-level browsing context id and thread name
-    LogEntry(Option<String>, LogEntry),
+    LogEntry(Option<ScriptEventLoopId>, Option<String>, LogEntry),
     /// Discard the document.
     DiscardDocument,
     /// Discard the browsing context.
@@ -623,27 +777,44 @@ pub enum ScriptToConstellationMessage {
     /// Send messages from postMessage calls from serviceworker
     /// to constellation for storing in service worker manager
     ForwardDOMMessage(DOMMessage, ServoUrl),
-    /// <https://w3c.github.io/ServiceWorker/#schedule-job-algorithm>
-    ScheduleJob(Job),
     /// Notifies the constellation about media session events
     /// (i.e. when there is metadata for the active media session, playback state changes...).
     MediaSessionEvent(PipelineId, MediaSessionEvent),
     #[cfg(feature = "webgpu")]
     /// Create a WebGPU Adapter instance
     RequestAdapter(
-        IpcSender<WebGPUAdapterResponse>,
+        GenericCallback<WebGPUAdapterResponse>,
         wgpu_core::instance::RequestAdapterOptions,
         wgpu_core::id::AdapterId,
     ),
     #[cfg(feature = "webgpu")]
     /// Get WebGPU channel
-    GetWebGPUChan(IpcSender<Option<WebGPU>>),
+    GetWebGPUChan(GenericSender<Option<WebGPU>>),
     /// Notify the constellation of a pipeline's document's title.
     TitleChanged(PipelineId, String),
     /// Notify the constellation that the size of some `<iframe>`s has changed.
     IFrameSizes(Vec<IFrameSizeMsg>),
     /// Request results from the memory reporter.
-    ReportMemory(IpcSender<MemoryReportResult>),
+    ReportMemory(GenericCallback<MemoryReportResult>),
+    /// Return the result of the evaluated JavaScript with the given [`JavaScriptEvaluationId`].
+    FinishJavaScriptEvaluation(
+        JavaScriptEvaluationId,
+        Result<JSValue, JavaScriptEvaluationError>,
+    ),
+    /// Forward a keyboard scroll operation from an `<iframe>` to a parent pipeline.
+    ForwardKeyboardScroll(PipelineId, KeyboardScroll),
+    /// Notify the Constellation of the screenshot readiness of a given pipeline.
+    RespondToScreenshotReadinessRequest(ScreenshotReadinessResponse),
+    /// Request the constellation to force garbage collection in all `ScriptThread`'s.
+    TriggerGarbageCollection,
+    /// Request to acquire a wake lock of the given type. The constellation will track the
+    /// aggregate lock count and notify the provider only when the count transitions from 0 to 1.
+    /// <https://w3c.github.io/screen-wake-lock/#dfn-acquire-wake-lock>
+    AcquireWakeLock(WakeLockType),
+    /// Request to release a wake lock of the given type. The constellation will track the
+    /// aggregate lock count and notify the provider only when the count transitions from N to 0.
+    /// <https://w3c.github.io/screen-wake-lock/#dfn-release-wake-lock>
+    ReleaseWakeLock(WakeLockType),
 }
 
 impl fmt::Debug for ScriptToConstellationMessage {
@@ -651,4 +822,43 @@ impl fmt::Debug for ScriptToConstellationMessage {
         let variant_string: &'static str = self.into();
         write!(formatter, "ScriptMsg::{variant_string}")
     }
+}
+
+/// <https://html.spec.whatwg.org/multipage/#target-snapshot-params>
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct TargetSnapshotParams {
+    /// <https://html.spec.whatwg.org/multipage/#target-snapshot-params-sandbox>
+    pub sandboxing_flags: SandboxingFlagSet,
+    /// <https://html.spec.whatwg.org/multipage/#target-snapshot-params-iframe-referrer-policy>
+    pub iframe_element_referrer_policy: ReferrerPolicy,
+}
+
+impl Default for TargetSnapshotParams {
+    fn default() -> Self {
+        Self {
+            sandboxing_flags: SandboxingFlagSet::empty(),
+            iframe_element_referrer_policy: ReferrerPolicy::EmptyString,
+        }
+    }
+}
+
+/// <https://html.spec.whatwg.org/multipage/#sequential-focus-direction>
+///
+/// > A sequential focus direction is one of two possible values: "forward", or "backward". They are
+/// > used in the below algorithms to describe the direction in which sequential focus travels at the
+/// > user's request.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub enum SequentialFocusDirection {
+    Forward,
+    Backward,
+}
+
+/// The type of focus operation to do on a remote document.
+#[derive(Deserialize, Serialize)]
+pub enum RemoteFocusOperation {
+    /// Focus the entire viewport of the remote document.
+    Viewport,
+    /// Do sequential focus navigation using the `<iframe>` element with the given
+    /// [`BrowsingContextId`] as the starting point and in the given direction.
+    Sequential(SequentialFocusDirection, Option<BrowsingContextId>),
 }

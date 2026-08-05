@@ -48,14 +48,17 @@
 
 use std::cell::OnceCell;
 use std::collections::BinaryHeap;
+use std::ffi::CString;
 use std::hash::{BuildHasher, Hash};
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use resvg::usvg::fontdb::Source;
+use resvg::usvg::{self, tiny_skia_path};
+use style::properties::ComputedValues;
 use style::values::generics::length::GenericLengthPercentageOrAuto;
 pub use stylo_malloc_size_of::MallocSizeOfOps;
-use uuid::Uuid;
 
 /// Trait for measuring the "deep" heap usage of a data structure. This is the
 /// most commonly-used of the traits.
@@ -115,6 +118,14 @@ impl<T: MallocSizeOf> MallocSizeOf for [T] {
     }
 }
 
+impl<T: MallocConditionalSizeOf> MallocConditionalSizeOf for [T] {
+    fn conditional_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.iter()
+            .map(|element| element.conditional_size_of(ops))
+            .sum()
+    }
+}
+
 /// For use on types where size_of() returns 0.
 #[macro_export]
 macro_rules! malloc_size_of_is_0(
@@ -158,6 +169,12 @@ impl MallocSizeOf for markup5ever::QualName {
 }
 
 impl MallocSizeOf for String {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        unsafe { ops.malloc_size_of(self.as_ptr()) }
+    }
+}
+
+impl MallocSizeOf for CString {
     fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
         unsafe { ops.malloc_size_of(self.as_ptr()) }
     }
@@ -238,6 +255,53 @@ impl<T: MallocConditionalSizeOf> MallocConditionalSizeOf for Vec<T> {
             n += elem.conditional_size_of(ops);
         }
         n
+    }
+}
+
+impl<T: MallocConditionalSizeOf> MallocConditionalSizeOf for std::collections::VecDeque<T> {
+    fn conditional_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        let mut n = self.shallow_size_of(ops);
+        for elem in self.iter() {
+            n += elem.conditional_size_of(ops);
+        }
+        n
+    }
+}
+
+impl<T: MallocConditionalSizeOf> MallocConditionalSizeOf for std::cell::RefCell<T> {
+    fn conditional_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.borrow().conditional_size_of(ops)
+    }
+}
+
+impl<T1, T2> MallocConditionalSizeOf for (T1, T2)
+where
+    T1: MallocConditionalSizeOf,
+    T2: MallocConditionalSizeOf,
+{
+    fn conditional_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.0.conditional_size_of(ops) + self.1.conditional_size_of(ops)
+    }
+}
+
+impl<T: MallocConditionalSizeOf + ?Sized> MallocConditionalSizeOf for Box<T> {
+    fn conditional_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.shallow_size_of(ops) + (**self).conditional_size_of(ops)
+    }
+}
+
+impl<T: MallocConditionalSizeOf, E: MallocSizeOf> MallocConditionalSizeOf for Result<T, E> {
+    fn conditional_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        match *self {
+            Ok(ref x) => x.conditional_size_of(ops),
+            Err(ref e) => e.size_of(ops),
+        }
+    }
+}
+
+impl MallocConditionalSizeOf for () {
+    fn conditional_size_of(&self, _ops: &mut MallocSizeOfOps) -> usize {
+        0
     }
 }
 
@@ -327,6 +391,13 @@ impl<T: MallocSizeOf> MallocSizeOf for std::collections::VecDeque<T> {
     }
 }
 
+impl MallocSizeOf for std::path::PathBuf {
+    fn size_of(&self, _ops: &mut MallocSizeOfOps) -> usize {
+        // This should be an approximation of the actual size
+        self.as_os_str().as_encoded_bytes().len()
+    }
+}
+
 impl<A: smallvec::Array> MallocShallowSizeOf for smallvec::SmallVec<A> {
     fn shallow_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
         if self.spilled() {
@@ -351,34 +422,44 @@ where
     }
 }
 
-impl<T> MallocShallowSizeOf for thin_vec::ThinVec<T> {
-    fn shallow_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
-        if self.capacity() == 0 {
-            // If it's the singleton we might not be a heap pointer.
+impl<A: MallocConditionalSizeOf> MallocConditionalSizeOf for smallvec::SmallVec<A>
+where
+    A: smallvec::Array,
+    A::Item: MallocConditionalSizeOf,
+{
+    fn conditional_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        if !self.spilled() {
             return 0;
         }
 
-        assert_eq!(
-            std::mem::size_of::<Self>(),
-            std::mem::size_of::<*const ()>()
-        );
-        unsafe { ops.malloc_size_of(*(self as *const Self as *const *const ())) }
-    }
-}
-
-impl<T: MallocSizeOf> MallocSizeOf for thin_vec::ThinVec<T> {
-    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
-        let mut n = self.shallow_size_of(ops);
-        for elem in self.iter() {
-            n += elem.size_of(ops);
-        }
-        n
+        self.shallow_size_of(ops) +
+            self.iter()
+                .map(|element| element.conditional_size_of(ops))
+                .sum::<usize>()
     }
 }
 
 impl<T: MallocSizeOf> MallocSizeOf for BinaryHeap<T> {
     fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
         self.iter().map(|element| element.size_of(ops)).sum()
+    }
+}
+
+impl<T: MallocSizeOf> MallocSizeOf for std::collections::BTreeSet<T> {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.iter().map(|element| element.size_of(ops)).sum()
+    }
+}
+
+impl<T: MallocSizeOf> MallocSizeOf for Range<T> {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.start.size_of(ops) + self.end.size_of(ops)
+    }
+}
+
+impl<T: MallocSizeOf> MallocSizeOf for RangeInclusive<T> {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.start().size_of(ops) + self.end().size_of(ops)
     }
 }
 
@@ -457,6 +538,22 @@ macro_rules! malloc_size_of_hash_map {
                 n
             }
         }
+
+        impl<K, V, S> MallocConditionalSizeOf for $ty
+        where
+            K: Eq + Hash + MallocSizeOf,
+            V: MallocConditionalSizeOf,
+            S: BuildHasher,
+        {
+            fn conditional_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+                let mut n = self.shallow_size_of(ops);
+                for (k, v) in self.iter() {
+                    n += k.size_of(ops);
+                    n += v.conditional_size_of(ops);
+                }
+                n
+            }
+        }
     };
 }
 
@@ -507,12 +604,36 @@ impl<T: MallocSizeOf> MallocSizeOf for OnceCell<T> {
     }
 }
 
+impl<T: MallocConditionalSizeOf> MallocConditionalSizeOf for OnceCell<T> {
+    fn conditional_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.get()
+            .map(|interior| interior.conditional_size_of(ops))
+            .unwrap_or_default()
+    }
+}
+
+impl<T: MallocSizeOf> MallocSizeOf for OnceLock<T> {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.get()
+            .map(|interior| interior.size_of(ops))
+            .unwrap_or_default()
+    }
+}
+
+impl<T: MallocConditionalSizeOf> MallocConditionalSizeOf for OnceLock<T> {
+    fn conditional_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.get()
+            .map(|interior| interior.conditional_size_of(ops))
+            .unwrap_or_default()
+    }
+}
+
 // See https://github.com/rust-lang/rust/issues/68318:
 // We don't want MallocSizeOf to be defined for Rc and Arc. If negative trait bounds are
 // ever allowed, this code should be uncommented.  Instead, there is a compile-fail test for
 // this.
-//impl<T> !MallocSizeOf for Arc<T> { }
-//impl<T> !MallocShallowSizeOf for Arc<T> { }
+// impl<T> !MallocSizeOf for Arc<T> { }
+// impl<T> !MallocShallowSizeOf for Arc<T> { }
 
 impl<T> MallocUnconditionalShallowSizeOf for servo_arc::Arc<T> {
     fn unconditional_shallow_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
@@ -600,6 +721,14 @@ impl<T: MallocSizeOf> MallocConditionalSizeOf for Rc<T> {
     }
 }
 
+impl<T: MallocSizeOf> MallocSizeOf for std::sync::Weak<T> {
+    fn size_of(&self, _: &mut MallocSizeOfOps) -> usize {
+        // A weak reference to the data necessarily has another strong reference
+        // somewhere else where it can be measured or...it's been released and is zero.
+        0
+    }
+}
+
 /// If a mutex is stored directly as a member of a data type that is being measured,
 /// it is the unique owner of its contents and deserves to be measured.
 ///
@@ -609,6 +738,30 @@ impl<T: MallocSizeOf> MallocConditionalSizeOf for Rc<T> {
 impl<T: MallocSizeOf> MallocSizeOf for std::sync::Mutex<T> {
     fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
         (*self.lock().unwrap()).size_of(ops)
+    }
+}
+
+impl<T: MallocSizeOf> MallocSizeOf for std::sync::RwLock<T> {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        (*self.read().unwrap()).size_of(ops)
+    }
+}
+
+impl<T: MallocSizeOf> MallocSizeOf for parking_lot::Mutex<T> {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        (*self.lock()).size_of(ops)
+    }
+}
+
+impl<T: MallocSizeOf> MallocSizeOf for parking_lot::RwLock<T> {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        (*self.read()).size_of(ops)
+    }
+}
+
+impl<T: MallocConditionalSizeOf> MallocConditionalSizeOf for parking_lot::RwLock<T> {
+    fn conditional_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        (*self.read()).conditional_size_of(ops)
     }
 }
 
@@ -627,6 +780,18 @@ impl<T: MallocSizeOf, Src, Dst> MallocSizeOf for euclid::Scale<T, Src, Dst> {
 impl<T: MallocSizeOf, U> MallocSizeOf for euclid::Point2D<T, U> {
     fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
         self.x.size_of(ops) + self.y.size_of(ops)
+    }
+}
+
+impl<T: MallocSizeOf, U> MallocSizeOf for euclid::Box2D<T, U> {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.min.size_of(ops) + self.max.size_of(ops)
+    }
+}
+
+impl<T: MallocSizeOf, U> MallocSizeOf for euclid::Vector3D<T, U> {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.x.size_of(ops) + self.y.size_of(ops) + self.z.size_of(ops)
     }
 }
 
@@ -683,6 +848,18 @@ impl<T: MallocSizeOf, Src, Dst> MallocSizeOf for euclid::Transform3D<T, Src, Dst
     }
 }
 
+impl<T: MallocSizeOf, Src, Dst> MallocSizeOf for euclid::RigidTransform3D<T, Src, Dst> {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.rotation.i.size_of(ops) +
+            self.rotation.j.size_of(ops) +
+            self.rotation.k.size_of(ops) +
+            self.rotation.r.size_of(ops) +
+            self.translation.x.size_of(ops) +
+            self.translation.y.size_of(ops) +
+            self.translation.z.size_of(ops)
+    }
+}
+
 impl MallocSizeOf for url::Host {
     fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
         match *self {
@@ -712,6 +889,188 @@ impl<Static: string_cache::StaticAtomSet> MallocSizeOf for string_cache::Atom<St
     }
 }
 
+impl MallocSizeOf for usvg::Tree {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        let root = self.root();
+        let linear_gradients = self.linear_gradients();
+        let radial_gradients = self.radial_gradients();
+        let patterns = self.patterns();
+        let clip_paths = self.clip_paths();
+        let masks = self.masks();
+        let filters = self.filters();
+        let fontdb = self.fontdb();
+
+        let mut sum = root.size_of(ops) +
+            linear_gradients.size_of(ops) +
+            radial_gradients.size_of(ops) +
+            patterns.size_of(ops) +
+            clip_paths.size_of(ops) +
+            masks.size_of(ops) +
+            filters.size_of(ops);
+
+        sum += fontdb.conditional_size_of(ops);
+
+        if ops.has_malloc_enclosing_size_of() {
+            unsafe {
+                sum += ops.malloc_enclosing_size_of(root);
+                if !linear_gradients.is_empty() {
+                    sum += ops.malloc_enclosing_size_of(linear_gradients.as_ptr());
+                }
+                if !radial_gradients.is_empty() {
+                    sum += ops.malloc_enclosing_size_of(radial_gradients.as_ptr());
+                }
+                if !patterns.is_empty() {
+                    sum += ops.malloc_enclosing_size_of(patterns.as_ptr());
+                }
+                if !clip_paths.is_empty() {
+                    sum += ops.malloc_enclosing_size_of(clip_paths.as_ptr());
+                }
+                if !masks.is_empty() {
+                    sum += ops.malloc_enclosing_size_of(masks.as_ptr());
+                }
+                if !filters.is_empty() {
+                    sum += ops.malloc_enclosing_size_of(filters.as_ptr());
+                }
+            }
+        }
+        sum
+    }
+}
+
+impl MallocSizeOf for usvg::Group {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        let id = self.id();
+        let children = self.children();
+        let filters = self.filters();
+        let clip_path = self.clip_path();
+
+        let mut sum =
+            id.size_of(ops) + children.size_of(ops) + filters.size_of(ops) + clip_path.size_of(ops);
+
+        if ops.has_malloc_enclosing_size_of() {
+            unsafe {
+                if !id.is_empty() {
+                    sum += ops.malloc_enclosing_size_of(id.as_ptr());
+                }
+                if let Some(c) = clip_path {
+                    sum += ops.malloc_enclosing_size_of(c)
+                }
+                if !children.is_empty() {
+                    sum += ops.malloc_enclosing_size_of(children.as_ptr());
+                }
+                if !filters.is_empty() {
+                    sum += ops.malloc_enclosing_size_of(filters.as_ptr());
+                }
+            }
+        }
+        sum
+    }
+}
+
+impl MallocSizeOf for usvg::Node {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        let id = self.id();
+
+        let mut sum = id.size_of(ops);
+        if ops.has_malloc_enclosing_size_of() {
+            unsafe {
+                if !id.is_empty() {
+                    sum += ops.malloc_enclosing_size_of(id.as_ptr())
+                }
+            }
+        }
+        match self {
+            usvg::Node::Group(group) => {
+                sum += group.size_of(ops);
+                if ops.has_malloc_enclosing_size_of() {
+                    unsafe { sum += ops.malloc_enclosing_size_of(group) }
+                }
+            },
+            usvg::Node::Path(path) => {
+                sum += path.size_of(ops);
+                if ops.has_malloc_enclosing_size_of() {
+                    unsafe { sum += ops.malloc_enclosing_size_of(path) }
+                }
+            },
+            usvg::Node::Image(image) => {
+                sum += image.size_of(ops);
+            },
+            usvg::Node::Text(text) => {
+                sum += text.size_of(ops);
+            },
+        };
+        sum
+    }
+}
+
+impl MallocSizeOf for usvg::Path {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        let id = self.id();
+        let data = self.data();
+        let fill = self.fill();
+        let stroke = self.stroke();
+
+        let mut sum = id.size_of(ops) + data.size_of(ops) + fill.size_of(ops) + stroke.size_of(ops);
+        if ops.has_malloc_enclosing_size_of() {
+            unsafe {
+                if !id.is_empty() {
+                    sum += ops.malloc_enclosing_size_of(id.as_ptr());
+                }
+                sum += ops.malloc_enclosing_size_of(data);
+                if let Some(f) = fill {
+                    sum += ops.malloc_enclosing_size_of(f)
+                }
+                if let Some(s) = stroke {
+                    sum += ops.malloc_enclosing_size_of(s)
+                }
+            }
+        }
+        sum
+    }
+}
+impl MallocSizeOf for tiny_skia_path::Path {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        let verbs = self.verbs();
+        let points = self.points();
+
+        let mut sum = verbs.size_of(ops) + points.size_of(ops);
+        if ops.has_malloc_enclosing_size_of() {
+            unsafe {
+                if !points.is_empty() {
+                    sum += ops.malloc_enclosing_size_of(points.as_ptr());
+                }
+                if !verbs.is_empty() {
+                    sum += ops.malloc_enclosing_size_of(verbs.as_ptr());
+                }
+            }
+        }
+
+        sum
+    }
+}
+
+impl MallocSizeOf for usvg::ClipPath {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        let id = self.id();
+        let clip_path = self.clip_path();
+        let root = self.root();
+
+        let mut sum = id.size_of(ops) + clip_path.size_of(ops) + root.size_of(ops);
+        if ops.has_malloc_enclosing_size_of() {
+            unsafe {
+                sum += ops.malloc_enclosing_size_of(root);
+                if !id.is_empty() {
+                    sum += ops.malloc_enclosing_size_of(id.as_ptr());
+                }
+                if let Some(c) = clip_path {
+                    sum += c.size_of(ops)
+                }
+            }
+        }
+        sum
+    }
+}
+
 // Placeholder for unique case where internals of Sender cannot be measured.
 // malloc size of is 0 macro complains about type supplied!
 impl<T> MallocSizeOf for crossbeam_channel::Sender<T> {
@@ -720,7 +1079,19 @@ impl<T> MallocSizeOf for crossbeam_channel::Sender<T> {
     }
 }
 
+impl<T> MallocSizeOf for crossbeam_channel::Receiver<T> {
+    fn size_of(&self, _ops: &mut MallocSizeOfOps) -> usize {
+        0
+    }
+}
+
 impl<T> MallocSizeOf for tokio::sync::mpsc::UnboundedSender<T> {
+    fn size_of(&self, _ops: &mut MallocSizeOfOps) -> usize {
+        0
+    }
+}
+
+impl<T> MallocSizeOf for tokio::sync::oneshot::Sender<T> {
     fn size_of(&self, _ops: &mut MallocSizeOfOps) -> usize {
         0
     }
@@ -744,9 +1115,31 @@ impl MallocSizeOf for ipc_channel::ipc::IpcSharedMemory {
     }
 }
 
-impl<T: MallocSizeOf> MallocSizeOf for accountable_refcell::RefCell<T> {
+impl<T> MallocSizeOf for std::sync::mpsc::Sender<T> {
+    fn size_of(&self, _ops: &mut MallocSizeOfOps) -> usize {
+        0
+    }
+}
+
+impl MallocSizeOf for servo_arc::Arc<ComputedValues> {
     fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
-        self.borrow().size_of(ops)
+        self.conditional_size_of(ops)
+    }
+}
+
+impl MallocSizeOf for http::HeaderMap {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        // The headermap in http is more complicated than a simple hashmap
+        // However, this should give us a reasonable approximation.
+        self.iter()
+            .map(|entry| entry.0.size_of(ops) + entry.1.size_of(ops))
+            .sum()
+    }
+}
+
+impl MallocSizeOf for data_url::mime::Mime {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.type_.size_of(ops) + self.parameters.size_of(ops) + self.subtype.size_of(ops)
     }
 }
 
@@ -758,34 +1151,76 @@ malloc_size_of_is_0!(f32, f64);
 malloc_size_of_is_0!(i8, i16, i32, i64, i128, isize);
 malloc_size_of_is_0!(u8, u16, u32, u64, u128, usize);
 
-malloc_size_of_is_0!(Range<f32>, Range<f64>);
-malloc_size_of_is_0!(Range<i8>, Range<i16>, Range<i32>, Range<i64>, Range<isize>);
-malloc_size_of_is_0!(Range<u8>, Range<u16>, Range<u32>, Range<u64>, Range<usize>);
-
-malloc_size_of_is_0!(Uuid);
-malloc_size_of_is_0!(content_security_policy::Destination);
-malloc_size_of_is_0!(http::StatusCode);
+malloc_size_of_is_0!(uuid::Uuid);
 malloc_size_of_is_0!(app_units::Au);
+malloc_size_of_is_0!(content_security_policy::Destination);
+malloc_size_of_is_0!(content_security_policy::sandboxing_directive::SandboxingFlagSet);
+malloc_size_of_is_0!(encoding_rs::Decoder);
+malloc_size_of_is_0!(http::StatusCode);
+malloc_size_of_is_0!(http::Method);
+malloc_size_of_is_0!(icu_locid::subtags::Language);
+malloc_size_of_is_0!(keyboard_types::Code);
 malloc_size_of_is_0!(keyboard_types::Modifiers);
+malloc_size_of_is_0!(mime::Mime);
+malloc_size_of_is_0!(resvg::usvg::fontdb::ID);
+malloc_size_of_is_0!(resvg::usvg::fontdb::Style);
+malloc_size_of_is_0!(resvg::usvg::fontdb::Weight);
+malloc_size_of_is_0!(resvg::usvg::fontdb::Stretch);
+malloc_size_of_is_0!(resvg::usvg::fontdb::Language);
+malloc_size_of_is_0!(std::num::NonZeroU16);
+malloc_size_of_is_0!(std::num::NonZeroU32);
 malloc_size_of_is_0!(std::num::NonZeroU64);
 malloc_size_of_is_0!(std::num::NonZeroUsize);
 malloc_size_of_is_0!(std::sync::atomic::AtomicBool);
+malloc_size_of_is_0!(std::sync::atomic::AtomicI32);
 malloc_size_of_is_0!(std::sync::atomic::AtomicIsize);
+malloc_size_of_is_0!(std::sync::atomic::AtomicU32);
+malloc_size_of_is_0!(std::sync::atomic::AtomicU8);
 malloc_size_of_is_0!(std::sync::atomic::AtomicUsize);
 malloc_size_of_is_0!(std::time::Duration);
 malloc_size_of_is_0!(std::time::Instant);
 malloc_size_of_is_0!(std::time::SystemTime);
-malloc_size_of_is_0!(style::data::ElementData);
+malloc_size_of_is_0!(style::data::ElementDataWrapper);
 malloc_size_of_is_0!(style::font_face::SourceList);
 malloc_size_of_is_0!(style::properties::ComputedValues);
 malloc_size_of_is_0!(style::properties::declaration_block::PropertyDeclarationBlock);
 malloc_size_of_is_0!(style::queries::values::PrefersColorScheme);
 malloc_size_of_is_0!(style::stylesheets::Stylesheet);
+malloc_size_of_is_0!(style::stylesheets::FontFaceRule);
 malloc_size_of_is_0!(style::values::specified::source_size_list::SourceSizeList);
 malloc_size_of_is_0!(taffy::Layout);
+malloc_size_of_is_0!(time::Duration);
 malloc_size_of_is_0!(unicode_bidi::Level);
 malloc_size_of_is_0!(unicode_script::Script);
-malloc_size_of_is_0!(urlpattern::UrlPattern);
+malloc_size_of_is_0!(std::net::TcpStream);
+
+impl MallocSizeOf for urlpattern::UrlPattern {
+    fn size_of(&self, _ops: &mut MallocSizeOfOps) -> usize {
+        // This is an approximation
+        self.protocol().len() +
+            self.username().len() +
+            self.password().len() +
+            self.hostname().len() +
+            self.port().len() +
+            self.pathname().len() +
+            self.search().len() +
+            self.hash().len()
+    }
+}
+
+impl<S: tendril::TendrilSink<tendril::fmt::UTF8, A>, A: tendril::Atomicity> MallocSizeOf
+    for tendril::stream::LossyDecoder<S, A>
+{
+    fn size_of(&self, _: &mut MallocSizeOfOps) -> usize {
+        0
+    }
+}
+
+impl<F: tendril::Format> MallocSizeOf for tendril::SendTendril<F> {
+    fn size_of(&self, _: &mut MallocSizeOfOps) -> usize {
+        0
+    }
+}
 
 macro_rules! malloc_size_of_is_webrender_malloc_size_of(
     ($($ty:ty),+) => (
@@ -800,13 +1235,18 @@ macro_rules! malloc_size_of_is_webrender_malloc_size_of(
     );
 );
 
+malloc_size_of_is_webrender_malloc_size_of!(webrender::FastTransform<webrender_api::units::LayoutPixel, webrender_api::units::LayoutPixel>);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::BorderRadius);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::BorderStyle);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::BoxShadowClipMode);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::ColorF);
+malloc_size_of_is_webrender_malloc_size_of!(webrender_api::Epoch);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::ExtendMode);
-malloc_size_of_is_webrender_malloc_size_of!(webrender_api::FontKey);
+malloc_size_of_is_webrender_malloc_size_of!(webrender_api::ExternalScrollId);
+malloc_size_of_is_webrender_malloc_size_of!(webrender_api::FontInstanceFlags);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::FontInstanceKey);
+malloc_size_of_is_webrender_malloc_size_of!(webrender_api::FontKey);
+malloc_size_of_is_webrender_malloc_size_of!(webrender_api::FontVariation);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::GlyphInstance);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::GradientStop);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::ImageKey);
@@ -814,7 +1254,15 @@ malloc_size_of_is_webrender_malloc_size_of!(webrender_api::ImageRendering);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::LineStyle);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::MixBlendMode);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::NormalBorder);
+malloc_size_of_is_webrender_malloc_size_of!(webrender_api::PipelineId);
+malloc_size_of_is_webrender_malloc_size_of!(
+    webrender_api::PropertyBindingKey<webrender_api::ColorF>
+);
+malloc_size_of_is_webrender_malloc_size_of!(webrender_api::ReferenceFrameKind);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::RepeatMode);
+malloc_size_of_is_webrender_malloc_size_of!(webrender_api::SpatialId);
+malloc_size_of_is_webrender_malloc_size_of!(webrender_api::StickyOffsetBounds);
+malloc_size_of_is_webrender_malloc_size_of!(webrender_api::TransformStyle);
 
 macro_rules! malloc_size_of_is_stylo_malloc_size_of(
     ($($ty:ty),+) => (
@@ -854,7 +1302,7 @@ impl<T> MallocSizeOf for style::shared_lock::Locked<T> {
     fn size_of(&self, _ops: &mut MallocSizeOfOps) -> usize {
         // TODO: fix this implementation when Locked derives MallocSizeOf.
         0
-        //<style::shared_lock::Locked<T> as stylo_malloc_size_of::MallocSizeOf>::size_of(self, ops)
+        // <style::shared_lock::Locked<T> as stylo_malloc_size_of::MallocSizeOf>::size_of(self, ops)
     }
 }
 
@@ -864,15 +1312,45 @@ impl<T: MallocSizeOf> MallocSizeOf for atomic_refcell::AtomicRefCell<T> {
     }
 }
 
+impl<T: stylo_malloc_size_of::MallocSizeOf, const FRACTION_BITS: u16> MallocSizeOf
+    for style::values::computed::font::FixedPoint<T, FRACTION_BITS>
+{
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        <Self as stylo_malloc_size_of::MallocSizeOf>::size_of(self, ops)
+    }
+}
+
+impl<Integer, Number, LinearStops> MallocSizeOf
+    for style::values::generics::easing::TimingFunction<Integer, Number, LinearStops>
+where
+    Integer: stylo_malloc_size_of::MallocSizeOf,
+    Number: stylo_malloc_size_of::MallocSizeOf,
+    LinearStops: stylo_malloc_size_of::MallocSizeOf,
+{
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        <Self as stylo_malloc_size_of::MallocSizeOf>::size_of(self, ops)
+    }
+}
+
+malloc_size_of_is_stylo_malloc_size_of!(style::properties::PropertyId);
 malloc_size_of_is_stylo_malloc_size_of!(style::animation::DocumentAnimationSet);
 malloc_size_of_is_stylo_malloc_size_of!(style::attr::AttrIdentifier);
 malloc_size_of_is_stylo_malloc_size_of!(style::attr::AttrValue);
 malloc_size_of_is_stylo_malloc_size_of!(style::color::AbsoluteColor);
 malloc_size_of_is_stylo_malloc_size_of!(style::computed_values::font_variant_caps::T);
+malloc_size_of_is_stylo_malloc_size_of!(style::computed_values::font_variant_position::T);
+malloc_size_of_is_stylo_malloc_size_of!(style::computed_values::text_decoration_style::T);
+malloc_size_of_is_stylo_malloc_size_of!(style::computed_values::text_decoration_thickness::T);
+malloc_size_of_is_stylo_malloc_size_of!(style::computed_values::text_rendering::T);
 malloc_size_of_is_stylo_malloc_size_of!(style::dom::OpaqueNode);
+malloc_size_of_is_stylo_malloc_size_of!(style::font_face::ComputedFontStretchRange);
+malloc_size_of_is_stylo_malloc_size_of!(style::font_face::ComputedFontStyleRange);
+malloc_size_of_is_stylo_malloc_size_of!(style::font_face::ComputedFontWeightRange);
+malloc_size_of_is_stylo_malloc_size_of!(style::font_face::Source);
 malloc_size_of_is_stylo_malloc_size_of!(style::invalidation::element::restyle_hints::RestyleHint);
 malloc_size_of_is_stylo_malloc_size_of!(style::logical_geometry::WritingMode);
 malloc_size_of_is_stylo_malloc_size_of!(style::media_queries::MediaList);
+malloc_size_of_is_stylo_malloc_size_of!(style::properties::generated::font_face::Descriptors);
 malloc_size_of_is_stylo_malloc_size_of!(
     style::properties::longhands::align_items::computed_value::T
 );
@@ -886,17 +1364,33 @@ malloc_size_of_is_stylo_malloc_size_of!(style::selector_parser::RestyleDamage);
 malloc_size_of_is_stylo_malloc_size_of!(style::selector_parser::Snapshot);
 malloc_size_of_is_stylo_malloc_size_of!(style::shared_lock::SharedRwLock);
 malloc_size_of_is_stylo_malloc_size_of!(style::stylesheets::DocumentStyleSheet);
+malloc_size_of_is_stylo_malloc_size_of!(style::stylesheets::Origin);
 malloc_size_of_is_stylo_malloc_size_of!(style::stylist::Stylist);
-malloc_size_of_is_stylo_malloc_size_of!(style::values::computed::AlignContent);
 malloc_size_of_is_stylo_malloc_size_of!(style::values::computed::BorderStyle);
+malloc_size_of_is_stylo_malloc_size_of!(style::values::computed::ContentDistribution);
+malloc_size_of_is_stylo_malloc_size_of!(style::values::computed::FontFeatureSettings);
 malloc_size_of_is_stylo_malloc_size_of!(style::values::computed::FontStretch);
 malloc_size_of_is_stylo_malloc_size_of!(style::values::computed::FontStyle);
 malloc_size_of_is_stylo_malloc_size_of!(style::values::computed::FontWeight);
+malloc_size_of_is_stylo_malloc_size_of!(style::values::computed::FontVariantAlternates);
+malloc_size_of_is_stylo_malloc_size_of!(style::values::computed::FontVariantLigatures);
+malloc_size_of_is_stylo_malloc_size_of!(style::values::computed::FontVariantNumeric);
+malloc_size_of_is_stylo_malloc_size_of!(style::values::computed::FontVariantEastAsian);
 malloc_size_of_is_stylo_malloc_size_of!(style::values::computed::font::SingleFontFamily);
-malloc_size_of_is_stylo_malloc_size_of!(style::values::computed::JustifyContent);
 malloc_size_of_is_stylo_malloc_size_of!(style::values::specified::align::AlignFlags);
+malloc_size_of_is_stylo_malloc_size_of!(style::values::specified::box_::Overflow);
+malloc_size_of_is_stylo_malloc_size_of!(style::values::specified::font::FontSynthesis);
+malloc_size_of_is_stylo_malloc_size_of!(style::values::specified::font::XLang);
 malloc_size_of_is_stylo_malloc_size_of!(style::values::specified::TextDecorationLine);
 malloc_size_of_is_stylo_malloc_size_of!(stylo_dom::ElementState);
+malloc_size_of_is_stylo_malloc_size_of!(style::computed_values::font_optical_sizing::T);
+malloc_size_of_is_stylo_malloc_size_of!(style::computed_values::font_kerning::T);
+malloc_size_of_is_stylo_malloc_size_of!(style::stylesheets::font_feature_values_rule::SingleValue);
+malloc_size_of_is_stylo_malloc_size_of!(style::stylesheets::font_feature_values_rule::PairValues);
+malloc_size_of_is_stylo_malloc_size_of!(style::stylesheets::font_feature_values_rule::VectorValues);
+malloc_size_of_is_stylo_malloc_size_of!(
+    style::stylesheets::font_feature_values_rule::FontFeatureValuesRule
+);
 
 impl<T> MallocSizeOf for GenericLengthPercentageOrAuto<T>
 where
@@ -904,5 +1398,46 @@ where
 {
     fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
         <GenericLengthPercentageOrAuto<T> as stylo_malloc_size_of::MallocSizeOf>::size_of(self, ops)
+    }
+}
+
+impl MallocSizeOf for resvg::usvg::fontdb::Source {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        match self {
+            Source::Binary(_) => 0,
+            Source::File(path) => path.size_of(ops),
+            Source::SharedFile(path, _) => path.size_of(ops),
+        }
+    }
+}
+
+impl MallocSizeOf for resvg::usvg::fontdb::FaceInfo {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.id.size_of(ops) +
+            self.source.size_of(ops) +
+            self.families.size_of(ops) +
+            self.post_script_name.size_of(ops) +
+            self.style.size_of(ops) +
+            self.weight.size_of(ops) +
+            self.stretch.size_of(ops)
+    }
+}
+
+impl MallocSizeOf for resvg::usvg::fontdb::Database {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.faces().map(|face| face.size_of(ops)).sum()
+    }
+}
+
+impl<T> MallocSizeOf for once_cell::race::OnceBox<T>
+where
+    T: MallocSizeOf,
+{
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        if let Some(value) = self.get() {
+            (unsafe { ops.malloc_size_of::<T>(value) }) + value.size_of(ops)
+        } else {
+            0
+        }
     }
 }

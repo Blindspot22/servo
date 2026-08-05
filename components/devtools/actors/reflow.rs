@@ -4,20 +4,23 @@
 
 //! This actor is used for protocol purposes, it forwards the reflow events to clients.
 
-use std::net::TcpStream;
+use std::sync::Arc;
 
+use malloc_size_of_derive::MallocSizeOf;
 use serde_json::{Map, Value};
 
-use crate::StreamId;
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
+use crate::actor::{Actor, ActorError, ActorRegistry, new_actor_name};
+use crate::protocol::ClientRequest;
+use crate::{EmptyReplyMsg, StreamId};
 
-pub struct ReflowActor {
+#[derive(MallocSizeOf)]
+pub(crate) struct ReflowActor {
     name: String,
 }
 
 impl Actor for ReflowActor {
-    fn name(&self) -> String {
-        self.name.clone()
+    fn name(&self) -> &str {
+        &self.name
     }
 
     /// The reflow actor can handle the following messages:
@@ -25,24 +28,30 @@ impl Actor for ReflowActor {
     /// - `start`: Does nothing yet. This doesn't need a reply like other messages.
     fn handle_message(
         &self,
+        request: ClientRequest,
         _registry: &ActorRegistry,
         msg_type: &str,
         _msg: &Map<String, Value>,
-        _stream: &mut TcpStream,
         _id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
-        Ok(match msg_type {
+    ) -> Result<(), ActorError> {
+        match msg_type {
             "start" => {
                 // TODO: Create an observer on "reflows" events
-                ActorMessageStatus::Processed
+                let msg = EmptyReplyMsg {
+                    from: self.name().into(),
+                };
+                request.reply_final(&msg)?
             },
-            _ => ActorMessageStatus::Ignored,
-        })
+            _ => return Err(ActorError::UnrecognizedPacketType),
+        };
+        Ok(())
     }
 }
 
 impl ReflowActor {
-    pub fn new(name: String) -> Self {
-        Self { name }
+    pub fn register(registry: &ActorRegistry) -> Arc<Self> {
+        let name = new_actor_name::<Self>();
+        let actor = Self { name };
+        registry.register::<Self>(actor)
     }
 }

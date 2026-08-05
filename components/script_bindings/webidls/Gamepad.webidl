@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+// skip-unless CARGO_FEATURE_GAMEPAD
+
 // https://w3c.github.io/gamepad/#gamepad-interface
 [Exposed=Window, Pref="dom_gamepad_enabled"]
 interface Gamepad {
@@ -10,8 +12,8 @@ interface Gamepad {
     readonly attribute boolean connected;
     readonly attribute DOMHighResTimeStamp timestamp;
     readonly attribute DOMString mapping;
-    readonly attribute Float64Array axes;
-    [SameObject] readonly attribute GamepadButtonList buttons;
+    readonly attribute any buttons;
+    readonly attribute /* FrozenArray<double> */ any axes;
     [SameObject] readonly attribute GamepadHapticActuator vibrationActuator;
 };
 

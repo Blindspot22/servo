@@ -24,63 +24,64 @@
 //! originating `DomRoot<T>`.
 //!
 
-use std::cell::{OnceCell, UnsafeCell};
+use std::cell::OnceCell;
 use std::default::Default;
 use std::hash::{Hash, Hasher};
-use std::marker::PhantomData;
-use std::{mem, ptr};
+use std::mem;
 
-use js::jsapi::{JSObject, JSTracer};
+use js::jsapi::{Heap, JSObject, JSTracer, Value};
+use js::rust::HandleValue;
+use layout_api::TrustedNodeAddress;
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
+use script_bindings::assert::{assert_in_layout, assert_in_script};
+pub(crate) use script_bindings::dom::*;
+use script_bindings::reflector::DomObject;
 pub(crate) use script_bindings::root::*;
-use script_layout_interface::TrustedNodeAddress;
-use style::thread_state;
 
 use crate::dom::bindings::conversions::DerivedFrom;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::DomObject;
 use crate::dom::bindings::trace::JSTraceable;
 use crate::dom::node::Node;
-
-pub(crate) struct ThreadLocalStackRoots<'a>(PhantomData<&'a u32>);
-
-impl<'a> ThreadLocalStackRoots<'a> {
-    pub(crate) fn new(roots: &'a RootCollection) -> Self {
-        STACK_ROOTS.with(|r| r.set(Some(roots)));
-        ThreadLocalStackRoots(PhantomData)
-    }
-}
-
-impl Drop for ThreadLocalStackRoots<'_> {
-    fn drop(&mut self) {
-        STACK_ROOTS.with(|r| r.set(None));
-    }
-}
-
-pub(crate) trait ToLayout<T> {
-    /// Returns `LayoutDom<T>` containing the same pointer.
-    ///
-    /// # Safety
-    ///
-    /// The `self` parameter to this method must meet all the requirements of [`ptr::NonNull::as_ref`].
-    unsafe fn to_layout(&self) -> LayoutDom<T>;
-}
-
-impl<T: DomObject> ToLayout<T> for Dom<T> {
-    unsafe fn to_layout(&self) -> LayoutDom<T> {
-        assert_in_layout();
-        LayoutDom {
-            value: self.as_ptr().as_ref().unwrap(),
-        }
-    }
-}
 
 /// An unrooted reference to a DOM object for use in layout. `Layout*Helpers`
 /// traits must be implemented on this.
 #[cfg_attr(crown, crown::unrooted_must_root_lint::allow_unrooted_interior)]
 #[repr(transparent)]
-pub(crate) struct LayoutDom<'dom, T> {
+pub struct LayoutDom<'dom, T> {
     value: &'dom T,
+}
+
+impl LayoutDom<'_, Node> {
+    /// Create a new JS-owned value wrapped from an address known to be a
+    /// `Node` pointer.
+    pub(crate) unsafe fn from_trusted_node_address(inner: TrustedNodeAddress) -> Self {
+        assert_in_layout();
+        let TrustedNodeAddress(addr) = inner;
+        LayoutDom {
+            value: unsafe { &*(addr as *const Node) },
+        }
+    }
+}
+
+impl<'dom, T> LayoutDom<'dom, T>
+where
+    T: 'dom + DomObject,
+{
+    /// Returns a reference to the interior of this JS object. The fact
+    /// that this is unsafe is what necessitates the layout wrappers.
+    pub fn unsafe_get(self) -> &'dom T {
+        assert_in_layout();
+        self.value
+    }
+
+    /// Transforms a slice of `Dom<T>` into a slice of `LayoutDom<T>`.
+    // FIXME(nox): This should probably be done through a ToLayout trait.
+    pub(crate) unsafe fn to_layout_slice(slice: &'dom [Dom<T>]) -> &'dom [LayoutDom<'dom, T>] {
+        // This doesn't compile if Dom and LayoutDom don't have the same
+        // representation.
+        let _ = mem::transmute::<Dom<T>, LayoutDom<T>>;
+        unsafe { &*(slice as *const [Dom<T>] as *const [LayoutDom<T>]) }
+    }
 }
 
 impl<'dom, T> LayoutDom<'dom, T>
@@ -116,6 +117,15 @@ where
         assert_in_layout();
         self.value.is::<U>()
     }
+
+    /// Get a reference to the internal value.
+    ///
+    /// ## SAFETY
+    /// This function effectively circumvents all the safety provided by `LayoutDom` as it allows
+    /// performing arbitrary (potentially mutating) operations on the value. Use with caution!
+    pub(crate) unsafe fn as_ref(self) -> &'dom T {
+        self.value
+    }
 }
 
 impl<T> LayoutDom<'_, T>
@@ -145,180 +155,64 @@ impl<T> Hash for LayoutDom<'_, T> {
     }
 }
 
+#[expect(clippy::non_canonical_clone_impl)]
 impl<T> Clone for LayoutDom<'_, T> {
     #[inline]
-    #[allow(clippy::non_canonical_clone_impl)]
     fn clone(&self) -> Self {
         assert_in_layout();
         *self
     }
 }
 
-impl LayoutDom<'_, Node> {
-    /// Create a new JS-owned value wrapped from an address known to be a
-    /// `Node` pointer.
-    pub(crate) unsafe fn from_trusted_node_address(inner: TrustedNodeAddress) -> Self {
+pub(crate) trait ToLayout<'dom, T: DomObject> {
+    /// Get a reference to the contents of this smart pointer as a [`LayoutDom`],
+    /// for use during layout. Note that this should only be called in the course
+    /// of layout.
+    ///
+    /// # Safety
+    /// The return value holds a Rust reference to the underlying data, which should be
+    /// safe as long as `unsafe` is not used to override the lifetime in some way.
+    ///
+    /// - The caller *must not* modify the underlying DOM object via non-layout handles.
+    /// - The caller *must ensure* that garbage collection does not occur while the
+    ///   [`LayoutDom`] handle is alive.
+    unsafe fn to_layout(&self) -> LayoutDom<'dom, T>;
+}
+
+impl<'dom, T: DomObject> ToLayout<'dom, T> for Dom<T> {
+    unsafe fn to_layout(&self) -> LayoutDom<'dom, T> {
         assert_in_layout();
-        let TrustedNodeAddress(addr) = inner;
         LayoutDom {
-            value: &*(addr as *const Node),
+            value: unsafe { self.as_ptr().as_ref().unwrap() },
         }
     }
 }
 
-/// A holder that provides interior mutability for GC-managed values such as
-/// `Dom<T>`.  Essentially a `Cell<Dom<T>>`, but safer.
-///
-/// This should only be used as a field in other DOM objects; see warning
-/// on `Dom<T>`.
-#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
-#[derive(JSTraceable)]
-pub(crate) struct MutDom<T: DomObject> {
-    val: UnsafeCell<Dom<T>>,
-}
-
-impl<T: DomObject> MutDom<T> {
-    /// Create a new `MutDom`.
-    pub(crate) fn new(initial: &T) -> MutDom<T> {
-        assert_in_script();
-        MutDom {
-            val: UnsafeCell::new(Dom::from_ref(initial)),
-        }
-    }
-
-    /// Set this `MutDom` to the given value.
-    pub(crate) fn set(&self, val: &T) {
-        assert_in_script();
-        unsafe {
-            *self.val.get() = Dom::from_ref(val);
-        }
-    }
-
-    /// Get the value in this `MutDom`.
-    pub(crate) fn get(&self) -> DomRoot<T> {
-        assert_in_script();
-        unsafe { DomRoot::from_ref(&*ptr::read(self.val.get())) }
+impl<'dom, T: DomObject> ToLayout<'dom, T> for MutDom<T> {
+    unsafe fn to_layout(&self) -> LayoutDom<'dom, T> {
+        assert_in_layout();
+        unsafe { self.as_ref_unsafe().to_layout() }
     }
 }
 
-impl<T: DomObject> MallocSizeOf for MutDom<T> {
-    fn size_of(&self, _ops: &mut MallocSizeOfOps) -> usize {
-        // See comment on MallocSizeOf for Dom<T>.
-        0
-    }
-}
-
-impl<T: DomObject> PartialEq for MutDom<T> {
-    fn eq(&self, other: &Self) -> bool {
-        unsafe { *self.val.get() == *other.val.get() }
-    }
-}
-
-impl<T: DomObject + PartialEq> PartialEq<T> for MutDom<T> {
-    fn eq(&self, other: &T) -> bool {
-        unsafe { **self.val.get() == *other }
-    }
-}
-
-pub(crate) fn assert_in_layout() {
-    debug_assert!(thread_state::get().is_layout());
-}
-
-/// A holder that provides interior mutability for GC-managed values such as
-/// `Dom<T>`, with nullability represented by an enclosing Option wrapper.
-/// Essentially a `Cell<Option<Dom<T>>>`, but safer.
-///
-/// This should only be used as a field in other DOM objects; see warning
-/// on `Dom<T>`.
-#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
-#[derive(JSTraceable)]
-pub(crate) struct MutNullableDom<T: DomObject> {
-    ptr: UnsafeCell<Option<Dom<T>>>,
-}
-
-impl<T: DomObject> MutNullableDom<T> {
-    /// Create a new `MutNullableDom`.
-    pub(crate) fn new(initial: Option<&T>) -> MutNullableDom<T> {
-        assert_in_script();
-        MutNullableDom {
-            ptr: UnsafeCell::new(initial.map(Dom::from_ref)),
-        }
-    }
-
-    /// Retrieve a copy of the current inner value. If it is `None`, it is
-    /// initialized with the result of `cb` first.
-    pub(crate) fn or_init<F>(&self, cb: F) -> DomRoot<T>
-    where
-        F: FnOnce() -> DomRoot<T>,
-    {
-        assert_in_script();
-        match self.get() {
-            Some(inner) => inner,
-            None => {
-                let inner = cb();
-                self.set(Some(&inner));
-                inner
-            },
-        }
-    }
-
+pub(crate) trait ToLayoutOptional<'dom, T: DomObject> {
     /// Retrieve a copy of the inner optional `Dom<T>` as `LayoutDom<T>`.
     /// For use by layout, which can't use safe types like Temporary.
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
-    pub(crate) unsafe fn get_inner_as_layout(&self) -> Option<LayoutDom<T>> {
+    ///
+    /// # Safety
+    /// The return value holds a Rust reference to the underlying data, which should be
+    /// safe as long as `unsafe` is not used to override the lifetime in some way.
+    ///
+    /// - The caller *must not* modify the underlying DOM object via non-layout handles.
+    /// - The caller *must ensure* that garbage collection does not occur while the
+    ///   [`LayoutDom`] handle is alive.
+    unsafe fn to_layout(&self) -> Option<LayoutDom<'dom, T>>;
+}
+
+impl<'dom, T: DomObject> ToLayoutOptional<'dom, T> for MutNullableDom<T> {
+    unsafe fn to_layout(&self) -> Option<LayoutDom<'dom, T>> {
         assert_in_layout();
-        (*self.ptr.get()).as_ref().map(|js| js.to_layout())
-    }
-
-    /// Get a rooted value out of this object
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
-    pub(crate) fn get(&self) -> Option<DomRoot<T>> {
-        assert_in_script();
-        unsafe { ptr::read(self.ptr.get()).map(|o| DomRoot::from_ref(&*o)) }
-    }
-
-    /// Set this `MutNullableDom` to the given value.
-    pub(crate) fn set(&self, val: Option<&T>) {
-        assert_in_script();
-        unsafe {
-            *self.ptr.get() = val.map(|p| Dom::from_ref(p));
-        }
-    }
-
-    /// Gets the current value out of this object and sets it to `None`.
-    pub(crate) fn take(&self) -> Option<DomRoot<T>> {
-        let value = self.get();
-        self.set(None);
-        value
-    }
-}
-
-impl<T: DomObject> PartialEq for MutNullableDom<T> {
-    fn eq(&self, other: &Self) -> bool {
-        unsafe { *self.ptr.get() == *other.ptr.get() }
-    }
-}
-
-impl<T: DomObject> PartialEq<Option<&T>> for MutNullableDom<T> {
-    fn eq(&self, other: &Option<&T>) -> bool {
-        unsafe { *self.ptr.get() == other.map(Dom::from_ref) }
-    }
-}
-
-impl<T: DomObject> Default for MutNullableDom<T> {
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
-    fn default() -> MutNullableDom<T> {
-        assert_in_script();
-        MutNullableDom {
-            ptr: UnsafeCell::new(None),
-        }
-    }
-}
-
-impl<T: DomObject> MallocSizeOf for MutNullableDom<T> {
-    fn size_of(&self, _ops: &mut MallocSizeOfOps) -> usize {
-        // See comment on MallocSizeOf for Dom<T>.
-        0
+        unsafe { self.as_ref_unsafe().map(|dom_ref| dom_ref.to_layout()) }
     }
 }
 
@@ -339,7 +233,6 @@ where
 {
     /// Retrieve a copy of the current inner value. If it is `None`, it is
     /// initialized with the result of `cb` first.
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn init_once<F>(&self, cb: F) -> &T
     where
         F: FnOnce() -> DomRoot<T>,
@@ -350,7 +243,6 @@ where
 }
 
 impl<T: DomObject> Default for DomOnceCell<T> {
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn default() -> DomOnceCell<T> {
         assert_in_script();
         DomOnceCell {
@@ -366,32 +258,28 @@ impl<T: DomObject> MallocSizeOf for DomOnceCell<T> {
     }
 }
 
-#[cfg_attr(crown, allow(crown::unrooted_must_root))]
 unsafe impl<T: DomObject> JSTraceable for DomOnceCell<T> {
     unsafe fn trace(&self, trc: *mut JSTracer) {
         if let Some(ptr) = self.ptr.get() {
-            ptr.trace(trc);
+            unsafe { ptr.trace(trc) };
         }
     }
 }
 
-impl<'dom, T> LayoutDom<'dom, T>
-where
-    T: 'dom + DomObject,
-{
-    /// Returns a reference to the interior of this JS object. The fact
-    /// that this is unsafe is what necessitates the layout wrappers.
-    pub(crate) fn unsafe_get(self) -> &'dom T {
-        assert_in_layout();
-        self.value
-    }
+/// Converts a rooted `Heap<Value>` into a `HandleValue`.
+///
+/// This is only safe if the `Heap` is rooted (e.g., held inside a `Dom`-managed struct),
+/// and the `#[must_root]` crown lint is active to enforce rooting at compile time.
+/// Avoids repeating unsafe `from_raw` calls at each usage site.
+pub trait AsHandleValue<'a> {
+    fn as_handle_value(&'a self) -> HandleValue<'a>;
+}
 
-    /// Transforms a slice of `Dom<T>` into a slice of `LayoutDom<T>`.
-    // FIXME(nox): This should probably be done through a ToLayout trait.
-    pub(crate) unsafe fn to_layout_slice(slice: &'dom [Dom<T>]) -> &'dom [LayoutDom<'dom, T>] {
-        // This doesn't compile if Dom and LayoutDom don't have the same
-        // representation.
-        let _ = mem::transmute::<Dom<T>, LayoutDom<T>>;
-        &*(slice as *const [Dom<T>] as *const [LayoutDom<T>])
+impl<'a> AsHandleValue<'a> for Heap<Value> {
+    #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
+    fn as_handle_value(&'a self) -> HandleValue<'a> {
+        // SAFETY: `self` is assumed to be rooted, and `handle()` ties
+        // the lifetime to `&self`, which the compiler can enforce.
+        unsafe { HandleValue::from_marked_location(self.ptr.get() as *const _) }
     }
 }

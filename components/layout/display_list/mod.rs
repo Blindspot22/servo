@@ -6,46 +6,64 @@ use std::cell::{OnceCell, RefCell};
 use std::sync::Arc;
 
 use app_units::{AU_PER_PX, Au};
-use base::WebRenderEpochToU16;
-use base::id::ScrollTreeNodeId;
-use compositing_traits::display_list::{AxesScrollSensitivity, CompositorDisplayListInfo};
-use embedder_traits::Cursor;
-use euclid::{Point2D, SideOffsets2D, Size2D, UnknownUnit};
-use fonts::GlyphStore;
+use clip::Clip;
+pub(crate) use clip::ClipId;
+use euclid::{Box2D, Point2D, Rect, Scale, SideOffsets2D, Size2D, UnknownUnit, Vector2D};
+use fonts::ShapedTextSlice;
 use gradient::WebRenderGradient;
-use range::Range as ServoRange;
-use servo_geometry::MaxRect;
+use layout_api::ReflowStatistics;
+use net_traits::image_cache::Image as CachedImage;
+use paint_api::display_list::{PaintDisplayListInfo, SpatialTreeNodeInfo};
+use servo_arc::Arc as ServoArc;
+use servo_base::id::{PipelineId, ScrollTreeNodeId};
+use servo_config::opts::{DiagnosticsLogging, DiagnosticsLoggingOption};
+use servo_config::{pref, prefs};
+use servo_url::ServoUrl;
 use style::Zero;
 use style::color::{AbsoluteColor, ColorSpace};
+use style::computed_values::background_blend_mode::SingleComputedValue as BackgroundBlendMode;
 use style::computed_values::border_image_outset::T as BorderImageOutset;
-use style::computed_values::text_decoration_style::T as ComputedTextDecorationStyle;
+use style::computed_values::mix_blend_mode::T as ComputedMixBlendMode;
+use style::computed_values::overflow_x::T as ComputedOverflow;
+use style::computed_values::text_decoration_style::{
+    T as ComputedTextDecorationStyle, T as TextDecorationStyle,
+};
+use style::computed_values::text_decoration_thickness::T as TextDecorationThickness;
 use style::dom::OpaqueNode;
 use style::properties::ComputedValues;
 use style::properties::longhands::visibility::computed_value::T as Visibility;
 use style::properties::style_structs::Border;
+use style::values::computed::basic_shape::ClipPath as ComputedClipPath;
 use style::values::computed::{
     BorderImageSideWidth, BorderImageWidth, BorderStyle, LengthPercentage,
     NonNegativeLengthOrNumber, NumberOrPercentage, OutlineStyle,
 };
 use style::values::generics::NonNegative;
-use style::values::generics::rect::Rect;
+use style::values::generics::color::ColorOrAuto;
+use style::values::generics::rect::Rect as StyleRect;
 use style::values::specified::text::TextDecorationLine;
-use style::values::specified::ui::CursorKind;
-use style_traits::CSSPixel;
-use webrender_api::units::{DevicePixel, LayoutPixel, LayoutRect, LayoutSize};
+use style_traits::{CSSPixel as StyloCSSPixel, DevicePixel as StyloDevicePixel};
+use webrender_api::units::{
+    DeviceIntSize, DevicePixel, LayoutPixel, LayoutPoint, LayoutRect, LayoutSideOffsets, LayoutSize,
+};
 use webrender_api::{
-    self as wr, BorderDetails, BoxShadowClipMode, ClipChainId, CommonItemProperties,
-    ImageRendering, NinePatchBorder, NinePatchBorderSource, SpatialId, units,
+    self as wr, BorderDetails, BorderRadius, BorderSide, BoxShadowClipMode, BuiltDisplayList,
+    ClipChainId, ClipMode, ColorF, CommonItemProperties, ComplexClipRegion, GlyphInstance,
+    MixBlendMode, NinePatchBorder, NinePatchBorderSource, NormalBorder, PrimitiveFlags,
+    PropertyBinding, PropertyBindingKey, RasterSpace, SpatialId, StackingContextFlags,
+    TransformStyle, units,
 };
 use wr::units::LayoutVector2D;
 
-use crate::cell::ArcRefCell;
-use crate::context::{LayoutContext, ResolvedImage};
-pub use crate::display_list::conversions::ToWebRender;
-use crate::display_list::stacking_context::StackingContextSection;
+use crate::context::{ImageResolver, ResolvedImage};
+use crate::display_list::background::BackgroundPainter;
+use crate::display_list::conversions::FilterToWebRender;
+pub(crate) use crate::display_list::conversions::ToWebRender;
+use crate::display_list::paint_traversal::{PaintTraversal, PaintTraversalHandler, TraversalState};
 use crate::fragment_tree::{
-    BackgroundMode, BoxFragment, Fragment, FragmentFlags, FragmentTree, SpecificLayoutInfo, Tag,
-    TextFragment,
+    BackgroundMode, BaseFragment, BoxFragment, BoxFragmentWithStyle, ContainingBlockCalculation,
+    Fragment, FragmentFlags, FragmentStatus, FragmentTree, IFrameFragment, ImageFragment,
+    PositioningFragment, SpecificLayoutInfo, Tag, TextFragment,
 };
 use crate::geom::{
     LengthPercentageOrAuto, PhysicalPoint, PhysicalRect, PhysicalSides, PhysicalSize,
@@ -54,121 +72,62 @@ use crate::replaced::NaturalSizes;
 use crate::style_ext::{BorderStyleColor, ComputedValuesExt};
 
 mod background;
-mod clip_path;
+mod clip;
 mod conversions;
 mod gradient;
+mod hit_test;
+mod paint_timing_handler;
+mod paint_traversal;
 mod stacking_context;
 
-use background::BackgroundPainter;
-pub use stacking_context::*;
+pub(crate) use hit_test::HitTest;
+pub(crate) use paint_timing_handler::PaintTimingHandler;
+pub(crate) use stacking_context::*;
 
-#[derive(Clone, Copy)]
-pub struct WebRenderImageInfo {
-    pub size: Size2D<u32, UnknownUnit>,
-    pub key: Option<wr::ImageKey>,
-}
-
-// webrender's `ItemTag` is private.
-type ItemTag = (u64, u16);
-type HitInfo = Option<ItemTag>;
 const INSERTION_POINT_LOGICAL_WIDTH: Au = Au(AU_PER_PX);
 
-/// Where the information that's used to build display lists is stored. This
-/// includes both a [wr::DisplayListBuilder] for building up WebRender-specific
-/// display list information and a [CompositorDisplayListInfo] used to store
-/// information used by the compositor, such as a compositor-side scroll tree.
-pub struct DisplayList {
-    /// The [wr::DisplayListBuilder] used to collect display list items.
-    pub wr: wr::DisplayListBuilder,
-
-    /// The information about the WebRender display list that the compositor
-    /// consumes. This curerntly contains the out-of-band hit testing information
-    /// data structure that the compositor uses to map hit tests to information
-    /// about the item hit.
-    pub compositor_info: CompositorDisplayListInfo,
-
-    /// A count of the number of SpatialTree nodes pushed to the WebRender display
-    /// list. This is merely to ensure that the currently-unused SpatialTreeItemKey
-    /// produced for every SpatialTree node is unique.
-    pub spatial_tree_count: u64,
-}
-
-impl DisplayList {
-    /// Create a new [DisplayList] given the dimensions of the layout and the WebRender
-    /// pipeline id.
-    pub fn new(
-        viewport_size: units::LayoutSize,
-        content_size: units::LayoutSize,
-        pipeline_id: wr::PipelineId,
-        epoch: wr::Epoch,
-        viewport_scroll_sensitivity: AxesScrollSensitivity,
-        first_reflow: bool,
-    ) -> Self {
-        Self {
-            wr: wr::DisplayListBuilder::new(pipeline_id),
-            compositor_info: CompositorDisplayListInfo::new(
-                viewport_size,
-                content_size,
-                pipeline_id,
-                epoch,
-                viewport_scroll_sensitivity,
-                first_reflow,
-            ),
-            spatial_tree_count: 0,
-        }
-    }
-
-    pub fn define_clip_chain<I>(&mut self, parent: ClipChainId, clips: I) -> ClipChainId
-    where
-        I: IntoIterator<Item = wr::ClipId>,
-        I::IntoIter: ExactSizeIterator + Clone,
-    {
-        // WebRender has two different ways of expressing "no clip." ClipChainId::INVALID should be
-        // used for primitives, but `None` is used for stacking contexts and clip chains. We convert
-        // to the `Option<ClipChainId>` representation here. Just passing Some(ClipChainId::INVALID)
-        // leads to a crash.
-        let parent = match parent {
-            ClipChainId::INVALID => None,
-            parent => Some(parent),
-        };
-        self.wr.define_clip_chain(parent, clips)
-    }
-}
-
 pub(crate) struct DisplayListBuilder<'a> {
-    /// The current [ScrollTreeNodeId] for this [DisplayListBuilder]. This
-    /// allows only passing the builder instead passing the containing
-    /// [stacking_context::StackingContextContent::Fragment] as an argument to display
-    /// list building functions.
-    current_scroll_node_id: ScrollTreeNodeId,
+    /// The [`FragmentTree`] that we are building a display list for.
+    fragment_tree: &'a FragmentTree,
 
-    /// The current [ScrollTreeNodeId] for this [DisplayListBuilder]. This is necessary in addition
-    /// to the [Self::current_scroll_node_id], because some pieces of fragments as backgrounds with
-    /// `background-attachment: fixed` need to not scroll while the rest of the fragment does.
+    /// The current [`ScrollTreeNodeId`] for this [`DisplayListBuilder`]. This is
+    /// necessary because some pieces of fragments as backgrounds with
+    /// `background-attachment: fixed` need to not scroll while the rest of the fragment
+    /// does.
     current_reference_frame_scroll_node_id: ScrollTreeNodeId,
 
-    /// The current [wr::ClipId] for this [DisplayListBuilder]. This allows
-    /// only passing the builder instead passing the containing
-    /// [stacking_context::StackingContextContent::Fragment] as an argument to display
-    /// list building functions.
-    current_clip_chain_id: ClipChainId,
+    /// The [`wr::DisplayListBuilder`] for this Servo [`DisplayListBuilder`].
+    pub webrender_display_list_builder: &'a mut wr::DisplayListBuilder,
 
-    /// The [OpaqueNode] handle to the node used to paint the page background
-    /// if the background was a canvas.
-    element_for_canvas_background: OpaqueNode,
-
-    /// A [LayoutContext] used to get information about the device pixel ratio
-    /// and get handles to WebRender images.
-    pub context: &'a LayoutContext<'a>,
-
-    /// The [DisplayList] used to collect display list items and metadata.
-    pub display_list: &'a mut DisplayList,
+    /// The [`PaintDisplayListInfo`] used to collect display list items and metadata.
+    pub paint_info: &'a mut PaintDisplayListInfo,
 
     /// Data about the fragments that are highlighted by the inspector, if any.
     ///
     /// This data is collected during the traversal of the fragment tree and used
     /// to paint the highlight at the very end.
     inspector_highlight: Option<InspectorHighlight>,
+
+    /// Whether or not the `<body>` element should be painted. This is false if the root `<html>`
+    /// element inherits the `<body>`'s background to paint the page canvas background.
+    /// See <https://drafts.csswg.org/css-backgrounds/#body-background>.
+    paint_body_background: bool,
+
+    /// A mapping from [`ClipId`] To WebRender [`ClipChainId`] used when building this WebRender
+    /// display list.
+    clip_map: Vec<ClipChainId>,
+
+    /// An [`ImageResolver`] to use during display list construction.
+    image_resolver: Arc<ImageResolver>,
+
+    /// The device pixel ratio used for this `Document`'s display list.
+    device_pixel_ratio: Scale<f32, StyloCSSPixel, StyloDevicePixel>,
+
+    /// Handler for all Paint Timings
+    paint_timing_handler: &'a mut PaintTimingHandler,
+
+    /// Statistics collected about the reflow, in order to write tests for incremental layout.
+    reflow_statistics: &'a mut ReflowStatistics,
 }
 
 struct InspectorHighlight {
@@ -185,7 +144,7 @@ struct InspectorHighlight {
 struct HighlightTraversalState {
     /// The smallest rectangle that fully encloses all fragments created by the highlighted
     /// dom node, if any.
-    content_box: euclid::Rect<Au, CSSPixel>,
+    content_box: Rect<Au, StyloCSSPixel>,
 
     spatial_id: SpatialId,
 
@@ -193,61 +152,357 @@ struct HighlightTraversalState {
 
     /// When the highlighted fragment is a box fragment we remember the information
     /// needed to paint padding, border and margin areas.
-    maybe_box_fragment: Option<ArcRefCell<BoxFragment>>,
+    maybe_box_fragment: Option<Arc<BoxFragment>>,
 }
 
 impl InspectorHighlight {
     fn for_node(node: OpaqueNode) -> Self {
         Self {
-            tag: Tag::new(node),
+            tag: Tag {
+                node,
+                // TODO: Support highlighting pseudo-elements.
+                pseudo_element_chain: Default::default(),
+            },
             state: None,
         }
     }
 }
 
-impl DisplayList {
-    pub fn build(
-        &mut self,
-        context: &LayoutContext,
-        fragment_tree: &FragmentTree,
-        root_stacking_context: &StackingContext,
-    ) {
-        #[cfg(feature = "tracing")]
-        let _span = tracing::trace_span!("display_list::build", servo_profiling = true).entered();
-        let mut builder = DisplayListBuilder {
-            current_scroll_node_id: self.compositor_info.root_reference_frame_id,
-            current_reference_frame_scroll_node_id: self.compositor_info.root_reference_frame_id,
-            current_clip_chain_id: ClipChainId::INVALID,
-            element_for_canvas_background: fragment_tree.canvas_background.from_element,
-            context,
-            display_list: self,
-            inspector_highlight: context
-                .highlighted_dom_node
-                .map(InspectorHighlight::for_node),
-        };
-        fragment_tree.build_display_list(&mut builder, root_stacking_context);
-
-        if let Some(highlight) = builder
-            .inspector_highlight
-            .take()
-            .and_then(|highlight| highlight.state)
-        {
-            builder.paint_dom_inspector_highlight(highlight);
-        }
-    }
-}
-
 impl DisplayListBuilder<'_> {
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn build(
+        stacking_context_tree: &mut StackingContextTree,
+        fragment_tree: &FragmentTree,
+        image_resolver: Arc<ImageResolver>,
+        device_pixel_ratio: Scale<f32, StyloCSSPixel, StyloDevicePixel>,
+        highlighted_dom_node: Option<OpaqueNode>,
+        debug: &DiagnosticsLogging,
+        paint_timing_handler: &mut PaintTimingHandler,
+        reflow_statistics: &mut ReflowStatistics,
+    ) -> BuiltDisplayList {
+        // Build the rest of the display list which inclues all of the WebRender primitives.
+        let paint_info = &mut stacking_context_tree.paint_info;
+        let pipeline_id = paint_info.pipeline_id;
+        let mut webrender_display_list_builder =
+            webrender_api::DisplayListBuilder::new(pipeline_id);
+        webrender_display_list_builder.begin();
+
+        // `dump_serialized_display_list` doesn't actually print anything. It sets up
+        // the display list for printing the serialized version when `finalize()` is called.
+        // We need to call this before adding any display items so that they are printed
+        // during `finalize()`.
+        if debug.is_enabled(DiagnosticsLoggingOption::DisplayList) {
+            webrender_display_list_builder.dump_serialized_display_list();
+        }
+
+        let _span = profile_traits::trace_span!("DisplayListBuilder::build").entered();
+        let mut builder = DisplayListBuilder {
+            fragment_tree,
+            current_reference_frame_scroll_node_id: paint_info.root_reference_frame_id,
+            webrender_display_list_builder: &mut webrender_display_list_builder,
+            paint_info,
+            inspector_highlight: highlighted_dom_node.map(InspectorHighlight::for_node),
+            paint_body_background: true,
+            clip_map: Default::default(),
+            image_resolver,
+            device_pixel_ratio,
+            paint_timing_handler,
+            reflow_statistics,
+        };
+
+        // Clear any caret color from previous display list constructions.
+        builder.paint_info.caret_property_binding = None;
+
+        builder.add_all_spatial_nodes();
+
+        for clip in stacking_context_tree.clip_store.0.iter() {
+            builder.add_clip_to_display_list(clip);
+        }
+
+        // Add a single hit test that covers the entire viewport, so that WebRender knows
+        // which pipeline it hits when doing hit testing.
+        let pipeline_id = builder.paint_info.pipeline_id;
+        let viewport_size = builder.paint_info.viewport_details.size;
+        let viewport_rect = LayoutRect::from_size(viewport_size.cast_unit());
+        builder.wr().push_hit_test(
+            viewport_rect,
+            ClipChainId::INVALID,
+            SpatialId::root_reference_frame(pipeline_id),
+            PrimitiveFlags::default(),
+            (0, 0), /* tag */
+        );
+
+        PaintTraversal::traverse(&stacking_context_tree.root_stacking_context, &mut builder);
+        builder.paint_dom_inspector_highlight();
+
+        webrender_display_list_builder.end().1
+    }
+
     fn wr(&mut self) -> &mut wr::DisplayListBuilder {
-        &mut self.display_list.wr
+        self.webrender_display_list_builder
+    }
+
+    fn pipeline_id(&self) -> wr::PipelineId {
+        self.paint_info.pipeline_id
+    }
+
+    fn mark_is_paintable(&mut self) {
+        self.paint_info.is_paintable = true;
     }
 
     fn mark_is_contentful(&mut self) {
-        self.display_list.compositor_info.is_contentful = true;
+        self.paint_info.is_contentful = true;
+    }
+
+    fn spatial_id(&self, id: ScrollTreeNodeId) -> SpatialId {
+        self.paint_info.scroll_tree.webrender_id(id)
+    }
+
+    fn clip_chain_id(&self, id: ClipId) -> ClipChainId {
+        match id {
+            ClipId::INVALID => ClipChainId::INVALID,
+            _ => *self
+                .clip_map
+                .get(id.0)
+                .expect("Should never try to get clip before adding it to WebRender display list"),
+        }
+    }
+
+    pub(crate) fn add_all_spatial_nodes(&mut self) {
+        // A count of the number of SpatialTree nodes pushed to the WebRender display
+        // list. This is merely to ensure that the currently-unused SpatialTreeItemKey
+        // produced for every SpatialTree node is unique.
+        let mut scroll_tree = std::mem::take(&mut self.paint_info.scroll_tree);
+        let mut mapping = Vec::with_capacity(scroll_tree.nodes.len());
+
+        mapping.push(SpatialId::root_reference_frame(self.pipeline_id()));
+        mapping.push(SpatialId::root_scroll_node(self.pipeline_id()));
+
+        for node in scroll_tree.nodes.iter().skip(2) {
+            let parent_scroll_node_id = node
+                .parent
+                .expect("Should have already added root reference frame");
+            let parent_spatial_node_id = mapping
+                .get(parent_scroll_node_id.index)
+                .expect("Should add spatial nodes to display list in order");
+
+            mapping.push(match &node.info {
+                SpatialTreeNodeInfo::ReferenceFrame(info) => {
+                    let spatial_id = self.wr().push_reference_frame(
+                        info.origin,
+                        *parent_spatial_node_id,
+                        info.transform_style,
+                        PropertyBinding::Value(*info.transform.to_transform()),
+                        info.kind,
+                    );
+                    self.wr().pop_reference_frame();
+                    spatial_id
+                },
+                SpatialTreeNodeInfo::Scroll(info) => {
+                    self.wr().define_scroll_frame(
+                        *parent_spatial_node_id,
+                        info.external_id,
+                        info.content_rect,
+                        info.clip_rect,
+                        LayoutVector2D::zero(), /* external_scroll_offset */
+                        0,                      /* scroll_offset_generation */
+                        wr::HasScrollLinkedEffect::No,
+                    )
+                },
+                SpatialTreeNodeInfo::Sticky(info) => {
+                    self.wr().define_sticky_frame(
+                        *parent_spatial_node_id,
+                        info.frame_rect,
+                        info.margins,
+                        info.vertical_offset_bounds,
+                        info.horizontal_offset_bounds,
+                        LayoutVector2D::zero(), /* previously_applied_offset */
+                        None,                   /* transform */
+                    )
+                },
+            });
+        }
+
+        scroll_tree.update_mapping(mapping);
+        self.paint_info.scroll_tree = scroll_tree;
+    }
+
+    /// Add the given [`Clip`] to the WebRender display list and create a mapping from
+    /// its [`ClipId`] to a WebRender [`ClipChainId`]. This happens:
+    ///  - When WebRender display list construction starts: All clips created during the
+    ///    `StackingContextTree` construction are added in one batch. These clips are used
+    ///    for things such as `overflow: scroll` elements.
+    ///  - When a clip is added during WebRender display list construction for individual
+    ///    items. In that case, this is called by [`Self::maybe_create_clip`].
+    pub(crate) fn add_clip_to_display_list(&mut self, clip: &Clip) -> ClipChainId {
+        assert_eq!(
+            clip.id.0,
+            self.clip_map.len(),
+            "Clips should be added in order"
+        );
+
+        let spatial_id = self.spatial_id(clip.parent_scroll_node_id);
+        let new_clip_id = if clip.radii.is_zero() {
+            self.wr().define_clip_rect(spatial_id, clip.rect)
+        } else {
+            self.wr().define_clip_rounded_rect(
+                spatial_id,
+                ComplexClipRegion {
+                    rect: clip.rect,
+                    radii: clip.radii,
+                    mode: ClipMode::Clip,
+                },
+            )
+        };
+
+        // WebRender has two different ways of expressing "no clip." ClipChainId::INVALID should be
+        // used for primitives, but `None` is used for stacking contexts and clip chains. We convert
+        // to the `Option<ClipChainId>` representation here. Just passing Some(ClipChainId::INVALID)
+        // leads to a crash.
+        let parent_clip_chain_id = match self.clip_chain_id(clip.parent_clip_id) {
+            ClipChainId::INVALID => None,
+            parent => Some(parent),
+        };
+        let clip_chain_id = self
+            .wr()
+            .define_clip_chain(parent_clip_chain_id, [new_clip_id]);
+        self.clip_map.push(clip_chain_id);
+        clip_chain_id
+    }
+
+    /// Add a new clip to the WebRender display list being built. This only happens during
+    /// WebRender display list building and these clips should be added after all clips
+    /// from the `StackingContextTree` have already been processed.
+    fn maybe_create_clip(
+        &mut self,
+        state: &TraversalState,
+        radii: wr::BorderRadius,
+        rect: units::LayoutRect,
+        force_clip_creation: bool,
+    ) -> Option<ClipChainId> {
+        if radii.is_zero() && !force_clip_creation {
+            return None;
+        }
+
+        Some(self.add_clip_to_display_list(&Clip {
+            id: ClipId(self.clip_map.len()),
+            radii,
+            rect,
+            parent_scroll_node_id: state.spatial_id,
+            parent_clip_id: state.clip_id,
+        }))
+    }
+
+    fn push_webrender_stacking_context_if_necessary(
+        &mut self,
+        stacking_context: &StackingContext,
+    ) -> bool {
+        if stacking_context.context_type == StackingContextType::StackingContainer {
+            return false;
+        }
+
+        let mut is_blend_container = stacking_context.children.iter().any(|child| {
+            child.fragment().is_some_and(|fragment| {
+                fragment.style().clone_mix_blend_mode() != ComputedMixBlendMode::Normal
+            })
+        });
+
+        let primitive_flags;
+        let transform_style;
+        let mix_blend_mode;
+        let mut filters: Vec<_>;
+        let mut stacking_context_flags = StackingContextFlags::empty();
+        match &stacking_context.fragment {
+            StackingContextFragments::Fragment(fragment) => {
+                let style = fragment.style();
+                let effects = style.get_effects();
+
+                transform_style = style
+                    .used_transform_style(fragment.base.flags)
+                    .to_webrender();
+                mix_blend_mode = effects.mix_blend_mode.to_webrender();
+                primitive_flags = style.get_webrender_primitive_flags();
+
+                // Do not create another blend container stacking context started by the root
+                // element, because the root background is painted above of it (at the root
+                // stacking context, which sits above the root fragment).
+                //
+                // TODO: Would it be cleaner to paint the root background at the root fragment
+                // instead of the root stacking context?
+                is_blend_container &= !fragment.base.flags.contains(FragmentFlags::IS_ROOT_ELEMENT);
+
+                // WebRender only uses the stacking context to apply certain effects. If we don't
+                // actually need to create a stacking context, just avoid creating one.
+                if !is_blend_container &&
+                    effects.filter.0.is_empty() &&
+                    effects.opacity == 1.0 &&
+                    effects.mix_blend_mode == ComputedMixBlendMode::Normal &&
+                    !style.has_effective_transform_or_perspective(FragmentFlags::empty()) &&
+                    style.get_svg().clip_path == ComputedClipPath::None &&
+                    transform_style == TransformStyle::Flat
+                {
+                    return false;
+                }
+
+                // Create the filter pipeline.
+                let current_color = &style.get_inherited_text().color;
+                filters = effects
+                    .filter
+                    .0
+                    .iter()
+                    .map(|filter| FilterToWebRender::to_webrender(filter, current_color))
+                    .collect();
+                if effects.opacity != 1.0 {
+                    filters.push(wr::FilterOp::Opacity(
+                        effects.opacity.into(),
+                        effects.opacity,
+                    ));
+                }
+            },
+            // WebRender only needs a stacking context at the root when the root stacking
+            // context itself is a blend container.
+            StackingContextFragments::Root if is_blend_container => {
+                transform_style = TransformStyle::Flat;
+                primitive_flags = PrimitiveFlags::empty();
+                mix_blend_mode = MixBlendMode::Normal;
+                filters = Vec::new();
+            },
+            _ => return false,
+        };
+
+        if is_blend_container {
+            stacking_context_flags.insert(StackingContextFlags::IS_BLEND_CONTAINER);
+        }
+
+        // WebRender has two different ways of expressing "no clip." ClipChainId::INVALID
+        // should be used for primitives, but `None` is used for stacking contexts and
+        // clip chains. We convert to the `Option<ClipChainId>` representation here. Just
+        // passing Some(ClipChainId::INVALID) causes a panic.
+        let clip_chain_id = match stacking_context.clip_id {
+            ClipId::INVALID => None,
+            clip_id => Some(self.clip_chain_id(clip_id)),
+        };
+        let spatial_id = self.spatial_id(stacking_context.scroll_tree_node_id);
+
+        self.wr().push_stacking_context(
+            spatial_id,
+            primitive_flags,
+            clip_chain_id,
+            transform_style,
+            mix_blend_mode,
+            &filters,
+            &[], // filter_datas
+            wr::RasterSpace::Screen,
+            stacking_context_flags,
+            None, // snapshot
+        );
+
+        true
     }
 
     fn common_properties(
         &self,
+        state: &TraversalState,
         clip_rect: units::LayoutRect,
         style: &ComputedValues,
     ) -> wr::CommonItemProperties {
@@ -256,38 +511,22 @@ impl DisplayListBuilder<'_> {
         // for fragments that paint their entire border rectangle.
         wr::CommonItemProperties {
             clip_rect,
-            spatial_id: self.current_scroll_node_id.spatial_id,
-            clip_chain_id: self.current_clip_chain_id,
+            spatial_id: self.spatial_id(state.spatial_id),
+            clip_chain_id: self.clip_chain_id(state.clip_id),
             flags: style.get_webrender_primitive_flags(),
         }
     }
 
-    fn hit_info(
-        &mut self,
-        style: &ComputedValues,
-        tag: Option<Tag>,
-        auto_cursor: Cursor,
-    ) -> HitInfo {
-        use style::computed_values::pointer_events::T as PointerEvents;
-
-        let inherited_ui = style.get_inherited_ui();
-        if inherited_ui.pointer_events == PointerEvents::None {
-            return None;
-        }
-
-        let hit_test_index = self.display_list.compositor_info.add_hit_test_info(
-            tag?.node.0 as u64,
-            Some(cursor(inherited_ui.cursor.keyword, auto_cursor)),
-            self.current_scroll_node_id,
-        );
-        Some((
-            hit_test_index as u64,
-            self.display_list.compositor_info.epoch.as_u16(),
-        ))
-    }
-
     /// Draw highlights around the node that is currently hovered in the devtools.
-    fn paint_dom_inspector_highlight(&mut self, highlight: HighlightTraversalState) {
+    fn paint_dom_inspector_highlight(&mut self) {
+        let Some(highlight) = self
+            .inspector_highlight
+            .take()
+            .and_then(|highlight| highlight.state)
+        else {
+            return;
+        };
+
         const CONTENT_BOX_HIGHLIGHT_COLOR: webrender_api::ColorF = webrender_api::ColorF {
             r: 0.23,
             g: 0.7,
@@ -325,8 +564,7 @@ impl DisplayListBuilder<'_> {
             flags: wr::PrimitiveFlags::default(),
         };
 
-        self.display_list
-            .wr
+        self.wr()
             .push_rect(&properties, content_box, CONTENT_BOX_HIGHLIGHT_COLOR);
 
         // Highlight margin, border and padding
@@ -340,14 +578,16 @@ impl DisplayListBuilder<'_> {
                     }
 
                     let bounds = box_fragment
-                        .borrow()
-                        .offset_by_containing_block(&fragment_relative_bounds)
+                        .offset_by_containing_block(
+                            &fragment_relative_bounds,
+                            ContainingBlockCalculation::AlreadyDoneWithStackingContextTree,
+                        )
                         .to_webrender();
 
                     // We paint each highlighted area as if it was a border for simplicity
                     let border_style = wr::BorderSide {
                         color,
-                        style: webrender_api::BorderStyle::Solid,
+                        style: wr::BorderStyle::Solid,
                     };
 
                     let details = wr::BorderDetails::Normal(wr::NormalBorder {
@@ -368,7 +608,6 @@ impl DisplayListBuilder<'_> {
                     self.wr().push_border(&common, bounds, widths, details)
                 };
 
-            let box_fragment = box_fragment.borrow();
             paint_highlight(
                 PADDING_BOX_HIGHLIGHT_COLOR,
                 box_fragment.padding_rect(),
@@ -386,25 +625,381 @@ impl DisplayListBuilder<'_> {
             );
         }
     }
+
+    fn check_if_paintable(&mut self, bounds: LayoutRect, clip_rect: LayoutRect, opacity: f32) {
+        // From <https://www.w3.org/TR/paint-timing/#paintable>:
+        // An element el is paintable when all of the following apply:
+        // > el is being rendered.
+        // > el’s used visibility is visible.
+        // Above conditions are met, as we selectively call this API.
+
+        // > el and all of its ancestors' used opacity is greater than zero.
+        if opacity <= 0.0 {
+            return;
+        }
+
+        // > el’s paintable bounding rect intersects with the scrolling area of the document.
+        if self
+            .paint_timing_handler
+            .check_bounding_rect(bounds, clip_rect)
+        {
+            self.mark_is_paintable();
+        }
+    }
+
+    fn check_for_lcp_candidate(
+        &mut self,
+        state: &TraversalState,
+        clip_rect: LayoutRect,
+        bounds: LayoutRect,
+        tag: Option<Tag>,
+        url: Option<ServoUrl>,
+    ) {
+        if !pref!(largest_contentful_paint_enabled) {
+            return;
+        }
+
+        let transform = self
+            .paint_info
+            .scroll_tree
+            .cumulative_node_to_root_transform(state.spatial_id);
+
+        self.paint_timing_handler
+            .update_lcp_candidate(tag, bounds, clip_rect, transform, url);
+    }
+
+    fn visit_stacking_context_reference_frame_info(
+        &mut self,
+        stacking_context: &StackingContext,
+    ) -> (usize, Option<ScrollTreeNodeId>) {
+        let Some(reference_frame_info) = &stacking_context.reference_frame_info else {
+            return (0, None);
+        };
+
+        // Note: Reference frames always establish a stacking context, so it is fine to check if
+        // this stacking context establishes a reference frame as well. We don't need to check
+        // every fragment.
+        let old_reference_frame_spatial_id = std::mem::replace(
+            &mut self.current_reference_frame_scroll_node_id,
+            stacking_context.scroll_tree_node_id,
+        );
+
+        if reference_frame_info.captured_clip_id == ClipId::INVALID {
+            return (0, Some(old_reference_frame_spatial_id));
+        }
+
+        // Although there is nothing in the display list API that prevents it, WebRender
+        // expects that reference frames that alter the coordinate space of their contents do
+        // not propagate clips to those contents. In order to achieve this, push an extra
+        // stacking context here that only specifies a clip. This stacking context will contain
+        // all of the contents of the reference frame, but because it is added in the parent
+        // spatial node, it has the coordinate space of the reference frame parent. In addition
+        // to this, reference frames reset the base `ClipId` value for descendants to
+        // `ClipId::INVALID` during stacking context tree construction.
+        let clip_chain_id = Some(self.clip_chain_id(reference_frame_info.captured_clip_id));
+        let spatial_id = self.spatial_id(reference_frame_info.parent_spatial_node_id);
+        self.wr().push_stacking_context(
+            spatial_id,
+            PrimitiveFlags::default(),
+            clip_chain_id,
+            webrender_api::TransformStyle::Flat,
+            webrender_api::MixBlendMode::Normal,
+            &[], // filters,
+            &[], // filter_datas
+            wr::RasterSpace::Screen,
+            wr::StackingContextFlags::empty(),
+            None, // snapshot
+        );
+
+        (1, Some(old_reference_frame_spatial_id))
+    }
+}
+
+impl PaintTraversalHandler for DisplayListBuilder<'_> {
+    /// A tuple composed of the number of real WebRender stacking contexts pushed
+    /// and the previous `Self::current_reference_frame_scroll_node_id` value of
+    /// the `DisplayListBuilder` when a stacking context was visited (or `None` if
+    /// the value was unmodified).
+    type StackingContextState = (usize, Option<ScrollTreeNodeId>);
+
+    fn visit_stacking_context(
+        &mut self,
+        stacking_context: &StackingContext,
+    ) -> Self::StackingContextState {
+        let (mut stacking_contexts_pushed, old_reference_frame) =
+            self.visit_stacking_context_reference_frame_info(stacking_context);
+        if self.push_webrender_stacking_context_if_necessary(stacking_context) {
+            stacking_contexts_pushed += 1;
+        }
+        (stacking_contexts_pushed, old_reference_frame)
+    }
+
+    fn leave_stacking_context(
+        &mut self,
+        _: &TraversalState,
+        stacking_context_state: Self::StackingContextState,
+    ) {
+        let (stacking_contexts_pushed, old_reference_frame) = stacking_context_state;
+        for _ in 0..stacking_contexts_pushed {
+            self.wr().pop_stacking_context();
+        }
+
+        if let Some(old_reference_frame) = old_reference_frame {
+            self.current_reference_frame_scroll_node_id = old_reference_frame;
+        }
+    }
+
+    fn visit_box(&mut self, state: &TraversalState, fragment: &BoxFragmentWithStyle<'_>) {
+        fragment.base.visit_fragment(self);
+
+        if let Some(mut inspector_highlight) = self.inspector_highlight.take() &&
+            fragment.base.tag == Some(inspector_highlight.tag)
+        {
+            inspector_highlight.register_fragment_of_highlighted_dom_node(self, state, fragment);
+            self.inspector_highlight = Some(inspector_highlight);
+        }
+
+        if fragment.style().get_inherited_box().visibility != Visibility::Visible {
+            return;
+        };
+
+        BuilderForBoxFragment::new(fragment, state.origin).build(self, state)
+    }
+
+    fn visit_iframe(&mut self, state: &TraversalState, fragment: &Arc<IFrameFragment>) {
+        fragment.base.visit_fragment(self);
+
+        let style = fragment.base.style();
+        if style.get_inherited_box().visibility != Visibility::Visible {
+            return;
+        }
+
+        let rect = fragment.base.rect().translate(state.origin.to_vector());
+        let common = self.common_properties(state, rect.to_webrender(), &style);
+        self.wr().push_iframe(
+            rect.to_webrender(),
+            common.clip_rect,
+            &wr::SpaceAndClipInfo {
+                spatial_id: common.spatial_id,
+                clip_chain_id: common.clip_chain_id,
+            },
+            fragment.pipeline_id.into(),
+            true,
+        );
+        // From <https://www.w3.org/TR/paint-timing/#mark-paint-timing>:
+        // > A parent frame should not be aware of the paint events from its child iframes, and
+        // > vice versa. This means that a frame that contains just iframes will have first paint
+        // > (due to the enclosing boxes of the iframes) but no first contentful paint.
+        self.check_if_paintable(rect.to_webrender(), common.clip_rect, style.clone_opacity());
+    }
+
+    fn visit_image(
+        &mut self,
+        state: &TraversalState,
+        containing_block: PhysicalRect<Au>,
+        fragment: &Arc<ImageFragment>,
+    ) {
+        fragment.base.visit_fragment(self);
+
+        let style = fragment.base.style();
+        if style.get_inherited_box().visibility != Visibility::Visible {
+            return;
+        }
+
+        let image_rendering = style.get_inherited_box().image_rendering.to_webrender();
+        let rect = fragment
+            .base
+            .rect()
+            .translate(containing_block.origin.to_vector())
+            .to_webrender();
+        let clip = fragment
+            .clip
+            .translate(containing_block.origin.to_vector())
+            .to_webrender();
+        let common = self.common_properties(state, clip, &style);
+
+        if let Some(image_key) = fragment.image_key {
+            self.wr().push_image(
+                &common,
+                rect,
+                image_rendering,
+                wr::AlphaType::PremultipliedAlpha,
+                image_key,
+                wr::ColorF::WHITE,
+            );
+
+            self.check_if_paintable(rect, common.clip_rect, style.clone_opacity());
+
+            // From <https://www.w3.org/TR/paint-timing/#contentful>:
+            // An element target is contentful when one or more of the following apply:
+            // > target is a replaced element representing an available image.
+            // From: <https://html.spec.whatwg.org/multipage/#img-available>
+            // When an image request's state is either partially available or completely available,
+            // the image request is said to be available.
+            // Hence, Skip Broken Images.
+            if !fragment.showing_broken_image_icon {
+                self.mark_is_contentful();
+
+                self.check_for_lcp_candidate(
+                    state,
+                    common.clip_rect,
+                    rect,
+                    fragment.base.tag,
+                    fragment.url.clone(),
+                );
+            }
+        }
+
+        if fragment.showing_broken_image_icon {
+            Fragment::build_display_list_for_broken_image_border(self, &containing_block, &common);
+        }
+    }
+
+    fn visit_text(
+        &mut self,
+        state: &TraversalState,
+        containing_block: PhysicalRect<Au>,
+        fragment: &Arc<TextFragment>,
+    ) {
+        fragment.base.visit_fragment(self);
+
+        let style = fragment.base.style();
+        if style.get_inherited_box().visibility != Visibility::Visible {
+            return;
+        }
+        Fragment::build_display_list_for_text_fragment(fragment, self, state, &containing_block);
+    }
+
+    fn visit_positioning(&mut self, _state: &TraversalState, fragment: &Arc<PositioningFragment>) {
+        fragment.base.visit_fragment(self);
+    }
+
+    /// This is an implementation of step 3 from:
+    /// <https://drafts.csswg.org/css-position-4/#paint-a-stacking-context>:
+    ///
+    /// - See also: <https://drafts.csswg.org/css-backgrounds/#special-backgrounds>.
+    /// - Note: This is only called for the root `StackingContext`.
+    fn visit_box_for_root_background(&mut self, state: &TraversalState) {
+        let Some(fragment) = self.fragment_tree.root_box_fragment() else {
+            return;
+        };
+        let fragment = fragment.with_style();
+
+        let source_style = {
+            // > For documents whose root element is an HTML HTML element or an XHTML html element
+            // > [HTML]: if the computed value of background-image on the root element is none and its
+            // > background-color is transparent, user agents must instead propagate the computed
+            // > values of the background properties from that element’s first HTML BODY or XHTML body
+            // > child element.
+            let root_fragment_style = fragment.style();
+            if root_fragment_style.background_is_transparent() {
+                let body_fragment = self.fragment_tree.body_fragment();
+                self.paint_body_background = body_fragment.is_none();
+                body_fragment
+                    .map(|body_fragment| body_fragment.style().clone())
+                    .unwrap_or(fragment.style().clone())
+            } else {
+                root_fragment_style.clone()
+            }
+        };
+
+        // This can happen if the root fragment does not have a `<body>` child (either because it is
+        // `display: none` or `display: contents`) or if the `<body>`'s background is transparent.
+        if source_style.background_is_transparent() {
+            return;
+        }
+
+        // The painting area is theoretically the infinite 2D plane,
+        // but we need a rectangle with finite coordinates.
+        //
+        // If the document is smaller than the viewport (and doesn’t scroll),
+        // we still want to paint the rest of the viewport.
+        // If it’s larger, we also want to paint areas reachable after scrolling.
+        let painting_area = self
+            .fragment_tree
+            .initial_containing_block
+            .union(&self.fragment_tree.scrollable_overflow())
+            .to_webrender();
+
+        let background_color =
+            source_style.resolve_color(&source_style.get_background().background_color);
+        if background_color.alpha > 0.0 {
+            let common = self.common_properties(state, painting_area, &source_style);
+            let color = rgba(background_color);
+            self.wr().push_rect(&common, painting_area, color);
+
+            // From <https://www.w3.org/TR/paint-timing/#sec-terminology>:
+            // First paint ... includes non-default background paint and the enclosing box of an iframe.
+            // The spec is vague. See also: https://github.com/w3c/paint-timing/issues/122
+            let default_background_color = servo_config::pref!(shell_background_color_rgba);
+            let default_background_color = AbsoluteColor::new(
+                ColorSpace::Srgb,
+                default_background_color[0] as f32,
+                default_background_color[1] as f32,
+                default_background_color[2] as f32,
+                default_background_color[3] as f32,
+            )
+            .into_srgb_legacy();
+            if background_color != default_background_color {
+                self.mark_is_paintable();
+            }
+        }
+
+        let fragment_builder = BuilderForBoxFragment::new(
+            &fragment,
+            self.fragment_tree.initial_containing_block.origin,
+        );
+        let painter = BackgroundPainter {
+            style: &source_style,
+            painting_area_override: Some(painting_area),
+            positioning_area_override: None,
+        };
+        fragment_builder.build_background_image(self, state, &painter);
+    }
+
+    fn visit_box_for_outline(&mut self, state: &TraversalState, fragment: &Arc<BoxFragment>) {
+        let fragment = fragment.with_style();
+        if fragment.style().get_inherited_box().visibility != Visibility::Visible {
+            return;
+        };
+        BuilderForBoxFragment::new(&fragment, state.origin).build_outline(self, state)
+    }
+
+    fn visit_box_for_collapsed_table_borders(
+        &mut self,
+        state: &TraversalState,
+        fragment: &BoxFragmentWithStyle<'_>,
+    ) {
+        if fragment.style().get_inherited_box().visibility != Visibility::Visible {
+            return;
+        };
+        BuilderForBoxFragment::new(fragment, state.origin)
+            .build_collapsed_table_borders(self, state)
+    }
 }
 
 impl InspectorHighlight {
     fn register_fragment_of_highlighted_dom_node(
         &mut self,
-        fragment: &Fragment,
-        spatial_id: SpatialId,
-        clip_chain_id: ClipChainId,
-        containing_block: &PhysicalRect<Au>,
+        builder: &DisplayListBuilder,
+        traversal_state: &TraversalState,
+        fragment: &Arc<BoxFragment>,
     ) {
-        let state = self.state.get_or_insert(HighlightTraversalState {
-            content_box: euclid::Rect::zero(),
+        let spatial_id = builder.spatial_id(traversal_state.spatial_id);
+        let clip_chain_id = builder.clip_chain_id(traversal_state.clip_id);
+        let state = self.state.get_or_insert_with(|| HighlightTraversalState {
+            content_box: Rect::zero(),
             spatial_id,
             clip_chain_id,
-            maybe_box_fragment: None,
+            maybe_box_fragment: Some(fragment.clone()),
         });
 
-        // We expect all fragments generated by one node to be in the same scroll tree node and clip node
-        debug_assert_eq!(spatial_id, state.spatial_id);
+        // We only need to highlight the first `SpatialId`. Typically this will include the bottommost
+        // fragment for a node, which generally surrounds the entire content.
+        if spatial_id != state.spatial_id {
+            return;
+        }
+
         if clip_chain_id != ClipChainId::INVALID && state.clip_chain_id != ClipChainId::INVALID {
             debug_assert_eq!(
                 clip_chain_id, state.clip_chain_id,
@@ -412,213 +1007,89 @@ impl InspectorHighlight {
             );
         }
 
-        let fragment_relative_rect = match fragment {
-            Fragment::Box(fragment) | Fragment::Float(fragment) => {
-                state.maybe_box_fragment = Some(fragment.clone());
-
-                fragment.borrow().content_rect
-            },
-            Fragment::Positioning(fragment) => fragment.borrow().rect,
-            Fragment::Text(fragment) => fragment.borrow().rect,
-            Fragment::Image(image_fragment) => image_fragment.borrow().rect,
-            Fragment::AbsoluteOrFixedPositioned(_) => return,
-            Fragment::IFrame(iframe_fragment) => iframe_fragment.borrow().rect,
-        };
-
-        state.content_box = state
-            .content_box
-            .union(&fragment_relative_rect.translate(containing_block.origin.to_vector()));
+        state.maybe_box_fragment = Some(fragment.clone());
+        state.content_box = state.content_box.union(
+            &fragment
+                .base
+                .rect()
+                .translate(traversal_state.origin.to_vector()),
+        );
     }
 }
 
 impl Fragment {
-    pub(crate) fn build_display_list(
-        &self,
-        builder: &mut DisplayListBuilder,
-        containing_block: &PhysicalRect<Au>,
-        section: StackingContextSection,
-        is_hit_test_for_scrollable_overflow: bool,
-        is_collapsed_table_borders: bool,
-    ) {
-        if let Some(inspector_highlight) = &mut builder.inspector_highlight {
-            if self.tag() == Some(inspector_highlight.tag) {
-                inspector_highlight.register_fragment_of_highlighted_dom_node(
-                    self,
-                    builder.current_scroll_node_id.spatial_id,
-                    builder.current_clip_chain_id,
-                    containing_block,
-                );
-            }
-        }
-
-        match self {
-            Fragment::Box(box_fragment) | Fragment::Float(box_fragment) => {
-                let box_fragment = &*box_fragment.borrow();
-                match box_fragment.style.get_inherited_box().visibility {
-                    Visibility::Visible => BuilderForBoxFragment::new(
-                        box_fragment,
-                        containing_block,
-                        is_hit_test_for_scrollable_overflow,
-                        is_collapsed_table_borders,
-                    )
-                    .build(builder, section),
-                    Visibility::Hidden => (),
-                    Visibility::Collapse => (),
-                }
-            },
-            Fragment::AbsoluteOrFixedPositioned(_) => {},
-            Fragment::Positioning(positioning_fragment) => {
-                let positioning_fragment = positioning_fragment.borrow();
-                if let Some(style) = positioning_fragment.style.as_ref() {
-                    let rect = positioning_fragment
-                        .rect
-                        .translate(containing_block.origin.to_vector());
-                    self.maybe_push_hit_test_for_style_and_tag(
-                        builder,
-                        style,
-                        positioning_fragment.base.tag,
-                        rect,
-                        Cursor::Default,
-                    );
-                }
-            },
-            Fragment::Image(image) => {
-                let image = image.borrow();
-                match image.style.get_inherited_box().visibility {
-                    Visibility::Visible => {
-                        builder.mark_is_contentful();
-
-                        let image_rendering = image
-                            .style
-                            .get_inherited_box()
-                            .image_rendering
-                            .to_webrender();
-                        let rect = image
-                            .rect
-                            .translate(containing_block.origin.to_vector())
-                            .to_webrender();
-                        let clip = image
-                            .clip
-                            .translate(containing_block.origin.to_vector())
-                            .to_webrender();
-                        let common = builder.common_properties(clip, &image.style);
-
-                        if let Some(image_key) = image.image_key {
-                            builder.wr().push_image(
-                                &common,
-                                rect,
-                                image_rendering,
-                                wr::AlphaType::PremultipliedAlpha,
-                                image_key,
-                                wr::ColorF::WHITE,
-                            );
-                        }
-                    },
-                    Visibility::Hidden => (),
-                    Visibility::Collapse => (),
-                }
-            },
-            Fragment::IFrame(iframe) => {
-                let iframe = iframe.borrow();
-                match iframe.style.get_inherited_box().visibility {
-                    Visibility::Visible => {
-                        builder.mark_is_contentful();
-                        let rect = iframe.rect.translate(containing_block.origin.to_vector());
-
-                        let common = builder.common_properties(rect.to_webrender(), &iframe.style);
-                        builder.wr().push_iframe(
-                            rect.to_webrender(),
-                            common.clip_rect,
-                            &wr::SpaceAndClipInfo {
-                                spatial_id: common.spatial_id,
-                                clip_chain_id: common.clip_chain_id,
-                            },
-                            iframe.pipeline_id.into(),
-                            true,
-                        );
-                    },
-                    Visibility::Hidden => (),
-                    Visibility::Collapse => (),
-                }
-            },
-            Fragment::Text(text) => {
-                let text = &*text.borrow();
-                match text.parent_style.get_inherited_box().visibility {
-                    Visibility::Visible => {
-                        self.build_display_list_for_text_fragment(text, builder, containing_block)
-                    },
-                    Visibility::Hidden => (),
-                    Visibility::Collapse => (),
-                }
-            },
-        }
-    }
-
-    fn maybe_push_hit_test_for_style_and_tag(
-        &self,
-        builder: &mut DisplayListBuilder,
-        style: &ComputedValues,
-        tag: Option<Tag>,
-        rect: PhysicalRect<Au>,
-        cursor: Cursor,
-    ) {
-        let hit_info = builder.hit_info(style, tag, cursor);
-        let hit_info = match hit_info {
-            Some(hit_info) => hit_info,
-            None => return,
-        };
-
-        let clip_chain_id = builder.current_clip_chain_id;
-        let spatial_id = builder.current_scroll_node_id.spatial_id;
-        builder.wr().push_hit_test(
-            rect.to_webrender(),
-            clip_chain_id,
-            spatial_id,
-            style.get_webrender_primitive_flags(),
-            hit_info,
-        );
-    }
-
     fn build_display_list_for_text_fragment(
-        &self,
         fragment: &TextFragment,
         builder: &mut DisplayListBuilder,
+        state: &TraversalState,
         containing_block: &PhysicalRect<Au>,
     ) {
         // NB: The order of painting text components (CSS Text Decoration Module Level 3) is:
         // shadows, underline, overline, text, text-emphasis, and then line-through.
-
-        builder.mark_is_contentful();
-
-        let rect = fragment.rect.translate(containing_block.origin.to_vector());
+        let rect = fragment
+            .base
+            .rect()
+            .translate(containing_block.origin.to_vector());
         let mut baseline_origin = rect.origin;
         baseline_origin.y += fragment.font_metrics.ascent;
-        let glyphs = glyphs(
+
+        let include_whitespace = fragment.offsets.is_some() ||
+            state
+                .text_decorations
+                .iter()
+                .any(|item| !item.line.is_empty());
+
+        let (glyphs, largest_advance) = glyphs(
             &fragment.glyphs,
             baseline_origin,
             fragment.justification_adjustment,
-            !fragment.has_selection(),
+            include_whitespace,
         );
-        if glyphs.is_empty() {
+
+        if glyphs.is_empty() && !fragment.is_empty_for_text_cursor {
             return;
         }
 
-        self.maybe_push_hit_test_for_style_and_tag(
-            builder,
-            &fragment.parent_style,
-            fragment.base.tag,
-            rect,
-            Cursor::Text,
-        );
-
-        let color = fragment.parent_style.clone_color();
+        let parent_style = fragment.base.style();
+        let color = parent_style.clone_color();
+        let font_size = parent_style.clone_font_size();
         let font_metrics = &fragment.font_metrics;
-        let dppx = builder.context.style_context.device_pixel_ratio().get();
-        let common = builder.common_properties(rect.to_webrender(), &fragment.parent_style);
+        let dppx = builder.device_pixel_ratio.get();
+
+        let resolve_thickness = |thickness: &TextDecorationThickness| -> Au {
+            let resolved = match thickness {
+                TextDecorationThickness::LengthPercentage(length_percentage) => {
+                    length_percentage.resolve(font_size.computed_size.0).px()
+                },
+                TextDecorationThickness::Auto | TextDecorationThickness::FromFont => {
+                    font_metrics.underline_size.to_f32_px()
+                },
+            };
+
+            // If zero, return zero.
+            // Else round down to the nearest physical pixel; floor at 1 physical pixel.
+            // See: <https://drafts.csswg.org/css-values-4/#snap-as-a-line-width>
+            if resolved == 0.0 {
+                Au::zero()
+            } else {
+                Au::from_f32_px((resolved * dppx).floor().max(1.0) / dppx)
+            }
+        };
+
+        // Gecko gets the text bounding box based on the ink overflow bounds. Since
+        // we don't need to calculate this yet (as we do not implement `contain:
+        // paint`), we just need to make sure these boundaries are big enough to
+        // contain the inked portion of the glyphs. We assume that the descent and
+        // ascent are big enough and then just expand the advance-based boundaries by
+        // twice the size of the biggest advance in the advance dimention.
+        let glyph_bounds = rect
+            .inflate(largest_advance.scale_by(2.0), Au::zero())
+            .to_webrender();
+        let common = builder.common_properties(state, glyph_bounds, &parent_style);
 
         // Shadows. According to CSS-BACKGROUNDS, text shadows render in *reverse* order (front to
         // back).
-        let shadows = &fragment.parent_style.get_inherited_text().text_shadow;
+        let shadows = &parent_style.get_inherited_text().text_shadow;
         for shadow in shadows.0.iter().rev() {
             builder.wr().push_shadow(
                 &wr::SpaceAndClipInfo {
@@ -634,106 +1105,79 @@ impl Fragment {
             );
         }
 
-        if fragment
-            .text_decoration_line
-            .contains(TextDecorationLine::UNDERLINE)
-        {
-            let mut rect = rect;
-            rect.origin.y += font_metrics.ascent - font_metrics.underline_offset;
-            rect.size.height = Au::from_f32_px(font_metrics.underline_size.to_nearest_pixel(dppx));
-            self.build_display_list_for_text_decoration(fragment, builder, &rect, &color);
+        Self::build_display_list_for_text_selection(
+            fragment,
+            builder,
+            state,
+            containing_block,
+            fragment.base.rect().min_x(),
+            fragment.justification_adjustment,
+        );
+
+        for text_decoration in state.text_decorations.iter() {
+            if text_decoration.line.contains(TextDecorationLine::UNDERLINE) {
+                let mut rect = rect;
+                rect.origin.y += font_metrics.ascent - font_metrics.underline_offset;
+                rect.size.height = resolve_thickness(&text_decoration.thickness);
+                Self::build_display_list_for_text_decoration(
+                    state,
+                    &parent_style,
+                    builder,
+                    &rect,
+                    text_decoration,
+                    TextDecorationLine::UNDERLINE,
+                );
+            }
         }
 
-        if fragment
-            .text_decoration_line
-            .contains(TextDecorationLine::OVERLINE)
-        {
-            let mut rect = rect;
-            rect.size.height = Au::from_f32_px(font_metrics.underline_size.to_nearest_pixel(dppx));
-            self.build_display_list_for_text_decoration(fragment, builder, &rect, &color);
-        }
-
-        // TODO: This caret/text selection implementation currently does not account for vertical text
-        // and RTL text properly.
-        if let Some(range) = fragment.selection_range {
-            let baseline_origin = rect.origin;
-            if !range.is_empty() {
-                let start = glyphs_advance_by_index(
-                    &fragment.glyphs,
-                    range.begin(),
-                    baseline_origin,
-                    fragment.justification_adjustment,
+        for text_decoration in state.text_decorations.iter() {
+            if text_decoration.line.contains(TextDecorationLine::OVERLINE) {
+                let mut rect = rect;
+                rect.size.height = resolve_thickness(&text_decoration.thickness);
+                Self::build_display_list_for_text_decoration(
+                    state,
+                    &parent_style,
+                    builder,
+                    &rect,
+                    text_decoration,
+                    TextDecorationLine::OVERLINE,
                 );
-
-                let end = glyphs_advance_by_index(
-                    &fragment.glyphs,
-                    range.end(),
-                    baseline_origin,
-                    fragment.justification_adjustment,
-                );
-
-                let selection_rect = LayoutRect::new(
-                    Point2D::new(start.x.to_f32_px(), containing_block.min_y().to_f32_px()),
-                    Point2D::new(end.x.to_f32_px(), containing_block.max_y().to_f32_px()),
-                );
-                if let Some(selection_color) = fragment
-                    .selected_style
-                    .clone_background_color()
-                    .as_absolute()
-                {
-                    let selection_common =
-                        builder.common_properties(selection_rect, &fragment.parent_style);
-                    builder.wr().push_rect(
-                        &selection_common,
-                        selection_rect,
-                        rgba(*selection_color),
-                    );
-                }
-            } else {
-                let insertion_point = glyphs_advance_by_index(
-                    &fragment.glyphs,
-                    range.begin(),
-                    baseline_origin,
-                    fragment.justification_adjustment,
-                );
-
-                let insertion_point_rect = LayoutRect::new(
-                    Point2D::new(
-                        insertion_point.x.to_f32_px(),
-                        containing_block.min_y().to_f32_px(),
-                    ),
-                    Point2D::new(
-                        insertion_point.x.to_f32_px() + INSERTION_POINT_LOGICAL_WIDTH.to_f32_px(),
-                        containing_block.max_y().to_f32_px(),
-                    ),
-                );
-                let insertion_point_common =
-                    builder.common_properties(insertion_point_rect, &fragment.parent_style);
-                // TODO: The color of the caret is currently hardcoded to the text color.
-                // We should be retrieving the caret color from the style properly.
-                builder
-                    .wr()
-                    .push_rect(&insertion_point_common, insertion_point_rect, rgba(color));
             }
         }
 
         builder.wr().push_text(
             &common,
-            rect.to_webrender(),
+            glyph_bounds,
             &glyphs,
             fragment.font_key,
             rgba(color),
             None,
         );
 
-        if fragment
-            .text_decoration_line
-            .contains(TextDecorationLine::LINE_THROUGH)
-        {
-            let mut rect = rect;
-            rect.origin.y += font_metrics.ascent - font_metrics.strikeout_offset;
-            rect.size.height = Au::from_f32_px(font_metrics.strikeout_size.to_nearest_pixel(dppx));
-            self.build_display_list_for_text_decoration(fragment, builder, &rect, &color);
+        builder.check_if_paintable(glyph_bounds, common.clip_rect, parent_style.clone_opacity());
+
+        // From <https://www.w3.org/TR/paint-timing/#contentful>:
+        // An element target is contentful when one or more of the following apply:
+        // > target has a text node child, representing non-empty text, and the node’s used opacity is greater than zero.
+        builder.mark_is_contentful();
+
+        for text_decoration in state.text_decorations.iter() {
+            if text_decoration
+                .line
+                .contains(TextDecorationLine::LINE_THROUGH)
+            {
+                let mut rect = rect;
+                rect.origin.y += font_metrics.ascent - font_metrics.strikeout_offset;
+                rect.size.height = resolve_thickness(&text_decoration.thickness);
+                Self::build_display_list_for_text_decoration(
+                    state,
+                    &parent_style,
+                    builder,
+                    &rect,
+                    text_decoration,
+                    TextDecorationLine::LINE_THROUGH,
+                );
+            }
         }
 
         if !shadows.0.is_empty() {
@@ -742,104 +1186,278 @@ impl Fragment {
     }
 
     fn build_display_list_for_text_decoration(
-        &self,
-        fragment: &TextFragment,
+        state: &TraversalState,
+        parent_style: &ServoArc<ComputedValues>,
         builder: &mut DisplayListBuilder,
         rect: &PhysicalRect<Au>,
-        color: &AbsoluteColor,
+        text_decoration: &FragmentTextDecoration,
+        line: TextDecorationLine,
     ) {
-        let rect = rect.to_webrender();
-        let wavy_line_thickness = (0.33 * rect.size().height).ceil();
-        let text_decoration_color = fragment
-            .parent_style
-            .clone_text_decoration_color()
-            .resolve_to_absolute(color);
-        let text_decoration_style = fragment.parent_style.clone_text_decoration_style();
-        if text_decoration_style == ComputedTextDecorationStyle::MozNone {
+        if text_decoration.style == ComputedTextDecorationStyle::MozNone {
             return;
         }
-        builder.display_list.wr.push_line(
-            &builder.common_properties(rect, &fragment.parent_style),
-            &rect,
+
+        let mut rect = rect.to_webrender();
+        let wavy_line_thickness = rect.height().ceil();
+        if text_decoration.style == ComputedTextDecorationStyle::Wavy {
+            rect = rect.inflate(0.0, wavy_line_thickness);
+        }
+
+        // In Servo, text decorations can span multiple text fragments. In order to have dots,
+        // dashes, and wavy line segments match up between multiple fragments, this code extends
+        // the painting rect for the decoration types for which this matters to the origin. As
+        // the rectangle starts at the origin, all painted decorations will be in phase. As the
+        // clipping rectangle is left unchanged, the actual painted region remains the size of
+        // the original rectangle.
+        let expand_rect_for_text_decoration = |mut rect: Box2D<f32, LayoutPixel>| {
+            if matches!(
+                text_decoration.style,
+                ComputedTextDecorationStyle::Dotted |
+                    ComputedTextDecorationStyle::Dashed |
+                    ComputedTextDecorationStyle::Wavy,
+            ) {
+                rect.min.x = rect.min.x.min(0.0);
+            }
+            rect
+        };
+
+        let common_properties = builder.common_properties(state, rect, parent_style);
+        builder.wr().push_line(
+            &common_properties,
+            &expand_rect_for_text_decoration(rect),
             wavy_line_thickness,
             wr::LineOrientation::Horizontal,
-            &rgba(text_decoration_color),
-            text_decoration_style.to_webrender(),
+            &rgba(text_decoration.color),
+            text_decoration.style.to_webrender(),
         );
-        // XXX(ferjm) support text-decoration-style: double
+
+        if text_decoration.style == TextDecorationStyle::Double {
+            let half_height = (rect.height() / 2.0).floor().max(1.0);
+            let y_offset = match line {
+                TextDecorationLine::OVERLINE => -rect.height() - half_height,
+                _ => rect.height() + half_height,
+            };
+            let rect = rect.translate(Vector2D::new(0.0, y_offset));
+            let common_properties = builder.common_properties(state, rect, parent_style);
+            builder.wr().push_line(
+                &common_properties,
+                &rect,
+                wavy_line_thickness,
+                wr::LineOrientation::Horizontal,
+                &rgba(text_decoration.color),
+                text_decoration.style.to_webrender(),
+            );
+        }
+    }
+
+    fn build_display_list_for_broken_image_border(
+        builder: &mut DisplayListBuilder,
+        containing_block: &PhysicalRect<Au>,
+        common: &CommonItemProperties,
+    ) {
+        let border_side = BorderSide {
+            color: ColorF::BLACK,
+            style: wr::BorderStyle::Inset,
+        };
+        builder.wr().push_border(
+            common,
+            containing_block.to_webrender(),
+            LayoutSideOffsets::new_all_same(1.0),
+            BorderDetails::Normal(NormalBorder {
+                left: border_side,
+                right: border_side,
+                top: border_side,
+                bottom: border_side,
+                radius: BorderRadius::zero(),
+                do_aa: true,
+            }),
+        );
+    }
+
+    // TODO: This caret/text selection implementation currently does not account for vertical text
+    // and RTL text properly.
+    fn build_display_list_for_text_selection(
+        fragment: &TextFragment,
+        builder: &mut DisplayListBuilder<'_>,
+        state: &TraversalState,
+        containing_block_rect: &PhysicalRect<Au>,
+        fragment_x_offset: Au,
+        justification_adjustment: Au,
+    ) {
+        let Some(offsets) = fragment.offsets.as_ref() else {
+            return;
+        };
+
+        let shared_selection = offsets.shared_selection.borrow();
+        if !shared_selection.enabled {
+            return;
+        }
+
+        if offsets.character_range.start > shared_selection.character_range.end ||
+            offsets.character_range.end < shared_selection.character_range.start
+        {
+            return;
+        }
+
+        // When there is an active selection, the line is empty, and there is a forced linebreak,
+        // layout will push an empty fragment in order to trigger painting of the cursor on an empty line.
+        // This code ensure that it is only painted if the cursor is on the starting index of the empty
+        // fragment.
+        if fragment.is_empty_for_text_cursor &&
+            !offsets
+                .character_range
+                .contains(&shared_selection.character_range.start)
+        {
+            return;
+        }
+
+        let mut current_character_index = offsets.character_range.start;
+        let mut current_advance = Au::zero();
+        let mut start_advance = None;
+        let mut end_advance = None;
+        for glyph_store in fragment.glyphs.iter() {
+            let glyph_store_character_count = glyph_store.character_count();
+            if current_character_index + glyph_store_character_count <
+                shared_selection.character_range.start
+            {
+                current_advance += glyph_store.total_advance() +
+                    (justification_adjustment * glyph_store.total_word_separators() as i32);
+                current_character_index += glyph_store_character_count;
+                continue;
+            }
+
+            if current_character_index >= shared_selection.character_range.end {
+                break;
+            }
+
+            for glyph in glyph_store.glyphs() {
+                if current_character_index >= shared_selection.character_range.start {
+                    start_advance = start_advance.or(Some(current_advance));
+                }
+
+                current_character_index += glyph.character_count();
+                current_advance += glyph.advance();
+                if glyph.char_is_word_separator() {
+                    current_advance += justification_adjustment;
+                }
+
+                if current_character_index <= shared_selection.character_range.end {
+                    end_advance = Some(current_advance);
+                }
+            }
+        }
+
+        let start_x = start_advance.unwrap_or(current_advance);
+        let end_x = end_advance.unwrap_or(current_advance);
+
+        let parent_style = fragment.base.style();
+        if !shared_selection.character_range.is_empty() {
+            let selection_rect = Rect::new(
+                containing_block_rect.origin +
+                    Vector2D::new(fragment_x_offset + start_x, Au::zero()),
+                Size2D::new(end_x - start_x, containing_block_rect.height()),
+            )
+            .to_webrender();
+
+            if let Some(selection_color) = fragment
+                .selected_style
+                .borrow()
+                .clone_background_color()
+                .as_absolute()
+            {
+                let selection_common =
+                    builder.common_properties(state, selection_rect, &parent_style);
+                builder
+                    .wr()
+                    .push_rect(&selection_common, selection_rect, rgba(*selection_color));
+            }
+            return;
+        }
+
+        let insertion_point_rect = Rect::new(
+            containing_block_rect.origin + Vector2D::new(start_x + fragment_x_offset, Au::zero()),
+            Size2D::new(
+                INSERTION_POINT_LOGICAL_WIDTH,
+                containing_block_rect.height(),
+            ),
+        )
+        .to_webrender();
+
+        let color = parent_style.clone_color();
+        let caret_color = match parent_style.clone_caret_color().0 {
+            ColorOrAuto::Color(caret_color) => caret_color.resolve_to_absolute(&color),
+            ColorOrAuto::Auto => color,
+        };
+        let insertion_point_common =
+            builder.common_properties(state, insertion_point_rect, &parent_style);
+
+        let caret_color = rgba(caret_color);
+        let property_binding = if prefs::get().editing_caret_blink_time().is_some() {
+            // It's okay to always use the same property binding key for this pipeline, as
+            // there is currently only a single thing that animates in this way (the caret).
+            // This code should be updated if we ever add more paint-side animations.
+            let pipeline_id: PipelineId = builder.paint_info.pipeline_id.into();
+            let property_binding_key = PropertyBindingKey::new(pipeline_id.into());
+            builder.paint_info.caret_property_binding = Some((property_binding_key, caret_color));
+            PropertyBinding::Binding(property_binding_key, caret_color)
+        } else {
+            PropertyBinding::Value(caret_color)
+        };
+
+        builder.wr().push_rect_with_animation(
+            &insertion_point_common,
+            insertion_point_rect,
+            property_binding,
+        );
     }
 }
 
 struct BuilderForBoxFragment<'a> {
-    fragment: &'a BoxFragment,
-    containing_block: &'a PhysicalRect<Au>,
+    fragment: &'a BoxFragmentWithStyle<'a>,
+    containing_block_origin: PhysicalPoint<Au>,
     border_rect: units::LayoutRect,
     margin_rect: OnceCell<units::LayoutRect>,
     padding_rect: OnceCell<units::LayoutRect>,
     content_rect: OnceCell<units::LayoutRect>,
-    border_radius: wr::BorderRadius,
+    border_radius: OnceCell<wr::BorderRadius>,
     border_edge_clip_chain_id: RefCell<Option<ClipChainId>>,
     padding_edge_clip_chain_id: RefCell<Option<ClipChainId>>,
     content_edge_clip_chain_id: RefCell<Option<ClipChainId>>,
-    is_hit_test_for_scrollable_overflow: bool,
-    is_collapsed_table_borders: bool,
 }
 
 impl<'a> BuilderForBoxFragment<'a> {
     fn new(
-        fragment: &'a BoxFragment,
-        containing_block: &'a PhysicalRect<Au>,
-        is_hit_test_for_scrollable_overflow: bool,
-        is_collapsed_table_borders: bool,
+        fragment: &'a BoxFragmentWithStyle<'a>,
+        containing_block_origin: PhysicalPoint<Au>,
     ) -> Self {
         let border_rect = fragment
             .border_rect()
-            .translate(containing_block.origin.to_vector());
-
-        let webrender_border_rect = border_rect.to_webrender();
-        let border_radius = {
-            let resolve = |radius: &LengthPercentage, box_size: Au| {
-                radius.to_used_value(box_size).to_f32_px()
-            };
-            let corner = |corner: &style::values::computed::BorderCornerRadius| {
-                Size2D::new(
-                    resolve(&corner.0.width.0, border_rect.size.width),
-                    resolve(&corner.0.height.0, border_rect.size.height),
-                )
-            };
-            let b = fragment.style.get_border();
-            let mut radius = wr::BorderRadius {
-                top_left: corner(&b.border_top_left_radius),
-                top_right: corner(&b.border_top_right_radius),
-                bottom_right: corner(&b.border_bottom_right_radius),
-                bottom_left: corner(&b.border_bottom_left_radius),
-            };
-
-            normalize_radii(&webrender_border_rect, &mut radius);
-            radius
-        };
-
+            .translate(containing_block_origin.to_vector());
         Self {
             fragment,
-            containing_block,
-            border_rect: webrender_border_rect,
-            border_radius,
+            containing_block_origin,
+            border_rect: border_rect.to_webrender(),
+            border_radius: OnceCell::new(),
             margin_rect: OnceCell::new(),
             padding_rect: OnceCell::new(),
             content_rect: OnceCell::new(),
             border_edge_clip_chain_id: RefCell::new(None),
             padding_edge_clip_chain_id: RefCell::new(None),
             content_edge_clip_chain_id: RefCell::new(None),
-            is_hit_test_for_scrollable_overflow,
-            is_collapsed_table_borders,
         }
+    }
+
+    fn border_radius(&self) -> BorderRadius {
+        *self
+            .border_radius
+            .get_or_init(|| self.fragment.border_radius())
     }
 
     fn content_rect(&self) -> &units::LayoutRect {
         self.content_rect.get_or_init(|| {
             self.fragment
-                .content_rect
-                .translate(self.containing_block.origin.to_vector())
+                .content_rect()
+                .translate(self.containing_block_origin.to_vector())
                 .to_webrender()
         })
     }
@@ -848,7 +1466,7 @@ impl<'a> BuilderForBoxFragment<'a> {
         self.padding_rect.get_or_init(|| {
             self.fragment
                 .padding_rect()
-                .translate(self.containing_block.origin.to_vector())
+                .translate(self.containing_block_origin.to_vector())
                 .to_webrender()
         })
     }
@@ -857,7 +1475,7 @@ impl<'a> BuilderForBoxFragment<'a> {
         self.margin_rect.get_or_init(|| {
             self.fragment
                 .margin_rect()
-                .translate(self.containing_block.origin.to_vector())
+                .translate(self.containing_block_origin.to_vector())
                 .to_webrender()
         })
     }
@@ -865,16 +1483,17 @@ impl<'a> BuilderForBoxFragment<'a> {
     fn border_edge_clip(
         &self,
         builder: &mut DisplayListBuilder,
+        state: &TraversalState,
         force_clip_creation: bool,
     ) -> Option<ClipChainId> {
         if let Some(clip) = *self.border_edge_clip_chain_id.borrow() {
             return Some(clip);
         }
 
-        let maybe_clip = create_clip_chain(
-            self.border_radius,
+        let maybe_clip = builder.maybe_create_clip(
+            state,
+            self.border_radius(),
             self.border_rect,
-            builder,
             force_clip_creation,
         );
         *self.border_edge_clip_chain_id.borrow_mut() = maybe_clip;
@@ -884,15 +1503,16 @@ impl<'a> BuilderForBoxFragment<'a> {
     fn padding_edge_clip(
         &self,
         builder: &mut DisplayListBuilder,
+        state: &TraversalState,
         force_clip_creation: bool,
     ) -> Option<ClipChainId> {
         if let Some(clip) = *self.padding_edge_clip_chain_id.borrow() {
             return Some(clip);
         }
 
-        let radii = inner_radii(self.border_radius, self.fragment.border.to_webrender());
+        let radii = offset_radii(self.border_radius(), -self.fragment.border.to_webrender());
         let maybe_clip =
-            create_clip_chain(radii, *self.padding_rect(), builder, force_clip_creation);
+            builder.maybe_create_clip(state, radii, *self.padding_rect(), force_clip_creation);
         *self.padding_edge_clip_chain_id.borrow_mut() = maybe_clip;
         maybe_clip
     }
@@ -900,44 +1520,24 @@ impl<'a> BuilderForBoxFragment<'a> {
     fn content_edge_clip(
         &self,
         builder: &mut DisplayListBuilder,
+        state: &TraversalState,
         force_clip_creation: bool,
     ) -> Option<ClipChainId> {
         if let Some(clip) = *self.content_edge_clip_chain_id.borrow() {
             return Some(clip);
         }
 
-        let radii = inner_radii(
-            self.border_radius,
-            (self.fragment.border + self.fragment.padding).to_webrender(),
+        let radii = offset_radii(
+            self.border_radius(),
+            -(self.fragment.border + self.fragment.padding).to_webrender(),
         );
         let maybe_clip =
-            create_clip_chain(radii, *self.content_rect(), builder, force_clip_creation);
+            builder.maybe_create_clip(state, radii, *self.content_rect(), force_clip_creation);
         *self.content_edge_clip_chain_id.borrow_mut() = maybe_clip;
         maybe_clip
     }
 
-    fn build(&mut self, builder: &mut DisplayListBuilder, section: StackingContextSection) {
-        if self.is_hit_test_for_scrollable_overflow {
-            self.build_hit_test(
-                builder,
-                self.fragment
-                    .reachable_scrollable_overflow_region()
-                    .to_webrender(),
-            );
-            return;
-        }
-
-        if self.is_collapsed_table_borders {
-            self.build_collapsed_table_borders(builder);
-            return;
-        }
-
-        if section == StackingContextSection::Outline {
-            self.build_outline(builder);
-            return;
-        }
-
-        self.build_hit_test(builder, self.border_rect);
+    fn build(&mut self, builder: &mut DisplayListBuilder, state: &TraversalState) {
         if self
             .fragment
             .base
@@ -947,24 +1547,52 @@ impl<'a> BuilderForBoxFragment<'a> {
             return;
         }
 
-        self.build_background(builder);
-        self.build_box_shadow(builder);
-        self.build_border(builder);
+        self.build_background(builder, state);
+        self.build_box_shadow(builder, state);
+        if !self.fragment.is_table_grid_with_collapsed_borders() {
+            self.build_border(builder, state);
+        }
+
+        let overflow = self
+            .fragment
+            .style()
+            .effective_overflow(self.fragment.base.flags);
+        let scrolls_via_user_input =
+            |overflow| matches!(overflow, ComputedOverflow::Scroll | ComputedOverflow::Auto);
+        if (scrolls_via_user_input(overflow.x) || scrolls_via_user_input(overflow.y)) &&
+            self.fragment.style().get_inherited_ui().pointer_events !=
+                style::computed_values::pointer_events::T::None
+        {
+            let mut inner_state = state.clone();
+            inner_state.spatial_id = self
+                .fragment
+                .generated_scroll_tree_node_id()
+                .unwrap_or(state.spatial_id);
+            inner_state.clip_id = self.fragment.generated_clip_id().unwrap_or(state.clip_id);
+
+            self.build_hit_test(
+                builder,
+                &inner_state,
+                self.fragment
+                    .scrollable_overflow()
+                    .translate(self.containing_block_origin.to_vector())
+                    .to_webrender(),
+            );
+        }
     }
 
-    fn build_hit_test(&self, builder: &mut DisplayListBuilder, rect: LayoutRect) {
-        let hit_info = builder.hit_info(
-            &self.fragment.style,
-            self.fragment.base.tag,
-            Cursor::Default,
-        );
-        let hit_info = match hit_info {
-            Some(hit_info) => hit_info,
-            None => return,
-        };
+    fn build_hit_test(
+        &self,
+        builder: &mut DisplayListBuilder,
+        state: &TraversalState,
+        rect: LayoutRect,
+    ) {
+        let external_scroll_node_id = builder
+            .paint_info
+            .external_scroll_id_for_scroll_tree_node(state.spatial_id);
 
-        let mut common = builder.common_properties(rect, &self.fragment.style);
-        if let Some(clip_chain_id) = self.border_edge_clip(builder, false) {
+        let mut common = builder.common_properties(state, rect, self.fragment.style());
+        if let Some(clip_chain_id) = self.border_edge_clip(builder, state, false) {
             common.clip_chain_id = clip_chain_id;
         }
         builder.wr().push_hit_test(
@@ -972,13 +1600,14 @@ impl<'a> BuilderForBoxFragment<'a> {
             common.clip_chain_id,
             common.spatial_id,
             common.flags,
-            hit_info,
+            (external_scroll_node_id.0, 0), /* tag */
         );
     }
 
     fn build_background_for_painter(
         &mut self,
         builder: &mut DisplayListBuilder,
+        state: &TraversalState,
         painter: &BackgroundPainter,
     ) {
         let b = painter.style.get_background();
@@ -989,22 +1618,43 @@ impl<'a> BuilderForBoxFragment<'a> {
             //  value associated with the bottom-most background image layer.”
             let layer_index = b.background_image.0.len() - 1;
             let bounds = painter.painting_area(self, builder, layer_index);
-            let common = painter.common_properties(self, builder, layer_index, bounds);
+            let common = painter.common_properties(self, builder, state, layer_index, bounds);
             builder
                 .wr()
-                .push_rect(&common, bounds, rgba(background_color))
+                .push_rect(&common, bounds, rgba(background_color));
+
+            // From <https://www.w3.org/TR/paint-timing/#sec-terminology>:
+            // First paint ... includes non-default background paint and the enclosing box of an iframe.
+            // The spec is vague. See also: https://github.com/w3c/paint-timing/issues/122
+            let default_background_color = servo_config::pref!(shell_background_color_rgba);
+            let default_background_color = AbsoluteColor::new(
+                ColorSpace::Srgb,
+                default_background_color[0] as f32,
+                default_background_color[1] as f32,
+                default_background_color[2] as f32,
+                default_background_color[3] as f32,
+            )
+            .into_srgb_legacy();
+            if background_color != default_background_color {
+                builder.mark_is_paintable();
+            }
         }
 
-        self.build_background_image(builder, painter);
+        self.build_background_image(builder, state, painter);
     }
 
-    fn build_background(&mut self, builder: &mut DisplayListBuilder) {
-        if self
-            .fragment
-            .base
-            .is_for_node(builder.element_for_canvas_background)
+    fn build_background(&mut self, builder: &mut DisplayListBuilder, state: &TraversalState) {
+        let flags = self.fragment.base.flags;
+
+        // The root element's background is painted separately as it might inherit the `<body>`'s
+        // background.
+        if flags.intersects(FragmentFlags::IS_ROOT_ELEMENT) {
+            return;
+        }
+        // If the `<body>` background was inherited by the root element, don't paint it again here.
+        if !builder.paint_body_background &&
+            flags.intersects(FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT)
         {
-            // This background is already painted for the canvas, don’t paint it again here.
             return;
         }
 
@@ -1020,88 +1670,183 @@ impl<'a> BuilderForBoxFragment<'a> {
             for extra_background in extra_backgrounds {
                 let positioning_area = extra_background.rect;
                 let painter = BackgroundPainter {
-                    style: &extra_background.style,
+                    style: &extra_background.style.borrow_mut(),
                     painting_area_override: None,
                     positioning_area_override: Some(
                         positioning_area
-                            .translate(self.containing_block.origin.to_vector())
+                            .translate(self.containing_block_origin.to_vector())
                             .to_webrender(),
                     ),
                 };
-                self.build_background_for_painter(builder, &painter);
+                self.build_background_for_painter(builder, state, &painter);
             }
         }
 
         let painter = BackgroundPainter {
-            style: &self.fragment.style,
+            style: self.fragment.style(),
             painting_area_override: None,
             positioning_area_override: None,
         };
-        self.build_background_for_painter(builder, &painter);
+        self.build_background_for_painter(builder, state, &painter);
     }
 
     fn build_background_image(
-        &mut self,
+        &self,
         builder: &mut DisplayListBuilder,
+        state: &TraversalState,
         painter: &BackgroundPainter,
     ) {
         let style = painter.style;
         let b = style.get_background();
+        let need_blend_container = b
+            .background_blend_mode
+            .0
+            .iter()
+            .take(b.background_image.0.len())
+            .any(|background_blend_mode| background_blend_mode != &BackgroundBlendMode::Normal);
+
+        let push_stacking_context = |builder: &mut DisplayListBuilder,
+                                     blend_mode: BackgroundBlendMode,
+                                     flags: StackingContextFlags|
+         -> bool {
+            let spatial_id = builder.spatial_id(state.spatial_id);
+            builder.wr().push_stacking_context(
+                spatial_id,
+                PrimitiveFlags::empty(),
+                None,
+                TransformStyle::Flat,
+                blend_mode.to_webrender(),
+                &[],
+                &[],
+                RasterSpace::Screen,
+                flags,
+                None,
+            );
+            true
+        };
+
+        if need_blend_container {
+            push_stacking_context(
+                builder,
+                BackgroundBlendMode::Normal,
+                StackingContextFlags::IS_BLEND_CONTAINER,
+            );
+        }
+
         let node = self.fragment.base.tag.map(|tag| tag.node);
         // Reverse because the property is top layer first, we want to paint bottom layer first.
         for (index, image) in b.background_image.0.iter().enumerate().rev() {
-            match builder.context.resolve_image(node, image) {
-                Err(_) => {},
-                Ok(ResolvedImage::Gradient(gradient)) => {
+            let Ok(resolved_image) = builder.image_resolver.resolve_image(node, image) else {
+                continue;
+            };
+            match resolved_image {
+                ResolvedImage::Gradient(_) | ResolvedImage::Color(_) => {
                     let intrinsic = NaturalSizes::empty();
                     let Some(layer) =
-                        &background::layout_layer(self, painter, builder, index, intrinsic)
+                        &background::layout_layer(self, painter, builder, state, index, intrinsic)
                     else {
                         continue;
                     };
 
-                    match gradient::build(style, gradient, layer.tile_size, builder) {
-                        WebRenderGradient::Linear(linear_gradient) => builder.wr().push_gradient(
-                            &layer.common,
-                            layer.bounds,
-                            linear_gradient,
-                            layer.tile_size,
-                            layer.tile_spacing,
-                        ),
-                        WebRenderGradient::Radial(radial_gradient) => {
-                            builder.wr().push_radial_gradient(
-                                &layer.common,
-                                layer.bounds,
-                                radial_gradient,
-                                layer.tile_size,
-                                layer.tile_spacing,
-                            )
-                        },
-                        WebRenderGradient::Conic(conic_gradient) => {
-                            builder.wr().push_conic_gradient(
-                                &layer.common,
-                                layer.bounds,
-                                conic_gradient,
-                                layer.tile_size,
-                                layer.tile_spacing,
-                            )
-                        },
+                    let needs_blending = layer.blend_mode != BackgroundBlendMode::Normal;
+                    if needs_blending {
+                        push_stacking_context(builder, layer.blend_mode, Default::default());
                     }
+
+                    match resolved_image {
+                        ResolvedImage::Gradient(gradient) => {
+                            match gradient::build(style, gradient, layer.tile_size, builder) {
+                                WebRenderGradient::Linear(linear_gradient) => {
+                                    builder.wr().push_gradient(
+                                        &layer.common,
+                                        layer.bounds,
+                                        linear_gradient,
+                                        layer.tile_size,
+                                        layer.tile_spacing,
+                                    )
+                                },
+                                WebRenderGradient::Radial(radial_gradient) => {
+                                    builder.wr().push_radial_gradient(
+                                        &layer.common,
+                                        layer.bounds,
+                                        radial_gradient,
+                                        layer.tile_size,
+                                        layer.tile_spacing,
+                                    )
+                                },
+                                WebRenderGradient::Conic(conic_gradient) => {
+                                    builder.wr().push_conic_gradient(
+                                        &layer.common,
+                                        layer.bounds,
+                                        conic_gradient,
+                                        layer.tile_size,
+                                        layer.tile_spacing,
+                                    )
+                                },
+                            }
+                        },
+                        ResolvedImage::Color(color) => {
+                            let color = rgba(style.resolve_color(color));
+                            builder.wr().push_rect(&layer.common, layer.bounds, color);
+                        },
+                        _ => {},
+                    }
+
+                    if needs_blending {
+                        builder.wr().pop_stacking_context();
+                    }
+
+                    builder.check_if_paintable(
+                        layer.bounds,
+                        layer.common.clip_rect,
+                        style.clone_opacity(),
+                    );
                 },
-                Ok(ResolvedImage::Image(image_info)) => {
+                ResolvedImage::Image { image, size } => {
                     // FIXME: https://drafts.csswg.org/css-images-4/#the-image-resolution
                     let dppx = 1.0;
-                    let intrinsic = NaturalSizes::from_width_and_height(
-                        image_info.size.width as f32 / dppx,
-                        image_info.size.height as f32 / dppx,
-                    );
-                    let Some(image_key) = image_info.key else {
+                    let intrinsic =
+                        NaturalSizes::from_width_and_height(size.width / dppx, size.height / dppx);
+                    let layer =
+                        background::layout_layer(self, painter, builder, state, index, intrinsic);
+
+                    let image_wr_key = match image {
+                        CachedImage::Raster(raster_image) => raster_image.id,
+                        CachedImage::Vector(vector_image) => {
+                            let scale = builder.device_pixel_ratio.get();
+                            let default_size: DeviceIntSize =
+                                Size2D::new(size.width * scale, size.height * scale).to_i32();
+                            let layer_size = layer.as_ref().map(|layer| {
+                                Size2D::new(
+                                    layer.tile_size.width * scale,
+                                    layer.tile_size.height * scale,
+                                )
+                                .to_i32()
+                            });
+
+                            node.and_then(|node| {
+                                let size = layer_size.unwrap_or(default_size);
+                                builder.image_resolver.rasterize_vector_image(
+                                    vector_image.id,
+                                    size,
+                                    node,
+                                    vector_image.svg_id,
+                                )
+                            })
+                            .and_then(|rasterized_image| rasterized_image.id)
+                        },
+                    };
+
+                    let Some(image_key) = image_wr_key else {
                         continue;
                     };
 
-                    if let Some(layer) =
-                        background::layout_layer(self, painter, builder, index, intrinsic)
-                    {
+                    if let Some(layer) = layer {
+                        let needs_blending = layer.blend_mode != BackgroundBlendMode::Normal;
+                        if needs_blending {
+                            push_stacking_context(builder, layer.blend_mode, Default::default());
+                        }
+
                         if layer.repeat {
                             builder.wr().push_repeating_image(
                                 &layer.common,
@@ -1123,13 +1868,41 @@ impl<'a> BuilderForBoxFragment<'a> {
                                 wr::ColorF::WHITE,
                             )
                         }
+
+                        if needs_blending {
+                            builder.wr().pop_stacking_context();
+                        }
+
+                        builder.check_if_paintable(
+                            layer.bounds,
+                            layer.common.clip_rect,
+                            style.clone_opacity(),
+                        );
+
+                        // From <https://www.w3.org/TR/paint-timing/#sec-terminology>:
+                        // An element target is contentful when one or more of the following apply:
+                        // > target has a background-image which is a contentful image, and its used
+                        // > background-size has non-zero width and height values.
+                        builder.mark_is_contentful();
+
+                        builder.check_for_lcp_candidate(
+                            state,
+                            layer.common.clip_rect,
+                            layer.bounds,
+                            self.fragment.base.tag,
+                            None,
+                        );
                     }
                 },
             }
         }
+
+        if need_blend_container {
+            builder.wr().pop_stacking_context();
+        }
     }
 
-    fn build_border_side(&mut self, style_color: BorderStyleColor) -> wr::BorderSide {
+    fn build_border_side(&self, style_color: BorderStyleColor) -> wr::BorderSide {
         wr::BorderSide {
             color: rgba(style_color.color),
             style: match style_color.style {
@@ -1147,14 +1920,28 @@ impl<'a> BuilderForBoxFragment<'a> {
         }
     }
 
-    fn build_collapsed_table_borders(&mut self, builder: &mut DisplayListBuilder) {
+    fn build_collapsed_table_borders(
+        &self,
+        builder: &mut DisplayListBuilder,
+        state: &TraversalState,
+    ) {
+        if self
+            .fragment
+            .base
+            .flags
+            .contains(FragmentFlags::DO_NOT_PAINT)
+        {
+            return;
+        }
+
+        let layout_info = self.fragment.specific_layout_info();
         let Some(SpecificLayoutInfo::TableGridWithCollapsedBorders(table_info)) =
-            &self.fragment.specific_layout_info
+            layout_info.as_deref()
         else {
             return;
         };
         let mut common =
-            builder.common_properties(units::LayoutRect::default(), &self.fragment.style);
+            builder.common_properties(state, units::LayoutRect::default(), self.fragment.style());
         let radius = wr::BorderRadius::default();
         let mut column_sum = Au::zero();
         for (x, column_size) in table_info.track_sizes.x.iter().enumerate() {
@@ -1195,8 +1982,8 @@ impl<'a> BuilderForBoxFragment<'a> {
                     *row_size - top_adjustment + border_widths.bottom / 2,
                 );
                 let border_rect = PhysicalRect::new(origin, size)
-                    .translate(self.fragment.content_rect.origin.to_vector())
-                    .translate(self.containing_block.origin.to_vector())
+                    .translate(self.fragment.content_rect().origin.to_vector())
+                    .translate(self.containing_block_origin.to_vector())
                     .to_webrender();
                 common.clip_rect = border_rect;
                 builder.wr().push_border(
@@ -1211,14 +1998,15 @@ impl<'a> BuilderForBoxFragment<'a> {
         }
     }
 
-    fn build_border(&mut self, builder: &mut DisplayListBuilder) {
+    fn build_border(&mut self, builder: &mut DisplayListBuilder, state: &TraversalState) {
         if self.fragment.has_collapsed_borders() {
             // Avoid painting borders for tables and table parts in collapsed-borders mode,
             // since the resulting collapsed borders are painted on their own in a special way.
             return;
         }
 
-        let border = self.fragment.style.get_border();
+        let style = self.fragment.style();
+        let border = style.get_border();
         let border_widths = self.fragment.border.to_webrender();
 
         if border_widths == SideOffsets2D::zero() {
@@ -1226,21 +2014,21 @@ impl<'a> BuilderForBoxFragment<'a> {
         }
 
         // `border-image` replaces an element's border entirely.
-        let common = builder.common_properties(self.border_rect, &self.fragment.style);
-        if self.build_border_image(builder, &common, border, border_widths) {
+        if self.build_border_image(builder, state, border, border_widths) {
             return;
         }
 
-        let current_color = self.fragment.style.get_inherited_text().clone_color();
+        let current_color = style.get_inherited_text().clone_color();
         let style_color = BorderStyleColor::from_border(border, &current_color);
         let details = wr::BorderDetails::Normal(wr::NormalBorder {
             top: self.build_border_side(style_color.top),
             right: self.build_border_side(style_color.right),
             bottom: self.build_border_side(style_color.bottom),
             left: self.build_border_side(style_color.left),
-            radius: self.border_radius,
+            radius: self.border_radius(),
             do_aa: true,
         });
+        let common = builder.common_properties(state, self.border_rect, style);
         builder
             .wr()
             .push_border(&common, self.border_rect, border_widths, details)
@@ -1250,11 +2038,12 @@ impl<'a> BuilderForBoxFragment<'a> {
     fn build_border_image(
         &self,
         builder: &mut DisplayListBuilder,
-        common: &CommonItemProperties,
+        state: &TraversalState,
         border: &Border,
         border_widths: SideOffsets2D<f32, LayoutPixel>,
     ) -> bool {
-        let border_style_struct = self.fragment.style.get_border();
+        let style = self.fragment.style();
+        let border_style_struct = style.get_border();
         let border_image_outset =
             resolve_border_image_outset(border_style_struct.border_image_outset, border_widths);
         let border_image_area = self.border_rect.to_rect().outer_rect(border_image_outset);
@@ -1267,27 +2056,58 @@ impl<'a> BuilderForBoxFragment<'a> {
         let border_image_repeat = &border_style_struct.border_image_repeat;
         let border_image_fill = border_style_struct.border_image_slice.fill;
         let border_image_slice = &border_style_struct.border_image_slice.offsets;
+        let common = builder.common_properties(state, border_image_area.to_box2d(), style);
 
         let stops = Vec::new();
         let mut width = border_image_size.width;
         let mut height = border_image_size.height;
         let node = self.fragment.base.tag.map(|tag| tag.node);
         let source = match builder
-            .context
+            .image_resolver
             .resolve_image(node, &border.border_image_source)
         {
             Err(_) => return false,
-            Ok(ResolvedImage::Image(image_info)) => {
-                let Some(key) = image_info.key else {
+            Ok(ResolvedImage::Image { image, size }) => {
+                let image_key = match image {
+                    CachedImage::Raster(raster_image) => raster_image.id,
+                    CachedImage::Vector(vector_image) => {
+                        let scale = builder.device_pixel_ratio.get();
+                        let size = Size2D::new(size.width * scale, size.height * scale).to_i32();
+                        node.and_then(|node| {
+                            builder.image_resolver.rasterize_vector_image(
+                                vector_image.id,
+                                size,
+                                node,
+                                vector_image.svg_id,
+                            )
+                        })
+                        .and_then(|rasterized_image| rasterized_image.id)
+                    },
+                };
+
+                let Some(key) = image_key else {
                     return false;
                 };
 
-                width = image_info.size.width as f32;
-                height = image_info.size.height as f32;
-                NinePatchBorderSource::Image(key, ImageRendering::Auto)
+                builder.check_if_paintable(
+                    Box2D::from_size(size.cast_unit()),
+                    common.clip_rect,
+                    style.clone_opacity(),
+                );
+
+                // From <https://www.w3.org/TR/paint-timing/#contentful>:
+                // An element target is contentful when one or more of the following apply:
+                // > target has a background-image which is a contentful image,
+                // > and its used background-size has non-zero width and height values.
+                builder.mark_is_contentful();
+
+                width = size.width;
+                height = size.height;
+                let image_rendering = style.clone_image_rendering().to_webrender();
+                NinePatchBorderSource::Image(key, image_rendering)
             },
             Ok(ResolvedImage::Gradient(gradient)) => {
-                match gradient::build(&self.fragment.style, gradient, border_image_size, builder) {
+                match gradient::build(style, gradient, border_image_size, builder) {
                     WebRenderGradient::Linear(gradient) => {
                         NinePatchBorderSource::Gradient(gradient)
                     },
@@ -1299,9 +2119,31 @@ impl<'a> BuilderForBoxFragment<'a> {
                     },
                 }
             },
+            Ok(ResolvedImage::Color(color)) => {
+                // NinePatchBorderSource doesn't support a lone color, so pretend that
+                // its a linear gradient.
+                let color = rgba(style.resolve_color(color));
+                let gradient = builder.wr().create_gradient(
+                    Point2D::zero(),
+                    Point2D::zero(),
+                    vec![
+                        wr::GradientStop { offset: 0.0, color },
+                        wr::GradientStop { offset: 1.0, color },
+                    ],
+                    wr::ExtendMode::Clamp,
+                );
+                NinePatchBorderSource::Gradient(gradient)
+            },
         };
 
-        let size = euclid::Size2D::new(width as i32, height as i32);
+        let size = Size2D::new(width as i32, height as i32);
+
+        // If the size of the border is zero or the size of the border image is zero, just
+        // don't render anything. Zero-sized gradients cause problems in WebRender.
+        if size.is_empty() || border_image_size.is_empty() {
+            return true;
+        }
+
         let details = BorderDetails::NinePatch(NinePatchBorder {
             source,
             width: size.width,
@@ -1312,7 +2154,7 @@ impl<'a> BuilderForBoxFragment<'a> {
             repeat_vertical: border_image_repeat.1.to_webrender(),
         });
         builder.wr().push_border(
-            common,
+            &common,
             border_image_area.to_box2d(),
             border_image_widths,
             details,
@@ -1321,21 +2163,30 @@ impl<'a> BuilderForBoxFragment<'a> {
         true
     }
 
-    fn build_outline(&mut self, builder: &mut DisplayListBuilder) {
-        let style = &self.fragment.style;
+    fn build_outline(&self, builder: &mut DisplayListBuilder, state: &TraversalState) {
+        let style = self.fragment.style();
         let outline = style.get_outline();
-        let width = outline.outline_width.to_f32_px();
+        if outline.outline_style.none_or_hidden() {
+            return;
+        }
+        let width = outline.outline_width.0.to_f32_px();
         if width == 0.0 {
             return;
         }
-        let offset = outline
-            .outline_offset
-            .px()
-            .max(-self.border_rect.width() / 2.0)
-            .max(-self.border_rect.height() / 2.0) +
-            width;
-        let outline_rect = self.border_rect.inflate(offset, offset);
-        let common = builder.common_properties(outline_rect, &self.fragment.style);
+        // <https://drafts.csswg.org/css-ui-3/#outline-offset>
+        // > Negative values must cause the outline to shrink into the border box. Both
+        // > the height and the width of outside of the shape drawn by the outline should
+        // > not become smaller than twice the computed value of the outline-width
+        // > property, to make sure that an outline can be rendered even with large
+        // > negative values. User agents should apply this constraint independently in
+        // > each dimension. If the outline is drawn as multiple disconnected shapes, this
+        // > constraint applies to each shape separately.
+        let offset = outline.outline_offset.to_f32_px() + width;
+        let outline_rect = self.border_rect.inflate(
+            offset.max(-self.border_rect.width() / 2.0 + width),
+            offset.max(-self.border_rect.height() / 2.0 + width),
+        );
+        let common = builder.common_properties(state, outline_rect, style);
         let widths = SideOffsets2D::new_all_same(width);
         let border_style = match outline.outline_style {
             // TODO: treating 'auto' as 'solid' is allowed by the spec,
@@ -1352,7 +2203,7 @@ impl<'a> BuilderForBoxFragment<'a> {
             right: side,
             bottom: side,
             left: side,
-            radius: offset_radii(self.border_radius, offset),
+            radius: offset_radii(self.border_radius(), SideOffsets2D::new_all_same(offset)),
             do_aa: true,
         });
         builder
@@ -1360,14 +2211,14 @@ impl<'a> BuilderForBoxFragment<'a> {
             .push_border(&common, outline_rect, widths, details)
     }
 
-    fn build_box_shadow(&self, builder: &mut DisplayListBuilder<'_>) {
-        let box_shadows = &self.fragment.style.get_effects().box_shadow.0;
+    fn build_box_shadow(&self, builder: &mut DisplayListBuilder, state: &TraversalState) {
+        let style = self.fragment.style();
+        let box_shadows = &style.get_effects().box_shadow.0;
         if box_shadows.is_empty() {
             return;
         }
 
-        // NB: According to CSS-BACKGROUNDS, box shadows render in *reverse* order (front to back).
-        let common = builder.common_properties(MaxRect::max_rect(), &self.fragment.style);
+        // Note: According to CSS-BACKGROUNDS, box shadows render in *reverse* order (front to back).
         for box_shadow in box_shadows.iter().rev() {
             let (rect, clip_mode) = if box_shadow.inset {
                 (*self.padding_rect(), BoxShadowClipMode::Inset)
@@ -1375,17 +2226,50 @@ impl<'a> BuilderForBoxFragment<'a> {
                 (self.border_rect, BoxShadowClipMode::Outset)
             };
 
+            let offset = LayoutVector2D::new(
+                box_shadow.base.horizontal.px(),
+                box_shadow.base.vertical.px(),
+            );
+            let spread = box_shadow.spread.px();
+            let blur = box_shadow.base.blur.px();
+            let clip_rect = match clip_mode {
+                // Inset shadows are always inside the rect.
+                BoxShadowClipMode::Inset => rect,
+                // Match webrender's box_shadow.rs Gaussian blur inflation.
+                // (BLUR_SAMPLE_SCALE * blur).ceil(). BLUR_SAMPLE_SCALE is 3.0.
+                BoxShadowClipMode::Outset => {
+                    let extra_size_from_blur = (blur * 3.0).ceil();
+                    rect.translate(offset)
+                        .inflate(spread, spread)
+                        .inflate(extra_size_from_blur, extra_size_from_blur)
+                },
+            };
+            let border_radius = match clip_mode {
+                BoxShadowClipMode::Inset => {
+                    // The `border-radius` value applies to the border box, but inset shadows
+                    // use the padding box instead. So we need to shrink the `border-radius`
+                    // by the border widths.
+                    offset_radii(self.border_radius(), -self.fragment.border.to_webrender())
+                },
+                BoxShadowClipMode::Outset => self.border_radius(),
+            };
+            let shadow_radius = offset_radii(
+                border_radius,
+                SideOffsets2D::new_all_same(match clip_mode {
+                    BoxShadowClipMode::Inset => -spread,
+                    BoxShadowClipMode::Outset => spread,
+                }),
+            );
+            let common = builder.common_properties(state, clip_rect, style);
             builder.wr().push_box_shadow(
                 &common,
                 rect,
-                LayoutVector2D::new(
-                    box_shadow.base.horizontal.px(),
-                    box_shadow.base.vertical.px(),
-                ),
-                rgba(self.fragment.style.resolve_color(&box_shadow.base.color)),
-                box_shadow.base.blur.px(),
-                box_shadow.spread.px(),
-                self.border_radius,
+                offset,
+                rgba(style.resolve_color(&box_shadow.base.color)),
+                blur,
+                spread,
+                border_radius,
+                shadow_radius,
                 clip_mode,
             );
         }
@@ -1398,179 +2282,82 @@ fn rgba(color: AbsoluteColor) -> wr::ColorF {
         rgba.components.0.clamp(0.0, 1.0),
         rgba.components.1.clamp(0.0, 1.0),
         rgba.components.2.clamp(0.0, 1.0),
-        rgba.alpha,
+        rgba.alpha.clamp(0.0, 1.0),
     )
 }
 
 fn glyphs(
-    glyph_runs: &[Arc<GlyphStore>],
+    shaped_text_slices: &[Arc<ShapedTextSlice>],
     mut baseline_origin: PhysicalPoint<Au>,
     justification_adjustment: Au,
-    ignore_whitespace: bool,
-) -> Vec<wr::GlyphInstance> {
-    use fonts_traits::ByteIndex;
-    use range::Range;
-
+    include_whitespace: bool,
+) -> (Vec<GlyphInstance>, Au) {
     let mut glyphs = vec![];
-    for run in glyph_runs {
-        for glyph in run.iter_glyphs_for_byte_range(&Range::new(ByteIndex(0), run.len())) {
-            if !run.is_whitespace() || !ignore_whitespace {
+    let mut largest_advance = Au::zero();
+
+    for shaped_text_slice in shaped_text_slices {
+        for glyph in shaped_text_slice.glyphs() {
+            if !shaped_text_slice.is_whitespace() || include_whitespace {
                 let glyph_offset = glyph.offset().unwrap_or(Point2D::zero());
-                let point = units::LayoutPoint::new(
+                let point = LayoutPoint::new(
                     baseline_origin.x.to_f32_px() + glyph_offset.x.to_f32_px(),
                     baseline_origin.y.to_f32_px() + glyph_offset.y.to_f32_px(),
                 );
-                let glyph = wr::GlyphInstance {
+                let glyph_instance = GlyphInstance {
                     index: glyph.id(),
                     point,
                 };
-                glyphs.push(glyph);
+                glyphs.push(glyph_instance);
             }
 
             if glyph.char_is_word_separator() {
                 baseline_origin.x += justification_adjustment;
             }
-            baseline_origin.x += glyph.advance();
+
+            let advance = glyph.advance();
+            baseline_origin.x += advance;
+            largest_advance.max_assign(advance);
         }
     }
-    glyphs
+    (glyphs, largest_advance)
 }
 
-// TODO: The implementation here does not account for multiple glyph runs properly.
-fn glyphs_advance_by_index(
-    glyph_runs: &[Arc<GlyphStore>],
-    index: fonts_traits::ByteIndex,
-    baseline_origin: PhysicalPoint<Au>,
-    justification_adjustment: Au,
-) -> PhysicalPoint<Au> {
-    let mut point = baseline_origin;
-    let mut index = index;
-    for run in glyph_runs {
-        let range = ServoRange::new(fonts::ByteIndex(0), index.min(run.len()));
-        index = index - range.length();
-        let total_advance = run.advance_for_byte_range(&range, justification_adjustment);
-        point.x += total_advance;
-    }
-    point
-}
+/// Given a set of corner radii for a rectangle, this function returns the corresponding radii
+/// for the [outer rectangle][`Rect::outer_rect`] resulting from expanding the original
+/// rectangle by the given offsets.
+fn offset_radii(mut radii: BorderRadius, offsets: LayoutSideOffsets) -> BorderRadius {
+    let expand = |radius: &mut f32, offset: f32| {
+        // For negative offsets, just shrink the radius by that amount.
+        if offset < 0.0 {
+            *radius = (*radius + offset).max(0.0);
+            return;
+        }
 
-fn cursor(kind: CursorKind, auto_cursor: Cursor) -> Cursor {
-    match kind {
-        CursorKind::Auto => auto_cursor,
-        CursorKind::None => Cursor::None,
-        CursorKind::Default => Cursor::Default,
-        CursorKind::Pointer => Cursor::Pointer,
-        CursorKind::ContextMenu => Cursor::ContextMenu,
-        CursorKind::Help => Cursor::Help,
-        CursorKind::Progress => Cursor::Progress,
-        CursorKind::Wait => Cursor::Wait,
-        CursorKind::Cell => Cursor::Cell,
-        CursorKind::Crosshair => Cursor::Crosshair,
-        CursorKind::Text => Cursor::Text,
-        CursorKind::VerticalText => Cursor::VerticalText,
-        CursorKind::Alias => Cursor::Alias,
-        CursorKind::Copy => Cursor::Copy,
-        CursorKind::Move => Cursor::Move,
-        CursorKind::NoDrop => Cursor::NoDrop,
-        CursorKind::NotAllowed => Cursor::NotAllowed,
-        CursorKind::Grab => Cursor::Grab,
-        CursorKind::Grabbing => Cursor::Grabbing,
-        CursorKind::EResize => Cursor::EResize,
-        CursorKind::NResize => Cursor::NResize,
-        CursorKind::NeResize => Cursor::NeResize,
-        CursorKind::NwResize => Cursor::NwResize,
-        CursorKind::SResize => Cursor::SResize,
-        CursorKind::SeResize => Cursor::SeResize,
-        CursorKind::SwResize => Cursor::SwResize,
-        CursorKind::WResize => Cursor::WResize,
-        CursorKind::EwResize => Cursor::EwResize,
-        CursorKind::NsResize => Cursor::NsResize,
-        CursorKind::NeswResize => Cursor::NeswResize,
-        CursorKind::NwseResize => Cursor::NwseResize,
-        CursorKind::ColResize => Cursor::ColResize,
-        CursorKind::RowResize => Cursor::RowResize,
-        CursorKind::AllScroll => Cursor::AllScroll,
-        CursorKind::ZoomIn => Cursor::ZoomIn,
-        CursorKind::ZoomOut => Cursor::ZoomOut,
-    }
-}
-
-/// Radii for the padding edge or content edge
-fn inner_radii(mut radii: wr::BorderRadius, insets: units::LayoutSideOffsets) -> wr::BorderRadius {
-    assert!(insets.left >= 0.0, "left inset must not be negative");
-    radii.top_left.width -= insets.left;
-    radii.bottom_left.width -= insets.left;
-
-    assert!(insets.right >= 0.0, "left inset must not be negative");
-    radii.top_right.width -= insets.right;
-    radii.bottom_right.width -= insets.right;
-
-    assert!(insets.top >= 0.0, "top inset must not be negative");
-    radii.top_left.height -= insets.top;
-    radii.top_right.height -= insets.top;
-
-    assert!(insets.bottom >= 0.0, "bottom inset must not be negative");
-    radii.bottom_left.height -= insets.bottom;
-    radii.bottom_right.height -= insets.bottom;
-    radii
-}
-
-fn offset_radii(mut radii: wr::BorderRadius, offset: f32) -> wr::BorderRadius {
-    if offset == 0.0 {
-        return radii;
-    }
-    if offset < 0.0 {
-        return inner_radii(radii, units::LayoutSideOffsets::new_all_same(-offset));
-    }
-    let expand = |radius: &mut f32| {
-        // Expand the radius by the specified amount, but keeping sharp corners.
-        // TODO: this behavior is not continuous, it's being discussed in the CSSWG:
-        // https://github.com/w3c/csswg-drafts/issues/7103
+        // For positive offsets, expand the radius by that amount. But only if the
+        // radius is positive, in order to preserve sharp corners.
+        // TODO: this behavior is not continuous, we should use this algorithm instead:
+        // https://github.com/w3c/csswg-drafts/issues/7103#issuecomment-3357331922
         if *radius > 0.0 {
             *radius += offset;
         }
     };
-    expand(&mut radii.top_left.width);
-    expand(&mut radii.top_left.height);
-    expand(&mut radii.top_right.width);
-    expand(&mut radii.top_right.height);
-    expand(&mut radii.bottom_right.width);
-    expand(&mut radii.bottom_right.height);
-    expand(&mut radii.bottom_left.width);
-    expand(&mut radii.bottom_left.height);
-    radii
-}
-
-fn create_clip_chain(
-    radii: wr::BorderRadius,
-    rect: units::LayoutRect,
-    builder: &mut DisplayListBuilder,
-    force_clip_creation: bool,
-) -> Option<ClipChainId> {
-    if radii.is_zero() && !force_clip_creation {
-        return None;
+    if offsets.left != 0.0 {
+        expand(&mut radii.top_left.width, offsets.left);
+        expand(&mut radii.bottom_left.width, offsets.left);
     }
-
-    let spatial_id = builder.current_scroll_node_id.spatial_id;
-    let parent_clip_chain_id = builder.current_clip_chain_id;
-    let new_clip_id = if radii.is_zero() {
-        builder.wr().define_clip_rect(spatial_id, rect)
-    } else {
-        builder.wr().define_clip_rounded_rect(
-            spatial_id,
-            wr::ComplexClipRegion {
-                rect,
-                radii,
-                mode: wr::ClipMode::Clip,
-            },
-        )
-    };
-
-    Some(
-        builder
-            .display_list
-            .define_clip_chain(parent_clip_chain_id, [new_clip_id]),
-    )
+    if offsets.right != 0.0 {
+        expand(&mut radii.top_right.width, offsets.right);
+        expand(&mut radii.bottom_right.width, offsets.right);
+    }
+    if offsets.top != 0.0 {
+        expand(&mut radii.top_left.height, offsets.top);
+        expand(&mut radii.top_right.height, offsets.top);
+    }
+    if offsets.bottom != 0.0 {
+        expand(&mut radii.bottom_right.height, offsets.bottom);
+        expand(&mut radii.bottom_left.height, offsets.bottom);
+    }
+    radii
 }
 
 /// Resolve the WebRender border-image outset area from the style values.
@@ -1623,7 +2410,7 @@ fn resolve_border_image_width(
 
 /// Resolve the WebRender border-image slice from the style values.
 fn resolve_border_image_slice(
-    border_image_slice: &Rect<NonNegative<NumberOrPercentage>>,
+    border_image_slice: &StyleRect<NonNegative<NumberOrPercentage>>,
     size: Size2D<i32, UnknownUnit>,
 ) -> SideOffsets2D<i32, DevicePixel> {
     fn resolve_percentage(value: NonNegative<NumberOrPercentage>, length: i32) -> i32 {
@@ -1673,7 +2460,8 @@ pub(super) fn compute_margin_box_radius(
     layout_rect: LayoutSize,
     fragment: &BoxFragment,
 ) -> wr::BorderRadius {
-    let margin = fragment.style.physical_margin();
+    let style = fragment.style();
+    let margin = style.physical_margin();
     let adjust_radius = |radius: f32, margin: f32| -> f32 {
         if margin <= 0. || (radius / margin) >= 1. {
             (radius + margin).max(0.)
@@ -1720,5 +2508,59 @@ pub(super) fn compute_margin_box_radius(
             layout_rect,
             Size2D::new(margin.right, margin.bottom),
         ),
+    }
+}
+
+impl BoxFragment {
+    fn border_radius(&self) -> BorderRadius {
+        let style = self.style();
+        let border = style.get_border();
+        if border.border_top_left_radius.0.is_zero() &&
+            border.border_top_right_radius.0.is_zero() &&
+            border.border_bottom_right_radius.0.is_zero() &&
+            border.border_bottom_left_radius.0.is_zero()
+        {
+            return BorderRadius::zero();
+        }
+
+        let border_rect = self.border_rect();
+        let resolve =
+            |radius: &LengthPercentage, box_size: Au| radius.to_used_value(box_size).to_f32_px();
+        let corner = |corner: &style::values::computed::BorderCornerRadius| {
+            Size2D::new(
+                resolve(&corner.0.width.0, border_rect.size.width),
+                resolve(&corner.0.height.0, border_rect.size.height),
+            )
+        };
+
+        let mut radius = wr::BorderRadius {
+            top_left: corner(&border.border_top_left_radius),
+            top_right: corner(&border.border_top_right_radius),
+            bottom_right: corner(&border.border_bottom_right_radius),
+            bottom_left: corner(&border.border_bottom_left_radius),
+        };
+
+        normalize_radii(&border_rect.to_webrender(), &mut radius);
+        radius
+    }
+}
+
+impl BaseFragment {
+    fn visit_fragment(&self, builder: &mut DisplayListBuilder) {
+        match self.status() {
+            FragmentStatus::New => {
+                builder.reflow_statistics.rebuilt_fragment_count += 1;
+                self.set_status(FragmentStatus::Clean)
+            },
+            FragmentStatus::StyleChanged => {
+                builder.reflow_statistics.restyle_fragment_count += 1;
+                self.set_status(FragmentStatus::Clean)
+            },
+            FragmentStatus::OnlyDescendantsChanged => {
+                builder.reflow_statistics.only_descendants_changed_count += 1;
+                self.set_status(FragmentStatus::Clean)
+            },
+            FragmentStatus::Clean => {},
+        }
     }
 }

@@ -3,20 +3,20 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use js::rust::HandleObject;
+use script_bindings::reflector::reflect_dom_object_with_proto;
 use stylo_atoms::Atom;
 
 use crate::dom::bindings::codegen::Bindings::EventBinding::Event_Binding::EventMethods;
 use crate::dom::bindings::codegen::Bindings::WebGPUBinding::{
     GPUUncapturedErrorEventInit, GPUUncapturedErrorEventMethods,
 };
-use crate::dom::bindings::reflector::reflect_dom_object_with_proto;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::event::Event;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::webgpu::gpuerror::GPUError;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct GPUUncapturedErrorEvent {
@@ -34,50 +34,44 @@ impl GPUUncapturedErrorEvent {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
-        type_: DOMString,
+        event_type: Atom,
         init: &GPUUncapturedErrorEventInit,
-        can_gc: CanGc,
     ) -> DomRoot<Self> {
-        Self::new_with_proto(global, None, type_, init, can_gc)
+        Self::new_with_proto(cx, global, None, event_type, init)
     }
 
     fn new_with_proto(
+        cx: &mut JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
-        type_: DOMString,
+        event_type: Atom,
         init: &GPUUncapturedErrorEventInit,
-        can_gc: CanGc,
     ) -> DomRoot<Self> {
-        let ev = reflect_dom_object_with_proto(
+        let event = reflect_dom_object_with_proto(
+            cx,
             Box::new(GPUUncapturedErrorEvent::new_inherited(init)),
             global,
             proto,
-            can_gc,
         );
-        ev.event.init_event(
-            Atom::from(type_),
-            init.parent.bubbles,
-            init.parent.cancelable,
-        );
-        ev
-    }
-
-    pub(crate) fn event(&self) -> &Event {
-        &self.event
+        event
+            .event
+            .init_event(event_type, init.parent.bubbles, init.parent.cancelable);
+        event
     }
 }
 
 impl GPUUncapturedErrorEventMethods<crate::DomTypeHolder> for GPUUncapturedErrorEvent {
     /// <https://gpuweb.github.io/gpuweb/#dom-gpuuncapturederrorevent-gpuuncapturederrorevent>
     fn Constructor(
+        cx: &mut js::context::JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
-        type_: DOMString,
+        event_type: DOMString,
         init: &GPUUncapturedErrorEventInit,
     ) -> DomRoot<Self> {
-        GPUUncapturedErrorEvent::new_with_proto(global, proto, type_, init, can_gc)
+        GPUUncapturedErrorEvent::new_with_proto(cx, global, proto, event_type.into(), init)
     }
 
     /// <https://gpuweb.github.io/gpuweb/#dom-gpuuncapturederrorevent-error>

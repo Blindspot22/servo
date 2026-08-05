@@ -2,15 +2,16 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use canvas_traits::webgl::WebGLContextId;
 use dom_struct::dom_struct;
+use js::context::JSContext;
+use servo_canvas_traits::webgl::WebGLContextId;
 use webxr_api::LayerId;
 
 use crate::canvas_context::CanvasContext as _;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::Dom;
 use crate::dom::eventtarget::EventTarget;
-use crate::dom::webglrenderingcontext::WebGLRenderingContext;
+use crate::dom::webgl::webglrenderingcontext::WebGLRenderingContext;
 use crate::dom::xrframe::XRFrame;
 use crate::dom::xrsession::XRSession;
 use crate::dom::xrwebgllayer::XRWebGLLayer;
@@ -22,13 +23,11 @@ pub(crate) struct XRLayer {
     context: Dom<WebGLRenderingContext>,
     /// If none, the session is inline (the composition disabled flag is true)
     /// and this is a XRWebGLLayer.
-    #[ignore_malloc_size_of = "Layer ids don't heap-allocate"]
     #[no_trace]
     layer_id: Option<LayerId>,
 }
 
 impl XRLayer {
-    #[allow(dead_code)]
     pub(crate) fn new_inherited(
         session: &XRSession,
         context: &WebGLRenderingContext,
@@ -58,10 +57,10 @@ impl XRLayer {
         &self.session
     }
 
-    pub(crate) fn begin_frame(&self, frame: &XRFrame) -> Option<()> {
+    pub(crate) fn begin_frame(&self, cx: &mut JSContext, frame: &XRFrame) -> Option<()> {
         // TODO: Implement this for other layer types
         if let Some(this) = self.downcast::<XRWebGLLayer>() {
-            this.begin_frame(frame)
+            this.begin_frame(cx, frame)
         } else {
             unimplemented!()
         }

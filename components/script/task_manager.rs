@@ -5,9 +5,9 @@
 use core::cell::RefCell;
 use core::sync::atomic::Ordering;
 use std::cell::Ref;
-use std::collections::HashMap;
 
-use base::id::PipelineId;
+use rustc_hash::FxHashMap;
+use servo_base::id::PipelineId;
 use strum::VariantArray;
 
 use crate::messaging::ScriptEventLoopSender;
@@ -20,7 +20,7 @@ enum TaskCancellers {
     /// of them need to have the same canceller flag for all task sources.
     Shared(TaskCanceller),
     /// For `Window` each `TaskSource` has its own canceller.
-    OnePerTaskSource(RefCell<HashMap<TaskSourceName, TaskCanceller>>),
+    OnePerTaskSource(RefCell<FxHashMap<TaskSourceName, TaskCanceller>>),
 }
 
 impl TaskCancellers {
@@ -65,7 +65,7 @@ impl TaskCancellers {
 
 macro_rules! task_source_functions {
     ($self:ident, $task_source:ident, $task_source_name:ident) => {
-        pub(crate) fn $task_source(&$self) -> TaskSource {
+        pub(crate) fn $task_source(&$self) -> TaskSource<'_> {
             TaskSource {
                 task_manager: $self,
                 name: TaskSourceName::$task_source_name,
@@ -105,7 +105,7 @@ impl TaskManager {
         self.pipeline_id
     }
 
-    pub(crate) fn sender(&self) -> Ref<Option<ScriptEventLoopSender>> {
+    pub(crate) fn sender(&self) -> Ref<'_, Option<ScriptEventLoopSender>> {
         self.sender.borrow()
     }
 
@@ -132,18 +132,28 @@ impl TaskManager {
             .cancel_pending_tasks_for_source(task_source_name);
     }
 
+    task_source_functions!(self, bitmap_task_source, Bitmap);
     task_source_functions!(self, canvas_blob_task_source, Canvas);
     task_source_functions!(self, clipboard_task_source, Clipboard);
+    task_source_functions!(self, crypto_task_source, Crypto);
+    task_source_functions!(self, database_access_task_source, DatabaseAccess);
+    task_source_functions!(self, deferred_fetch_task_source, DeferredFetch);
     task_source_functions!(self, dom_manipulation_task_source, DOMManipulation);
     task_source_functions!(self, file_reading_task_source, FileReading);
     task_source_functions!(self, font_loading_task_source, FontLoading);
     task_source_functions!(self, gamepad_task_source, Gamepad);
+    // FIXME(arihant2math): uncomment when geolocation is implemented.
+    // task_source_functions!(self, geolocation_task_source, Geolocation);
     task_source_functions!(self, media_element_task_source, MediaElement);
+    task_source_functions!(
+        self,
+        navigation_and_traversal_task_source,
+        NavigationAndTraversal
+    );
     task_source_functions!(self, networking_task_source, Networking);
     task_source_functions!(self, performance_timeline_task_source, PerformanceTimeline);
     task_source_functions!(self, port_message_queue, PortMessage);
     task_source_functions!(self, remote_event_task_source, RemoteEvent);
-    task_source_functions!(self, rendering_task_source, Rendering);
     task_source_functions!(self, timer_task_source, Timer);
     task_source_functions!(self, user_interaction_task_source, UserInteraction);
     task_source_functions!(self, websocket_task_source, WebSocket);
@@ -152,4 +162,7 @@ impl TaskManager {
         intersection_observer_task_source,
         IntersectionObserver
     );
+    task_source_functions!(self, storage_task_source, Storage);
+    #[cfg(feature = "webgpu")]
+    task_source_functions!(self, webgpu_task_source, WebGPU);
 }

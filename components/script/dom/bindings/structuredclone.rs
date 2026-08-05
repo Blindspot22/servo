@@ -4,50 +4,67 @@
 
 //! This module implements structured cloning, as defined by [HTML](https://html.spec.whatwg.org/multipage/#safe-passing-of-structured-data).
 
-use std::collections::HashMap;
 use std::ffi::CStr;
 use std::os::raw;
-use std::ptr;
+use std::ptr::{self, NonNull};
 
-use base::id::{
-    BlobId, DomExceptionId, DomPointId, Index, MessagePortId, NamespaceIndex, PipelineNamespaceId,
-};
-use constellation_traits::{
-    BlobImpl, DomException, DomPoint, MessagePortImpl, Serializable as SerializableInterface,
-    StructuredSerializedData, Transferrable as TransferrableInterface,
-};
+use js::context::{JSContext, NoGC};
+use js::conversions::ToJSValConvertible;
 use js::gc::RootedVec;
 use js::glue::{
-    CopyJSStructuredCloneData, DeleteJSAutoStructuredCloneBuffer, GetLengthOfJSStructuredCloneData,
-    NewJSAutoStructuredCloneBuffer, WriteBytesToJSStructuredCloneData,
+    CopyJSStructuredCloneData, GetLengthOfJSStructuredCloneData, WriteBytesToJSStructuredCloneData,
 };
 use js::jsapi::{
-    CloneDataPolicy, HandleObject as RawHandleObject, Heap, JS_ClearPendingException,
-    JS_ReadUint32Pair, JS_STRUCTURED_CLONE_VERSION, JS_WriteUint32Pair, JSContext, JSObject,
+    CloneDataPolicy, HandleObject as RawHandleObject, Heap, JS_ReadUint32Pair,
+    JS_STRUCTURED_CLONE_VERSION, JS_WriteUint32Pair, JSContext as RawJSContext, JSObject,
     JSStructuredCloneCallbacks, JSStructuredCloneReader, JSStructuredCloneWriter,
     MutableHandleObject as RawMutableHandleObject, StructuredCloneScope, TransferableOwnership,
 };
 use js::jsval::UndefinedValue;
-use js::rust::wrappers::{JS_ReadStructuredClone, JS_WriteStructuredClone};
-use js::rust::{CustomAutoRooterGuard, HandleValue, MutableHandleValue};
+use js::realm::CurrentRealm;
+use js::rust::wrappers2::{JS_IsExceptionPending, JS_ReadStructuredClone, JS_WriteStructuredClone};
+use js::rust::{
+    CustomAutoRooterGuard, HandleValue, JSAutoStructuredCloneBufferWrapper, MutableHandleValue,
+};
+use rustc_hash::FxHashMap;
 use script_bindings::conversions::IDLInterface;
+use servo_base::id::{
+    BlobId, CryptoKeyId, DomExceptionId, DomMatrixId, DomPointId, DomQuadId, DomRectId, FileId,
+    FileListId, ImageBitmapId, ImageDataId, Index, MessagePortId, NamespaceIndex,
+    OffscreenCanvasId, PipelineNamespaceId, QuotaExceededErrorId,
+};
+use servo_constellation_traits::{
+    BlobImpl, DomException, DomMatrix, DomPoint, DomQuad, DomRect, MessagePortImpl,
+    Serializable as SerializableInterface, SerializableCryptoKey, SerializableFile,
+    SerializableFileList, SerializableImageBitmap, SerializableImageData,
+    SerializableQuotaExceededError, StructuredSerializedData, TransferableOffscreenCanvas,
+    Transferrable as TransferrableInterface, TransformStreamData,
+};
 use strum::IntoEnumIterator;
 
-use crate::dom::bindings::conversions::{ToJSValConvertible, root_from_object};
+use crate::dom::bindings::conversions::root_from_object;
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::serializable::{Serializable, StorageKey};
 use crate::dom::bindings::transferable::Transferable;
 use crate::dom::blob::Blob;
+use crate::dom::cryptokey::CryptoKey;
 use crate::dom::dompoint::DOMPoint;
 use crate::dom::dompointreadonly::DOMPointReadOnly;
+use crate::dom::file::File;
+use crate::dom::filelist::FileList;
 use crate::dom::globalscope::GlobalScope;
+use crate::dom::imagebitmap::ImageBitmap;
+use crate::dom::imagedata::ImageData;
 use crate::dom::messageport::MessagePort;
-use crate::dom::readablestream::ReadableStream;
-use crate::dom::types::DOMException;
-use crate::dom::writablestream::WritableStream;
-use crate::realms::{AlreadyInRealm, InRealm, enter_realm};
-use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
+use crate::dom::offscreencanvas::OffscreenCanvas;
+use crate::dom::stream::readablestream::ReadableStream;
+use crate::dom::stream::writablestream::WritableStream;
+use crate::dom::types::{
+    DOMException, DOMMatrix, DOMMatrixReadOnly, DOMQuad, DOMRect, DOMRectReadOnly,
+    QuotaExceededError, TransformStream,
+};
+use crate::realms::enter_auto_realm;
 
 // TODO: Should we add Min and Max const to https://github.com/servo/rust-mozjs/blob/master/src/consts.rs?
 // TODO: Determine for sure which value Min and Max should have.
@@ -58,23 +75,47 @@ pub(super) enum StructuredCloneTags {
     /// To support additional types, add new tags with values incremented from the last one before Max.
     Min = 0xFFFF8000,
     DomBlob = 0xFFFF8001,
-    MessagePort = 0xFFFF8002,
-    Principals = 0xFFFF8003,
-    DomPointReadOnly = 0xFFFF8004,
-    DomPoint = 0xFFFF8005,
-    ReadableStream = 0xFFFF8006,
-    DomException = 0xFFFF8007,
-    WritableStream = 0xFFFF8008,
+    DomFile = 0xFFFF8002,
+    DomFileList = 0xFFFF8003,
+    MessagePort = 0xFFFF8004,
+    Principals = 0xFFFF8005,
+    DomPointReadOnly = 0xFFFF8006,
+    DomPoint = 0xFFFF8007,
+    ReadableStream = 0xFFFF8008,
+    DomException = 0xFFFF8009,
+    WritableStream = 0xFFFF800A,
+    TransformStream = 0xFFFF800B,
+    ImageBitmap = 0xFFFF800C,
+    OffscreenCanvas = 0xFFFF800D,
+    QuotaExceededError = 0xFFFF800E,
+    DomRect = 0xFFFF800F,
+    DomRectReadOnly = 0xFFFF8010,
+    DomQuad = 0xFFFF8011,
+    DomMatrix = 0xFFFF8012,
+    DomMatrixReadOnly = 0xFFFF8013,
+    ImageData = 0xFFFF8014,
+    CryptoKey = 0xFFFF8015,
     Max = 0xFFFFFFFF,
 }
 
 impl From<SerializableInterface> for StructuredCloneTags {
     fn from(v: SerializableInterface) -> Self {
         match v {
+            SerializableInterface::File => StructuredCloneTags::DomFile,
+            SerializableInterface::FileList => StructuredCloneTags::DomFileList,
             SerializableInterface::Blob => StructuredCloneTags::DomBlob,
-            SerializableInterface::DomPointReadOnly => StructuredCloneTags::DomPointReadOnly,
             SerializableInterface::DomPoint => StructuredCloneTags::DomPoint,
+            SerializableInterface::DomPointReadOnly => StructuredCloneTags::DomPointReadOnly,
+            SerializableInterface::DomRect => StructuredCloneTags::DomRect,
+            SerializableInterface::DomRectReadOnly => StructuredCloneTags::DomRectReadOnly,
+            SerializableInterface::DomQuad => StructuredCloneTags::DomQuad,
+            SerializableInterface::DomMatrix => StructuredCloneTags::DomMatrix,
+            SerializableInterface::DomMatrixReadOnly => StructuredCloneTags::DomMatrixReadOnly,
             SerializableInterface::DomException => StructuredCloneTags::DomException,
+            SerializableInterface::ImageBitmap => StructuredCloneTags::ImageBitmap,
+            SerializableInterface::QuotaExceededError => StructuredCloneTags::QuotaExceededError,
+            SerializableInterface::ImageData => StructuredCloneTags::ImageData,
+            SerializableInterface::CryptoKey => StructuredCloneTags::CryptoKey,
         }
     }
 }
@@ -82,9 +123,12 @@ impl From<SerializableInterface> for StructuredCloneTags {
 impl From<TransferrableInterface> for StructuredCloneTags {
     fn from(v: TransferrableInterface) -> Self {
         match v {
+            TransferrableInterface::ImageBitmap => StructuredCloneTags::ImageBitmap,
             TransferrableInterface::MessagePort => StructuredCloneTags::MessagePort,
+            TransferrableInterface::OffscreenCanvas => StructuredCloneTags::OffscreenCanvas,
             TransferrableInterface::ReadableStream => StructuredCloneTags::ReadableStream,
             TransferrableInterface::WritableStream => StructuredCloneTags::WritableStream,
+            TransferrableInterface::TransformStream => StructuredCloneTags::TransformStream,
         }
     }
 }
@@ -92,32 +136,45 @@ impl From<TransferrableInterface> for StructuredCloneTags {
 fn reader_for_type(
     val: SerializableInterface,
 ) -> unsafe fn(
+    cx: &mut JSContext,
     &GlobalScope,
     *mut JSStructuredCloneReader,
     &mut StructuredDataReader<'_>,
-    CanGc,
 ) -> *mut JSObject {
     match val {
+        SerializableInterface::File => read_object::<File>,
+        SerializableInterface::FileList => read_object::<FileList>,
         SerializableInterface::Blob => read_object::<Blob>,
-        SerializableInterface::DomPointReadOnly => read_object::<DOMPointReadOnly>,
         SerializableInterface::DomPoint => read_object::<DOMPoint>,
+        SerializableInterface::DomPointReadOnly => read_object::<DOMPointReadOnly>,
+        SerializableInterface::DomRect => read_object::<DOMRect>,
+        SerializableInterface::DomRectReadOnly => read_object::<DOMRectReadOnly>,
+        SerializableInterface::DomQuad => read_object::<DOMQuad>,
+        SerializableInterface::DomMatrix => read_object::<DOMMatrix>,
+        SerializableInterface::DomMatrixReadOnly => read_object::<DOMMatrixReadOnly>,
         SerializableInterface::DomException => read_object::<DOMException>,
+        SerializableInterface::ImageBitmap => read_object::<ImageBitmap>,
+        SerializableInterface::QuotaExceededError => read_object::<QuotaExceededError>,
+        SerializableInterface::ImageData => read_object::<ImageData>,
+        SerializableInterface::CryptoKey => read_object::<CryptoKey>,
     }
 }
 
 unsafe fn read_object<T: Serializable>(
+    cx: &mut JSContext,
     owner: &GlobalScope,
     r: *mut JSStructuredCloneReader,
     sc_reader: &mut StructuredDataReader<'_>,
-    can_gc: CanGc,
 ) -> *mut JSObject {
     let mut name_space: u32 = 0;
     let mut index: u32 = 0;
-    assert!(JS_ReadUint32Pair(
-        r,
-        &mut name_space as *mut u32,
-        &mut index as *mut u32
-    ));
+    unsafe {
+        assert!(JS_ReadUint32Pair(
+            r,
+            &mut name_space as *mut u32,
+            &mut index as *mut u32
+        ));
+    }
     let storage_key = StorageKey { index, name_space };
 
     // 1. Re-build the key for the storage location
@@ -136,7 +193,7 @@ unsafe fn read_object<T: Serializable>(
         *objects = None;
     }
 
-    if let Ok(obj) = T::deserialize(owner, serialized, can_gc) {
+    if let Ok(obj) = T::deserialize(cx, owner, serialized) {
         let reflector = obj.reflector().get_jsobject().get();
         sc_reader.roots.push(Heap::boxed(reflector));
         return reflector;
@@ -146,28 +203,31 @@ unsafe fn read_object<T: Serializable>(
 }
 
 unsafe fn write_object<T: Serializable>(
+    no_gc: &NoGC,
     interface: SerializableInterface,
     owner: &GlobalScope,
     object: &T,
     w: *mut JSStructuredCloneWriter,
     sc_writer: &mut StructuredDataWriter,
 ) -> bool {
-    if let Ok((new_id, serialized)) = object.serialize() {
+    if let Ok((new_id, serialized)) = object.serialize(no_gc) {
         let objects = T::serialized_storage(StructuredData::Writer(sc_writer))
-            .get_or_insert_with(HashMap::new);
+            .get_or_insert(FxHashMap::default());
         objects.insert(new_id, serialized);
         let storage_key = StorageKey::new(new_id);
 
-        assert!(JS_WriteUint32Pair(
-            w,
-            StructuredCloneTags::from(interface) as u32,
-            0
-        ));
-        assert!(JS_WriteUint32Pair(
-            w,
-            storage_key.name_space,
-            storage_key.index
-        ));
+        unsafe {
+            assert!(JS_WriteUint32Pair(
+                w,
+                StructuredCloneTags::from(interface) as u32,
+                0
+            ));
+            assert!(JS_WriteUint32Pair(
+                w,
+                storage_key.name_space,
+                storage_key.index
+            ));
+        }
         return true;
     }
     warn!("Writing structured data failed in {:?}.", owner.get_url());
@@ -175,7 +235,7 @@ unsafe fn write_object<T: Serializable>(
 }
 
 unsafe extern "C" fn read_callback(
-    cx: *mut JSContext,
+    cx: *mut RawJSContext,
     r: *mut JSStructuredCloneReader,
     _policy: *const CloneDataPolicy,
     tag: u32,
@@ -191,66 +251,93 @@ unsafe extern "C" fn read_callback(
         "tag should be higher than StructuredCloneTags::Min"
     );
 
-    let sc_reader = &mut *(closure as *mut StructuredDataReader<'_>);
-    let in_realm_proof = AlreadyInRealm::assert_for_cx(SafeJSContext::from_ptr(cx));
-    let global = GlobalScope::from_context(cx, InRealm::Already(&in_realm_proof));
+    // SAFETY: it is safe to construct a JSContext from engine hook.
+    let mut cx = unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
+    let cx = &mut cx;
+
+    let sc_reader = unsafe { &mut *(closure as *mut StructuredDataReader<'_>) };
+
+    let mut realm = CurrentRealm::assert(cx);
+    let global = GlobalScope::from_current_realm(&mut realm);
+
     for serializable in SerializableInterface::iter() {
         if tag == StructuredCloneTags::from(serializable) as u32 {
             let reader = reader_for_type(serializable);
-            return reader(&global, r, sc_reader, CanGc::note());
+            return unsafe { reader(cx, &global, r, sc_reader) };
         }
     }
 
     ptr::null_mut()
 }
 
-struct InterfaceDoesNotMatch;
+enum OperationError {
+    InterfaceDoesNotMatch,
+    Exception(Error),
+}
 
 unsafe fn try_serialize<T: Serializable + IDLInterface>(
+    cx: &mut JSContext,
     val: SerializableInterface,
-    cx: *mut JSContext,
-    obj: RawHandleObject,
+    object: RawHandleObject,
     global: &GlobalScope,
     w: *mut JSStructuredCloneWriter,
     writer: &mut StructuredDataWriter,
-) -> Result<bool, InterfaceDoesNotMatch> {
-    if let Ok(obj) = root_from_object::<T>(*obj, cx) {
-        return Ok(write_object(val, global, &*obj, w, writer));
+) -> Result<bool, OperationError> {
+    let object = unsafe { root_from_object::<T>(cx, *object) };
+    if let Ok(obj) = object {
+        return unsafe { Ok(write_object(cx.no_gc(), val, global, &*obj, w, writer)) };
     }
-    Err(InterfaceDoesNotMatch)
+    Err(OperationError::InterfaceDoesNotMatch)
 }
 
 type SerializeOperation = unsafe fn(
+    &mut JSContext,
     SerializableInterface,
-    *mut JSContext,
     RawHandleObject,
     &GlobalScope,
     *mut JSStructuredCloneWriter,
     &mut StructuredDataWriter,
-) -> Result<bool, InterfaceDoesNotMatch>;
+) -> Result<bool, OperationError>;
 
 fn serialize_for_type(val: SerializableInterface) -> SerializeOperation {
     match val {
+        SerializableInterface::File => try_serialize::<File>,
+        SerializableInterface::FileList => try_serialize::<FileList>,
         SerializableInterface::Blob => try_serialize::<Blob>,
-        SerializableInterface::DomPointReadOnly => try_serialize::<DOMPointReadOnly>,
         SerializableInterface::DomPoint => try_serialize::<DOMPoint>,
+        SerializableInterface::DomPointReadOnly => try_serialize::<DOMPointReadOnly>,
+        SerializableInterface::DomRect => try_serialize::<DOMRect>,
+        SerializableInterface::DomRectReadOnly => try_serialize::<DOMRectReadOnly>,
+        SerializableInterface::DomQuad => try_serialize::<DOMQuad>,
+        SerializableInterface::DomMatrix => try_serialize::<DOMMatrix>,
+        SerializableInterface::DomMatrixReadOnly => try_serialize::<DOMMatrixReadOnly>,
         SerializableInterface::DomException => try_serialize::<DOMException>,
+        SerializableInterface::ImageBitmap => try_serialize::<ImageBitmap>,
+        SerializableInterface::QuotaExceededError => try_serialize::<QuotaExceededError>,
+        SerializableInterface::ImageData => try_serialize::<ImageData>,
+        SerializableInterface::CryptoKey => try_serialize::<CryptoKey>,
     }
 }
 
 unsafe extern "C" fn write_callback(
-    cx: *mut JSContext,
+    cx: *mut RawJSContext,
     w: *mut JSStructuredCloneWriter,
     obj: RawHandleObject,
     _same_process_scope_required: *mut bool,
     closure: *mut raw::c_void,
 ) -> bool {
-    let sc_writer = &mut *(closure as *mut StructuredDataWriter);
-    let in_realm_proof = AlreadyInRealm::assert_for_cx(SafeJSContext::from_ptr(cx));
-    let global = GlobalScope::from_context(cx, InRealm::Already(&in_realm_proof));
+    // SAFETY: it is safe to construct a JSContext from engine hook.
+    let mut cx = unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
+    let cx = &mut cx;
+
+    let sc_writer = unsafe { &mut *(closure as *mut StructuredDataWriter) };
+
+    let mut realm = CurrentRealm::assert(cx);
+    let global = GlobalScope::from_current_realm(&mut realm);
+
     for serializable in SerializableInterface::iter() {
         let serializer = serialize_for_type(serializable);
-        if let Ok(result) = serializer(serializable, cx, obj, &global, w, sc_writer) {
+        if let Ok(result) = unsafe { serializer(cx, serializable, obj, &global, w, sc_writer) } {
             return result;
         }
     }
@@ -259,16 +346,25 @@ unsafe extern "C" fn write_callback(
 
 fn receiver_for_type(
     val: TransferrableInterface,
-) -> fn(&GlobalScope, &mut StructuredDataReader<'_>, u64, RawMutableHandleObject) -> Result<(), ()>
-{
+) -> fn(
+    &mut JSContext,
+    &GlobalScope,
+    &mut StructuredDataReader<'_>,
+    u64,
+    RawMutableHandleObject,
+) -> Result<(), ()> {
     match val {
+        TransferrableInterface::ImageBitmap => receive_object::<ImageBitmap>,
         TransferrableInterface::MessagePort => receive_object::<MessagePort>,
+        TransferrableInterface::OffscreenCanvas => receive_object::<OffscreenCanvas>,
         TransferrableInterface::ReadableStream => receive_object::<ReadableStream>,
         TransferrableInterface::WritableStream => receive_object::<WritableStream>,
+        TransferrableInterface::TransformStream => receive_object::<TransformStream>,
     }
 }
 
 fn receive_object<T: Transferable>(
+    cx: &mut JSContext,
     owner: &GlobalScope,
     sc_reader: &mut StructuredDataReader<'_>,
     extra_data: u64,
@@ -306,7 +402,7 @@ fn receive_object<T: Transferable>(
         );
     };
 
-    let Ok(received) = T::transfer_receive(owner, id, serialized) else {
+    let Ok(received) = T::transfer_receive(cx, owner, id, serialized) else {
         return Err(());
     };
     return_object.set(received.reflector().rootable().get());
@@ -315,7 +411,7 @@ fn receive_object<T: Transferable>(
 }
 
 unsafe extern "C" fn read_transfer_callback(
-    cx: *mut JSContext,
+    cx: *mut RawJSContext,
     _r: *mut JSStructuredCloneReader,
     _policy: *const CloneDataPolicy,
     tag: u32,
@@ -324,14 +420,20 @@ unsafe extern "C" fn read_transfer_callback(
     closure: *mut raw::c_void,
     return_object: RawMutableHandleObject,
 ) -> bool {
-    let sc_reader = &mut *(closure as *mut StructuredDataReader<'_>);
-    let in_realm_proof = AlreadyInRealm::assert_for_cx(SafeJSContext::from_ptr(cx));
-    let owner = GlobalScope::from_context(cx, InRealm::Already(&in_realm_proof));
+    let sc_reader = unsafe { &mut *(closure as *mut StructuredDataReader<'_>) };
+    let mut cx = unsafe {
+        // This is safe because we are in SM hook
+        JSContext::from_ptr(
+            NonNull::new(cx).expect("JSContext pointer should not be null in SM hook"),
+        )
+    };
+    let mut realm = CurrentRealm::assert(&mut cx);
+    let owner = GlobalScope::from_current_realm(&mut realm);
 
     for transferrable in TransferrableInterface::iter() {
         if tag == StructuredCloneTags::from(transferrable) as u32 {
             let transfer_receiver = receiver_for_type(transferrable);
-            if transfer_receiver(&owner, sc_reader, extra_data, return_object).is_ok() {
+            if transfer_receiver(&mut realm, &owner, sc_reader, extra_data, return_object).is_ok() {
                 return true;
             }
         }
@@ -342,60 +444,66 @@ unsafe extern "C" fn read_transfer_callback(
 unsafe fn try_transfer<T: Transferable + IDLInterface>(
     interface: TransferrableInterface,
     obj: RawHandleObject,
-    cx: *mut JSContext,
+    cx: &mut JSContext,
     sc_writer: &mut StructuredDataWriter,
     tag: *mut u32,
     ownership: *mut TransferableOwnership,
     extra_data: *mut u64,
-) -> Result<(), ()> {
-    if let Ok(object) = root_from_object::<T>(*obj, cx) {
-        *tag = StructuredCloneTags::from(interface) as u32;
-        *ownership = TransferableOwnership::SCTAG_TMO_CUSTOM;
-        if let Ok((id, object)) = object.transfer() {
-            // 2. Store the transferred object at a given key.
-            let objects = T::serialized_storage(StructuredData::Writer(sc_writer))
-                .get_or_insert_with(HashMap::new);
-            objects.insert(id, object);
+) -> Result<(), OperationError> {
+    let object = unsafe { root_from_object::<T>(cx, *obj) };
+    let Ok(object) = object else {
+        return Err(OperationError::InterfaceDoesNotMatch);
+    };
 
-            let index = id.index.0.get();
+    unsafe { *tag = StructuredCloneTags::from(interface) as u32 };
+    unsafe { *ownership = TransferableOwnership::SCTAG_TMO_CUSTOM };
 
-            let mut big: [u8; 8] = [0; 8];
-            let name_space = id.namespace_id.0.to_ne_bytes();
-            let index = index.to_ne_bytes();
+    let (id, object) = object.transfer(cx).map_err(OperationError::Exception)?;
 
-            let (left, right) = big.split_at_mut(4);
-            left.copy_from_slice(&name_space);
-            right.copy_from_slice(&index);
+    // 2. Store the transferred object at a given key.
+    let objects = T::serialized_storage(StructuredData::Writer(sc_writer))
+        .get_or_insert(FxHashMap::default());
+    objects.insert(id, object);
 
-            // 3. Return a u64 representation of the key where the object is stored.
-            *extra_data = u64::from_ne_bytes(big);
-            return Ok(());
-        }
-    }
-    Err(())
+    let index = id.index.0.get();
+
+    let mut big: [u8; 8] = [0; 8];
+    let name_space = id.namespace_id.0.to_ne_bytes();
+    let index = index.to_ne_bytes();
+
+    let (left, right) = big.split_at_mut(4);
+    left.copy_from_slice(&name_space);
+    right.copy_from_slice(&index);
+
+    // 3. Return a u64 representation of the key where the object is stored.
+    unsafe { *extra_data = u64::from_ne_bytes(big) };
+    Ok(())
 }
 
 type TransferOperation = unsafe fn(
     TransferrableInterface,
     RawHandleObject,
-    *mut JSContext,
+    &mut JSContext,
     &mut StructuredDataWriter,
     *mut u32,
     *mut TransferableOwnership,
     *mut u64,
-) -> Result<(), ()>;
+) -> Result<(), OperationError>;
 
 fn transfer_for_type(val: TransferrableInterface) -> TransferOperation {
     match val {
+        TransferrableInterface::ImageBitmap => try_transfer::<ImageBitmap>,
         TransferrableInterface::MessagePort => try_transfer::<MessagePort>,
+        TransferrableInterface::OffscreenCanvas => try_transfer::<OffscreenCanvas>,
         TransferrableInterface::ReadableStream => try_transfer::<ReadableStream>,
         TransferrableInterface::WritableStream => try_transfer::<WritableStream>,
+        TransferrableInterface::TransformStream => try_transfer::<TransformStream>,
     }
 }
 
 /// <https://html.spec.whatwg.org/multipage/#structuredserializewithtransfer>
 unsafe extern "C" fn write_transfer_callback(
-    cx: *mut JSContext,
+    cx: *mut RawJSContext,
     obj: RawHandleObject,
     closure: *mut raw::c_void,
     tag: *mut u32,
@@ -403,11 +511,36 @@ unsafe extern "C" fn write_transfer_callback(
     _content: *mut *mut raw::c_void,
     extra_data: *mut u64,
 ) -> bool {
-    let sc_writer = &mut *(closure as *mut StructuredDataWriter);
+    let sc_writer = unsafe { &mut *(closure as *mut StructuredDataWriter) };
+    let mut cx = unsafe {
+        // This is safe because we are in SM hook
+        JSContext::from_ptr(
+            NonNull::new(cx).expect("JSContext pointer should not be null in SM hook"),
+        )
+    };
     for transferable in TransferrableInterface::iter() {
         let try_transfer = transfer_for_type(transferable);
-        if try_transfer(transferable, obj, cx, sc_writer, tag, ownership, extra_data).is_ok() {
-            return true;
+
+        let transfer_result = unsafe {
+            try_transfer(
+                transferable,
+                obj,
+                &mut cx,
+                sc_writer,
+                tag,
+                ownership,
+                extra_data,
+            )
+        };
+        match transfer_result {
+            Err(error) => match error {
+                OperationError::InterfaceDoesNotMatch => {},
+                OperationError::Exception(error) => {
+                    sc_writer.error = Some(error);
+                    return false;
+                },
+            },
+            Ok(..) => return true,
         }
     }
 
@@ -424,31 +557,42 @@ unsafe extern "C" fn free_transfer_callback(
 }
 
 unsafe fn can_transfer_for_type(
+    cx: &mut JSContext,
     transferable: TransferrableInterface,
     obj: RawHandleObject,
-    cx: *mut JSContext,
 ) -> Result<bool, ()> {
     unsafe fn can_transfer<T: Transferable + IDLInterface>(
+        cx: &mut JSContext,
         obj: RawHandleObject,
-        cx: *mut JSContext,
     ) -> Result<bool, ()> {
-        root_from_object::<T>(*obj, cx).map(|o| Transferable::can_transfer(&*o))
+        unsafe { root_from_object::<T>(cx, *obj).map(|o| Transferable::can_transfer(&*o)) }
     }
-    match transferable {
-        TransferrableInterface::MessagePort => can_transfer::<MessagePort>(obj, cx),
-        TransferrableInterface::ReadableStream => can_transfer::<ReadableStream>(obj, cx),
-        TransferrableInterface::WritableStream => can_transfer::<WritableStream>(obj, cx),
+
+    unsafe {
+        match transferable {
+            TransferrableInterface::ImageBitmap => can_transfer::<ImageBitmap>(cx, obj),
+            TransferrableInterface::MessagePort => can_transfer::<MessagePort>(cx, obj),
+            TransferrableInterface::OffscreenCanvas => can_transfer::<OffscreenCanvas>(cx, obj),
+            TransferrableInterface::ReadableStream => can_transfer::<ReadableStream>(cx, obj),
+            TransferrableInterface::WritableStream => can_transfer::<WritableStream>(cx, obj),
+            TransferrableInterface::TransformStream => can_transfer::<TransformStream>(cx, obj),
+        }
     }
 }
 
 unsafe extern "C" fn can_transfer_callback(
-    cx: *mut JSContext,
+    cx: *mut RawJSContext,
     obj: RawHandleObject,
     _same_process_scope_required: *mut bool,
     _closure: *mut raw::c_void,
 ) -> bool {
+    // SAFETY: it is safe to construct a JSContext from engine hook.
+    let mut cx = unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
+    let cx = &mut cx;
+
     for transferable in TransferrableInterface::iter() {
-        if let Ok(can_transfer) = can_transfer_for_type(transferable, obj, cx) {
+        let can_transfer = unsafe { can_transfer_for_type(cx, transferable, obj) };
+        if let Ok(can_transfer) = can_transfer {
             return can_transfer;
         }
     }
@@ -456,7 +600,7 @@ unsafe extern "C" fn can_transfer_callback(
 }
 
 unsafe extern "C" fn report_error_callback(
-    _cx: *mut JSContext,
+    _cx: *mut RawJSContext,
     _errorid: u32,
     closure: *mut raw::c_void,
     error_message: *const ::std::os::raw::c_char,
@@ -464,14 +608,16 @@ unsafe extern "C" fn report_error_callback(
     let msg_result = unsafe { CStr::from_ptr(error_message).to_str().map(str::to_string) };
 
     if let Ok(msg) = msg_result {
-        let dom_error_record = &mut *(closure as *mut DOMErrorRecord);
+        let error = unsafe { &mut *(closure as *mut Option<Error>) };
 
-        dom_error_record.message = Some(msg)
+        if error.is_none() {
+            *error = Some(Error::DataClone(Some(msg)));
+        }
     }
 }
 
 unsafe extern "C" fn sab_cloned_callback(
-    _cx: *mut JSContext,
+    _cx: *mut RawJSContext,
     _receiving: bool,
     _closure: *mut ::std::os::raw::c_void,
 ) -> bool {
@@ -494,75 +640,121 @@ pub(crate) enum StructuredData<'a, 'b> {
     Writer(&'a mut StructuredDataWriter),
 }
 
-#[derive(Default)]
-#[repr(C)]
-pub(crate) struct DOMErrorRecord {
-    pub(crate) message: Option<String>,
-}
-
 /// Reader and writer structs for results from, and inputs to, structured-data read/write operations.
 /// <https://html.spec.whatwg.org/multipage/#safe-passing-of-structured-data>
 #[repr(C)]
 pub(crate) struct StructuredDataReader<'a> {
-    /// A struct of error message.
-    errors: DOMErrorRecord,
+    /// A error record.
+    error: Option<Error>,
     /// Rooted copies of every deserialized object to ensure they are not garbage collected.
     roots: RootedVec<'a, Box<Heap<*mut JSObject>>>,
     /// A map of port implementations,
     /// used as part of the "transfer-receiving" steps of ports,
     /// to produce the DOM ports stored in `message_ports` above.
-    pub(crate) port_impls: Option<HashMap<MessagePortId, MessagePortImpl>>,
+    pub(crate) port_impls: Option<FxHashMap<MessagePortId, MessagePortImpl>>,
+    /// A map of transform stream implementations,
+    pub(crate) transform_streams_port_impls: Option<FxHashMap<MessagePortId, TransformStreamData>>,
     /// A map of blob implementations,
     /// used as part of the "deserialize" steps of blobs,
     /// to produce the DOM blobs stored in `blobs` above.
-    pub(crate) blob_impls: Option<HashMap<BlobId, BlobImpl>>,
+    pub(crate) blob_impls: Option<FxHashMap<BlobId, BlobImpl>>,
+    /// A map of serialized files.
+    pub(crate) files: Option<FxHashMap<FileId, SerializableFile>>,
+    /// A map of serialized file lists.
+    pub(crate) file_lists: Option<FxHashMap<FileListId, SerializableFileList>>,
     /// A map of serialized points.
-    pub(crate) points: Option<HashMap<DomPointId, DomPoint>>,
+    pub(crate) points: Option<FxHashMap<DomPointId, DomPoint>>,
+    /// A map of serialized rects.
+    pub(crate) rects: Option<FxHashMap<DomRectId, DomRect>>,
+    /// A map of serialized quads.
+    pub(crate) quads: Option<FxHashMap<DomQuadId, DomQuad>>,
+    /// A map of serialized matrices.
+    pub(crate) matrices: Option<FxHashMap<DomMatrixId, DomMatrix>>,
     /// A map of serialized exceptions.
-    pub(crate) exceptions: Option<HashMap<DomExceptionId, DomException>>,
+    pub(crate) exceptions: Option<FxHashMap<DomExceptionId, DomException>>,
+    /// A map of serialized quota exceeded errors.
+    pub(crate) quota_exceeded_errors:
+        Option<FxHashMap<QuotaExceededErrorId, SerializableQuotaExceededError>>,
+    // A map of serialized image bitmaps.
+    pub(crate) image_bitmaps: Option<FxHashMap<ImageBitmapId, SerializableImageBitmap>>,
+    /// A map of transferred image bitmaps.
+    pub(crate) transferred_image_bitmaps: Option<FxHashMap<ImageBitmapId, SerializableImageBitmap>>,
+    /// A map of transferred offscreen canvases.
+    pub(crate) offscreen_canvases:
+        Option<FxHashMap<OffscreenCanvasId, TransferableOffscreenCanvas>>,
+    // A map of serialized image data.
+    pub(crate) image_data: Option<FxHashMap<ImageDataId, SerializableImageData>>,
+    // A map of serialized crypto keys.
+    pub(crate) crypto_keys: Option<FxHashMap<CryptoKeyId, SerializableCryptoKey>>,
 }
 
 /// A data holder for transferred and serialized objects.
 #[derive(Default)]
 #[repr(C)]
 pub(crate) struct StructuredDataWriter {
-    /// Error message.
-    pub(crate) errors: DOMErrorRecord,
+    /// Error record.
+    pub(crate) error: Option<Error>,
     /// Transferred ports.
-    pub(crate) ports: Option<HashMap<MessagePortId, MessagePortImpl>>,
+    pub(crate) ports: Option<FxHashMap<MessagePortId, MessagePortImpl>>,
+    /// Transferred transform streams.
+    pub(crate) transform_streams_port: Option<FxHashMap<MessagePortId, TransformStreamData>>,
     /// Serialized points.
-    pub(crate) points: Option<HashMap<DomPointId, DomPoint>>,
+    pub(crate) points: Option<FxHashMap<DomPointId, DomPoint>>,
+    /// Serialized rects.
+    pub(crate) rects: Option<FxHashMap<DomRectId, DomRect>>,
+    /// Serialized quads.
+    pub(crate) quads: Option<FxHashMap<DomQuadId, DomQuad>>,
+    /// Serialized matrices.
+    pub(crate) matrices: Option<FxHashMap<DomMatrixId, DomMatrix>>,
     /// Serialized exceptions.
-    pub(crate) exceptions: Option<HashMap<DomExceptionId, DomException>>,
+    pub(crate) exceptions: Option<FxHashMap<DomExceptionId, DomException>>,
+    /// Serialized quota exceeded errors.
+    pub(crate) quota_exceeded_errors:
+        Option<FxHashMap<QuotaExceededErrorId, SerializableQuotaExceededError>>,
     /// Serialized blobs.
-    pub(crate) blobs: Option<HashMap<BlobId, BlobImpl>>,
+    pub(crate) blobs: Option<FxHashMap<BlobId, BlobImpl>>,
+    /// Serialized files.
+    pub(crate) files: Option<FxHashMap<FileId, SerializableFile>>,
+    /// Serialized file lists.
+    pub(crate) file_lists: Option<FxHashMap<FileListId, SerializableFileList>>,
+    /// Serialized image bitmaps.
+    pub(crate) image_bitmaps: Option<FxHashMap<ImageBitmapId, SerializableImageBitmap>>,
+    /// Transferred image bitmaps.
+    pub(crate) transferred_image_bitmaps: Option<FxHashMap<ImageBitmapId, SerializableImageBitmap>>,
+    /// Transferred offscreen canvases.
+    pub(crate) offscreen_canvases:
+        Option<FxHashMap<OffscreenCanvasId, TransferableOffscreenCanvas>>,
+    // A map of serialized image data.
+    pub(crate) image_data: Option<FxHashMap<ImageDataId, SerializableImageData>>,
+    // A map of serialized crypto keys.
+    pub(crate) crypto_keys: Option<FxHashMap<CryptoKeyId, SerializableCryptoKey>>,
 }
 
 /// Writes a structured clone. Returns a `DataClone` error if that fails.
 pub(crate) fn write(
-    cx: SafeJSContext,
+    cx: &mut JSContext,
     message: HandleValue,
     transfer: Option<CustomAutoRooterGuard<Vec<*mut JSObject>>>,
 ) -> Fallible<StructuredSerializedData> {
     unsafe {
-        rooted!(in(*cx) let mut val = UndefinedValue());
+        rooted!(&in(cx) let mut val = UndefinedValue());
         if let Some(transfer) = transfer {
-            transfer.to_jsval(*cx, val.handle_mut());
+            transfer.safe_to_jsval(cx, val.handle_mut());
         }
         let mut sc_writer = StructuredDataWriter::default();
         let sc_writer_ptr = &mut sc_writer as *mut _;
 
-        let scbuf = NewJSAutoStructuredCloneBuffer(
+        let scbuf = JSAutoStructuredCloneBufferWrapper::new(
             StructuredCloneScope::DifferentProcess,
             &STRUCTURED_CLONE_CALLBACKS,
         );
-        let scdata = &mut ((*scbuf).data_);
+        let scdata = &mut ((*scbuf.as_raw_ptr()).data_);
         let policy = CloneDataPolicy {
             allowIntraClusterClonableSharedObjects_: false,
             allowSharedMemoryObjects_: false,
         };
         let result = JS_WriteStructuredClone(
-            *cx,
+            cx,
             message,
             scdata,
             StructuredCloneScope::DifferentProcess,
@@ -572,8 +764,13 @@ pub(crate) fn write(
             val.handle(),
         );
         if !result {
-            JS_ClearPendingException(*cx);
-            return Err(Error::DataClone(sc_writer.errors.message));
+            let error = if JS_IsExceptionPending(cx) {
+                Error::JSFailed
+            } else {
+                sc_writer.error.unwrap_or(Error::DataClone(None))
+            };
+
+            return Err(error);
         }
 
         let nbytes = GetLengthOfJSStructuredCloneData(scdata);
@@ -581,14 +778,24 @@ pub(crate) fn write(
         CopyJSStructuredCloneData(scdata, data.as_mut_ptr());
         data.set_len(nbytes);
 
-        DeleteJSAutoStructuredCloneBuffer(scbuf);
-
         let data = StructuredSerializedData {
             serialized: data,
             ports: sc_writer.ports.take(),
+            transform_streams: sc_writer.transform_streams_port.take(),
             points: sc_writer.points.take(),
+            rects: sc_writer.rects.take(),
+            quads: sc_writer.quads.take(),
+            matrices: sc_writer.matrices.take(),
             exceptions: sc_writer.exceptions.take(),
+            quota_exceeded_errors: sc_writer.quota_exceeded_errors.take(),
             blobs: sc_writer.blobs.take(),
+            files: sc_writer.files.take(),
+            file_lists: sc_writer.file_lists.take(),
+            image_bitmaps: sc_writer.image_bitmaps.take(),
+            transferred_image_bitmaps: sc_writer.transferred_image_bitmaps.take(),
+            offscreen_canvases: sc_writer.offscreen_canvases.take(),
+            image_data: sc_writer.image_data.take(),
+            crypto_keys: sc_writer.crypto_keys.take(),
         };
 
         Ok(data)
@@ -598,28 +805,42 @@ pub(crate) fn write(
 /// Read structured serialized data, possibly containing transferred objects.
 /// Returns a vec of rooted transfer-received ports, or an error.
 pub(crate) fn read(
+    cx: &mut JSContext,
     global: &GlobalScope,
     mut data: StructuredSerializedData,
     rval: MutableHandleValue,
 ) -> Fallible<Vec<DomRoot<MessagePort>>> {
-    let cx = GlobalScope::get_cx();
-    let _ac = enter_realm(global);
+    let mut realm = enter_auto_realm(cx, global);
+    let cx = &mut realm.current_realm();
+
     rooted_vec!(let mut roots);
     let mut sc_reader = StructuredDataReader {
+        error: None,
         roots,
         port_impls: data.ports.take(),
+        transform_streams_port_impls: data.transform_streams.take(),
         blob_impls: data.blobs.take(),
+        files: data.files.take(),
+        file_lists: data.file_lists.take(),
         points: data.points.take(),
+        rects: data.rects.take(),
+        quads: data.quads.take(),
+        matrices: data.matrices.take(),
         exceptions: data.exceptions.take(),
-        errors: DOMErrorRecord { message: None },
+        quota_exceeded_errors: data.quota_exceeded_errors.take(),
+        image_bitmaps: data.image_bitmaps.take(),
+        transferred_image_bitmaps: data.transferred_image_bitmaps.take(),
+        offscreen_canvases: data.offscreen_canvases.take(),
+        image_data: data.image_data.take(),
+        crypto_keys: data.crypto_keys.take(),
     };
     let sc_reader_ptr = &mut sc_reader as *mut _;
     unsafe {
-        let scbuf = NewJSAutoStructuredCloneBuffer(
+        let scbuf = JSAutoStructuredCloneBufferWrapper::new(
             StructuredCloneScope::DifferentProcess,
             &STRUCTURED_CLONE_CALLBACKS,
         );
-        let scdata = &mut ((*scbuf).data_);
+        let scdata = &mut ((*scbuf.as_raw_ptr()).data_);
 
         WriteBytesToJSStructuredCloneData(
             data.serialized.as_mut_ptr() as *const u8,
@@ -628,7 +849,7 @@ pub(crate) fn read(
         );
 
         let result = JS_ReadStructuredClone(
-            *cx,
+            cx,
             scdata,
             JS_STRUCTURED_CLONE_VERSION,
             StructuredCloneScope::DifferentProcess,
@@ -641,15 +862,18 @@ pub(crate) fn read(
             sc_reader_ptr as *mut raw::c_void,
         );
         if !result {
-            JS_ClearPendingException(*cx);
-            return Err(Error::DataClone(sc_reader.errors.message));
-        }
+            let error = if JS_IsExceptionPending(cx) {
+                Error::JSFailed
+            } else {
+                sc_reader.error.unwrap_or(Error::DataClone(None))
+            };
 
-        DeleteJSAutoStructuredCloneBuffer(scbuf);
+            return Err(error);
+        }
 
         let mut message_ports = vec![];
         for reflector in sc_reader.roots.iter() {
-            let Ok(message_port) = root_from_object::<MessagePort>(reflector.get(), *cx) else {
+            let Ok(message_port) = root_from_object::<MessagePort>(cx, reflector.get()) else {
                 continue;
             };
             message_ports.push(message_port);

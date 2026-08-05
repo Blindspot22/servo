@@ -5,20 +5,23 @@
 //! This actor represents one DOM node. It is created by the Walker actor when it is traversing the
 //! document tree.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::net::TcpStream;
 
-use base::id::PipelineId;
-use devtools_traits::DevtoolScriptControlMsg::{GetChildren, GetDocumentElement, ModifyAttribute};
-use devtools_traits::{DevtoolScriptControlMsg, NodeInfo, ShadowRootMode};
-use ipc_channel::ipc::{self, IpcSender};
+use atomic_refcell::AtomicRefCell;
+use devtools_traits::{
+    AttrModification, DevtoolScriptControlMsg, EventListenerInfo, MatchedRule, NodeInfo,
+    ShadowRootMode,
+};
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{self, Map, Value};
+use servo_base::generic_channel;
 
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
+use crate::actor::{
+    Actor, ActorEncode, ActorError, ActorRegistry, DowncastableActorArc, new_actor_name,
+};
 use crate::actors::inspector::walker::WalkerActor;
-use crate::protocol::JsonPacketStream;
+use crate::protocol::ClientRequest;
 use crate::{EmptyReplyMsg, StreamId};
 
 /// Text node type constant. This is defined again to avoid depending on `script`, where it is defined originally.
@@ -29,7 +32,36 @@ const TEXT_NODE: u16 = 3;
 const MAX_INLINE_LENGTH: usize = 50;
 
 #[derive(Serialize)]
+struct GetEventListenerInfoReply {
+    from: String,
+    events: Vec<DevtoolsEventListenerInfo>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DevtoolsEventListenerInfo {
+    r#type: String,
+    handler: String,
+    origin: String,
+    tags: String,
+    capturing: bool,
+    // This will always be an empty object, we just need a value that serializes to "{}".
+    hide: Value,
+    native: bool,
+    source_actor: String,
+    enabled: bool,
+    is_user_defined: bool,
+    event_listener_info_id: String,
+}
+
+#[derive(Serialize)]
 struct GetUniqueSelectorReply {
+    from: String,
+    value: String,
+}
+
+#[derive(Serialize)]
+struct GetXPathReply {
     from: String,
     value: String,
 }
@@ -40,9 +72,9 @@ struct AttrMsg {
     value: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct NodeActorMsg {
+pub(crate) struct NodeActorMsg {
     pub actor: String,
 
     /// The ID of the shadow host of this node, if it is
@@ -60,6 +92,9 @@ pub struct NodeActorMsg {
     is_anonymous: bool,
     is_before_pseudo_element: bool,
     is_direct_shadow_host_child: Option<bool>,
+    /// Whether or not this node is displayed.
+    ///
+    /// Setting this value to `false` will cause the devtools to render the node name in gray.
     is_displayed: bool,
     #[serde(rename = "isInHTMLDocument")]
     is_in_html_document: Option<bool>,
@@ -90,19 +125,21 @@ pub struct NodeActorMsg {
     /// The `DOCTYPE` system identifier if this is a `DocumentType` node, `None` otherwise
     #[serde(skip_serializing_if = "Option::is_none")]
     system_id: Option<String>,
+
+    has_event_listeners: bool,
 }
 
-pub struct NodeActor {
+#[derive(MallocSizeOf)]
+pub(crate) struct NodeActor {
     name: String,
-    pub script_chan: IpcSender<DevtoolScriptControlMsg>,
-    pub pipeline: PipelineId,
-    pub walker: String,
-    pub style_rules: RefCell<HashMap<(String, usize), String>>,
+    pub walker_name: String,
+    pub style_rules: AtomicRefCell<HashMap<MatchedRule, String>>,
+    node_info: AtomicRefCell<NodeInfo>,
 }
 
 impl Actor for NodeActor {
-    fn name(&self) -> String {
-        self.name.clone()
+    fn name(&self) -> &str {
+        &self.name
     }
 
     /// The node actor can handle the following messages:
@@ -113,128 +150,189 @@ impl Actor for NodeActor {
     /// - `getUniqueSelector`: Returns the display name of this node
     fn handle_message(
         &self,
+        request: ClientRequest,
         registry: &ActorRegistry,
         msg_type: &str,
         msg: &Map<String, Value>,
-        stream: &mut TcpStream,
         _id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
-        Ok(match msg_type {
+    ) -> Result<(), ActorError> {
+        let browsing_context_actor = registry
+            .find::<WalkerActor>(&self.walker_name)
+            .browsing_context_actor(registry);
+        let script_chan = browsing_context_actor.script_chan();
+        let pipeline_id = browsing_context_actor.pipeline_id();
+
+        match msg_type {
             "modifyAttributes" => {
-                let mods = msg.get("modifications").ok_or(())?.as_array().ok_or(())?;
-                let modifications: Vec<_> = mods
+                let mods = msg
+                    .get("modifications")
+                    .ok_or(ActorError::MissingParameter)?
+                    .as_array()
+                    .ok_or(ActorError::BadParameterType)?;
+                let modifications: Vec<AttrModification> = mods
                     .iter()
                     .filter_map(|json_mod| {
                         serde_json::from_str(&serde_json::to_string(json_mod).ok()?).ok()
                     })
                     .collect();
 
-                let walker = registry.find::<WalkerActor>(&self.walker);
-                walker.new_mutations(stream, &self.name, &modifications);
-
-                self.script_chan
-                    .send(ModifyAttribute(
-                        self.pipeline,
-                        registry.actor_to_script(self.name()),
+                script_chan
+                    .send(DevtoolScriptControlMsg::ModifyAttribute(
+                        browsing_context_actor.pipeline_id(),
+                        registry.actor_to_script(self.name().into()),
                         modifications,
                     ))
-                    .map_err(|_| ())?;
+                    .map_err(|_| ActorError::Internal)?;
 
-                let reply = EmptyReplyMsg { from: self.name() };
-                let _ = stream.write_json_packet(&reply);
-                ActorMessageStatus::Processed
-            },
-
-            "getUniqueSelector" => {
-                let (tx, rx) = ipc::channel().unwrap();
-                self.script_chan
-                    .send(GetDocumentElement(self.pipeline, tx))
-                    .unwrap();
-                let doc_elem_info = rx.recv().map_err(|_| ())?.ok_or(())?;
-                let node = doc_elem_info.encode(
-                    registry,
-                    true,
-                    self.script_chan.clone(),
-                    self.pipeline,
-                    self.walker.clone(),
-                );
-
-                let msg = GetUniqueSelectorReply {
-                    from: self.name(),
-                    value: node.display_name,
+                let reply = EmptyReplyMsg {
+                    from: self.name().into(),
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&reply)?
+            },
+            "getEventListenerInfo" => {
+                let target = msg
+                    .get("to")
+                    .ok_or(ActorError::MissingParameter)?
+                    .as_str()
+                    .ok_or(ActorError::BadParameterType)?;
+
+                let (tx, rx) = generic_channel::channel().ok_or(ActorError::Internal)?;
+                script_chan
+                    .send(DevtoolScriptControlMsg::GetEventListenerInfo(
+                        pipeline_id,
+                        registry.actor_to_script(target.to_owned()),
+                        tx,
+                    ))
+                    .unwrap();
+                let event_listeners = rx.recv().map_err(|_| ActorError::Internal)?;
+
+                let msg = GetEventListenerInfoReply {
+                    from: self.name().into(),
+                    events: event_listeners.into_iter().map(From::from).collect(),
+                };
+                request.reply_final(&msg)?
+            },
+            "getUniqueSelector" => {
+                let (tx, rx) = generic_channel::channel().unwrap();
+                script_chan
+                    .send(DevtoolScriptControlMsg::GetDocumentElement(pipeline_id, tx))
+                    .unwrap();
+                let node_info = rx
+                    .recv()
+                    .map_err(|_| ActorError::Internal)?
+                    .ok_or(ActorError::Internal)?;
+
+                self.update(node_info);
+                let msg = GetUniqueSelectorReply {
+                    from: self.name().into(),
+                    value: self.node_info.borrow().node_name.to_lowercase(),
+                };
+                request.reply_final(&msg)?
+            },
+            "getXPath" => {
+                let target = msg
+                    .get("to")
+                    .ok_or(ActorError::MissingParameter)?
+                    .as_str()
+                    .ok_or(ActorError::BadParameterType)?;
+
+                let (tx, rx) = generic_channel::channel().unwrap();
+                script_chan
+                    .send(DevtoolScriptControlMsg::GetXPath(
+                        pipeline_id,
+                        registry.actor_to_script(target.to_owned()),
+                        tx,
+                    ))
+                    .unwrap();
+
+                let xpath_selector = rx.recv().map_err(|_| ActorError::Internal)?;
+                let msg = GetXPathReply {
+                    from: self.name().into(),
+                    value: xpath_selector,
+                };
+                request.reply_final(&msg)?
             },
 
-            _ => ActorMessageStatus::Ignored,
-        })
+            _ => return Err(ActorError::UnrecognizedPacketType),
+        };
+        Ok(())
     }
 }
 
-pub trait NodeInfoToProtocol {
-    fn encode(
-        self,
-        actors: &ActorRegistry,
-        display: bool,
-        script_chan: IpcSender<DevtoolScriptControlMsg>,
-        pipeline: PipelineId,
-        walker: String,
-    ) -> NodeActorMsg;
+impl NodeActor {
+    pub fn register_or_update(
+        registry: &ActorRegistry,
+        walker_name: &str,
+        node_info: NodeInfo,
+    ) -> DowncastableActorArc<Self> {
+        let unique_id = &node_info.unique_id;
+
+        if !registry.script_actor_registered(unique_id) {
+            let name = new_actor_name::<Self>();
+            registry.register_script_actor(unique_id.clone(), name.clone());
+
+            let actor = Self {
+                name,
+                walker_name: walker_name.into(),
+                style_rules: AtomicRefCell::new(HashMap::new()),
+                node_info: AtomicRefCell::new(node_info),
+            };
+
+            registry.register(actor).into()
+        } else {
+            let name = registry.script_to_actor(unique_id);
+            let actor = registry.find::<NodeActor>(&name);
+            actor.update(node_info);
+            actor
+        }
+    }
+
+    fn update(&self, node_info: NodeInfo) {
+        *self.node_info.borrow_mut() = node_info;
+    }
 }
 
-impl NodeInfoToProtocol for NodeInfo {
-    fn encode(
-        self,
-        actors: &ActorRegistry,
-        display: bool,
-        script_chan: IpcSender<DevtoolScriptControlMsg>,
-        pipeline: PipelineId,
-        walker: String,
-    ) -> NodeActorMsg {
-        let get_or_register_node_actor = |id: &str| {
-            if !actors.script_actor_registered(id.to_string()) {
-                let name = actors.new_name("node");
-                actors.register_script_actor(id.to_string(), name.clone());
+impl ActorEncode<NodeActorMsg> for NodeActor {
+    fn encode(&self, registry: &ActorRegistry) -> NodeActorMsg {
+        let node_info = self.node_info.borrow();
 
-                let node_actor = NodeActor {
-                    name: name.clone(),
-                    script_chan: script_chan.clone(),
-                    pipeline,
-                    walker: walker.clone(),
-                    style_rules: RefCell::new(HashMap::new()),
-                };
-                actors.register_later(Box::new(node_actor));
-                name
+        let actor = self.name();
+        let host = node_info.host.as_ref().and_then(|host_id| {
+            if registry.script_actor_registered(host_id) {
+                Some(registry.script_to_actor(host_id))
             } else {
-                actors.script_to_actor(id.to_string())
+                None
             }
-        };
+        });
 
-        let actor = get_or_register_node_actor(&self.unique_id);
-        let host = self
-            .host
-            .as_ref()
-            .map(|host_id| get_or_register_node_actor(host_id));
+        let browsing_context = registry
+            .find::<WalkerActor>(&self.walker_name)
+            .browsing_context_actor(registry);
+        let script_chan = browsing_context.script_chan();
+        let pipeline = browsing_context.pipeline_id();
+        let script_id = registry.actor_to_script(actor.into());
 
-        let name = actors.actor_to_script(actor.clone());
-
-        // If a node only has a single text node as a child whith a small enough text,
+        // If a node only has a single text node as a child with a small enough text,
         // return it with this node as an `inlineTextChild`.
         let inline_text_child = (|| {
             // TODO: Also return if this node is a flex element.
-            if self.num_children != 1 || self.node_name == "SLOT" {
+            if node_info.num_children != 1 || node_info.node_name == "SLOT" {
                 return None;
             }
 
-            let (tx, rx) = ipc::channel().ok()?;
+            let (tx, rx) = generic_channel::channel()?;
             script_chan
-                .send(GetChildren(pipeline, name.clone(), tx))
+                .send(DevtoolScriptControlMsg::GetChildren(
+                    pipeline,
+                    script_id.clone(),
+                    tx,
+                ))
                 .unwrap();
             let mut children = rx.recv().ok()??;
 
             let child = children.pop()?;
-            let msg = child.encode(actors, true, script_chan.clone(), pipeline, walker);
+            let node_actor = NodeActor::register_or_update(registry, &self.walker_name, child);
+            let msg = node_actor.encode(registry);
 
             // If the node child is not a text node, do not represent it inline.
             if msg.node_type != TEXT_NODE {
@@ -250,47 +348,57 @@ impl NodeInfoToProtocol for NodeInfo {
         })();
 
         NodeActorMsg {
-            actor,
+            actor: actor.into(),
             host,
-            base_uri: self.base_uri,
-            causes_overflow: false,
-            container_type: None,
-            display_name: self.node_name.clone().to_lowercase(),
-            display_type: self.display,
+            base_uri: node_info.base_uri.clone(),
+            display_name: node_info.node_name.to_lowercase(),
+            display_type: node_info.display.clone(),
             inline_text_child,
-            is_after_pseudo_element: false,
-            is_anonymous: false,
-            is_before_pseudo_element: false,
-            is_direct_shadow_host_child: None,
-            is_displayed: display,
+            is_displayed: node_info.is_displayed,
             is_in_html_document: Some(true),
-            is_marker_pseudo_element: false,
-            is_native_anonymous: false,
-            is_scrollable: false,
-            is_shadow_host: self.is_shadow_host,
-            is_shadow_root: self.shadow_root_mode.is_some(),
-            is_top_level_document: self.is_top_level_document,
-            node_name: self.node_name,
-            node_type: self.node_type,
-            node_value: self.node_value,
-            num_children: self.num_children,
-            parent: actors.script_to_actor(self.parent.clone()),
-            shadow_root_mode: self
+            is_shadow_host: node_info.is_shadow_host,
+            is_shadow_root: node_info.shadow_root_mode.is_some(),
+            is_top_level_document: node_info.is_top_level_document,
+            node_name: node_info.node_name.clone(),
+            node_type: node_info.node_type,
+            node_value: node_info.node_value.clone(),
+            num_children: node_info.num_children,
+            parent: registry.script_to_actor(&node_info.parent),
+            shadow_root_mode: node_info
                 .shadow_root_mode
                 .as_ref()
                 .map(ShadowRootMode::to_string),
-            traits: HashMap::new(),
-            attrs: self
+            attrs: node_info
                 .attrs
-                .into_iter()
+                .iter()
                 .map(|attr| AttrMsg {
-                    name: attr.name,
-                    value: attr.value,
+                    name: attr.name.clone(),
+                    value: attr.value.clone(),
                 })
                 .collect(),
-            name: self.doctype_name,
-            public_id: self.doctype_public_identifier,
-            system_id: self.doctype_system_identifier,
+            name: node_info.doctype_name.clone(),
+            public_id: node_info.doctype_public_identifier.clone(),
+            system_id: node_info.doctype_system_identifier.clone(),
+            has_event_listeners: node_info.has_event_listeners,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<EventListenerInfo> for DevtoolsEventListenerInfo {
+    fn from(event_listener_info: EventListenerInfo) -> Self {
+        Self {
+            r#type: event_listener_info.event_type,
+            handler: "todo".to_owned(),
+            capturing: event_listener_info.capturing,
+            origin: "todo".to_owned(),
+            tags: "".to_owned(),
+            hide: Value::Object(Default::default()),
+            native: false,
+            source_actor: "todo".to_owned(),
+            enabled: true,
+            is_user_defined: false,
+            event_listener_info_id: "todo".to_owned(),
         }
     }
 }

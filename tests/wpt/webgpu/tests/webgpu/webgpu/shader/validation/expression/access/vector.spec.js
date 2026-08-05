@@ -150,6 +150,10 @@ const kConcreteCases = {
   xyxz_rbg_yx: { wgsl: 'let r : vec2<T> = v.xyxz.rbg.yx;', ok: (width) => width > 2 },
   wxyz_bga_xy: { wgsl: 'let r : vec2<T> = v.wxyz.bga.xy;', ok: (width) => width > 3 },
 
+  // mixed swizzle and indexing
+  xy_0: { wgsl: 'let r = v.xy[0];', result_width: 1, ok: true },
+  xy_3: { wgsl: 'let r = v.xy[3];', ok: false },
+
   // error: invalid convenience letterings
   xq: { wgsl: 'let r : vec2<T> = v.xq;', ok: false },
   py: { wgsl: 'let r : vec2<T> = v.py;', ok: false },
@@ -358,6 +362,10 @@ const kAbstractCases = {
     ok: (width) => width > 3
   },
 
+  // mixed swizzle and indexing
+  xy_0: { wgsl: 'const r = V.xy[0];', result_width: 1, ok: true },
+  xy_3: { wgsl: 'const r = V.xy[3];', ok: false },
+
   // error: invalid convenience letterings
   xq: { wgsl: 'const r = V.xq;', ok: false },
   py: { wgsl: 'const r = V.py;', ok: false },
@@ -393,11 +401,6 @@ combine('element_type', ['i32', 'u32', 'f32', 'f16', 'bool']).
 beginSubcases().
 combine('case', keysOf(kConcreteCases))
 ).
-beforeAllSubcases((t) => {
-  if (t.params.element_type === 'f16') {
-    t.selectDeviceOrSkipTestCase('shader-f16');
-  }
-}).
 fn((t) => {
   const c = kConcreteCases[t.params.case];
   const enables = t.params.element_type === 'f16' ? 'enable f16;' : '';
@@ -442,11 +445,6 @@ combine('concrete_type', ['u32', 'i32', 'f32', 'f16']).
 beginSubcases().
 combine('case', keysOf(kAbstractCases))
 ).
-beforeAllSubcases((t) => {
-  if (t.params.concrete_type === 'f16') {
-    t.selectDeviceOrSkipTestCase('shader-f16');
-  }
-}).
 fn((t) => {
   const enables = t.params.concrete_type === 'f16' ? 'enable f16;' : '';
   const c = kAbstractCases[t.params.case];

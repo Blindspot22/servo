@@ -9,6 +9,7 @@ use euclid::{
     Angle, Point2D, Rect, RigidTransform3D, Rotation3D, Size2D, Transform3D, UnknownUnit, Vector3D,
 };
 use glow::{self as gl, Context as Gl, HasContext};
+use profile_traits::generic_callback::GenericCallback as ProfileGenericCallback;
 use raw_window_handle::DisplayHandle;
 use surfman::chains::{PreserveBuffer, SwapChain, SwapChainAPI, SwapChains, SwapChainsAPI};
 use surfman::{
@@ -21,7 +22,7 @@ use webxr_api::{
     Display, Error, Event, EventBuffer, Floor, Frame, InputSource, LEFT_EYE, LayerGrandManager,
     LayerId, LayerInit, LayerManager, Native, Quitter, RIGHT_EYE, Session, SessionBuilder,
     SessionInit, SessionMode, SomeEye, VIEWER, View, Viewer, ViewerPose, Viewport, Viewports,
-    Views, WebXrSender,
+    Views,
 };
 
 use crate::{SurfmanGL, SurfmanLayerManager};
@@ -52,7 +53,7 @@ pub trait GlWindow {
     fn get_mode(&self) -> GlWindowMode {
         GlWindowMode::Blit
     }
-    fn display_handle(&self) -> DisplayHandle;
+    fn display_handle(&self) -> DisplayHandle<'_>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,7 +156,7 @@ impl DeviceAPI for GlWindowDevice {
     fn viewports(&self) -> Viewports {
         let size = self.viewport_size();
         let viewports = match self.window.get_mode() {
-            #[allow(clippy::erasing_op, clippy::identity_op)]
+            #[expect(clippy::erasing_op, clippy::identity_op)]
             GlWindowMode::Cubemap | GlWindowMode::Spherical => vec![
                 Rect::new(Point2D::new(size.width * 1, size.height * 1), size),
                 Rect::new(Point2D::new(size.width * 0, size.height * 1), size),
@@ -279,7 +280,7 @@ impl DeviceAPI for GlWindowDevice {
             Some(target_swap_chain) => {
                 // Rendering to a surfman swap chain
                 target_swap_chain
-                    .swap_buffers(&mut self.device, &mut self.context, PreserveBuffer::No)
+                    .swap_buffers(&self.device, &mut self.context, PreserveBuffer::No)
                     .unwrap();
             },
             None => {
@@ -305,7 +306,7 @@ impl DeviceAPI for GlWindowDevice {
         vec![]
     }
 
-    fn set_event_dest(&mut self, dest: WebXrSender<Event>) {
+    fn set_event_dest(&mut self, dest: ProfileGenericCallback<Event>) {
         self.events.upgrade(dest)
     }
 
@@ -465,9 +466,9 @@ impl GlWindowDevice {
         }
         let swap_chains = self.swap_chains.clone();
         let viewports = self.viewports();
-        let layer_manager = self.grand_manager.create_layer_manager(move |_, _| {
-            Ok(SurfmanLayerManager::new(viewports, swap_chains))
-        })?;
+        let layer_manager = self
+            .grand_manager
+            .create_layer_manager(move |_| Ok(SurfmanLayerManager::new(viewports, swap_chains)))?;
         self.layer_manager = Some(layer_manager);
         Ok(self.layer_manager.as_mut().unwrap())
     }
@@ -588,17 +589,13 @@ impl GlWindowDevice {
         let viewport_size = self.viewport_size();
         let aspect = viewport_size.width as f32 / viewport_size.height as f32;
 
-        // Dear rustfmt, This is a 4x4 matrix, please leave it alone. Best, ajeffrey.
-        {
-            #[rustfmt::skip]
-            // Sigh, row-major vs column-major
-            return Transform3D::new(
-                f / aspect, 0.0, 0.0,                   0.0,
-                0.0,        f,   0.0,                   0.0,
-                0.0,        0.0, (far + near) * nf,     -1.0,
-                0.0,        0.0, 2.0 * far * near * nf, 0.0,
-            );
-        }
+        // Sigh, row-major vs column-major
+        Transform3D::from_arrays([
+            [f / aspect, 0.0, 0.0, 0.0],
+            [0.0, f, 0.0, 0.0],
+            [0.0, 0.0, (far + near) * nf, -1.0],
+            [0.0, 0.0, 2.0 * far * near * nf, 0.0],
+        ])
     }
 }
 

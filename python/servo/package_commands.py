@@ -7,15 +7,11 @@
 # option. This file may not be copied, modified, or distributed
 # except according to those terms.
 
-from datetime import datetime
 import random
-import time
 from typing import List
-from github import Github
 
-import hashlib
-import io
-import json
+import time
+import re
 import os
 import os.path as path
 import shutil
@@ -39,49 +35,23 @@ from servo.command_base import (
     CommandBase,
     is_windows,
 )
-from servo.util import delete, get_target_dir
+from servo.util import delete
 
-PACKAGES = {
-    'android': [
-        'android/aarch64-linux-android/release/servoapp.apk',
-        'android/aarch64-linux-android/release/servoview.aar',
-    ],
-    'linux': [
-        'production/servo-tech-demo.tar.gz',
-    ],
-    'mac': [
-        'production/servo-tech-demo.dmg',
-    ],
-    'windows-msvc': [
-        r'production\msi\Servo.exe',
-        r'production\msi\Servo.zip',
-    ],
-    'ohos': [
-        ('openharmony/aarch64-unknown-linux-ohos/release/entry/build/'
-            'default/outputs/default/servoshell-default-signed.hap')
-    ],
-}
+from python.servo.platform.build_target import SanitizerKind
+from servo.platform.build_target import is_android, is_openharmony
 
 
-def packages_for_platform(platform):
-    target_dir = get_target_dir()
-
-    for package in PACKAGES[platform]:
-        yield path.join(target_dir, package)
+def listfiles(directory: str) -> list[str]:
+    return [f for f in os.listdir(directory) if path.isfile(path.join(directory, f))]
 
 
-def listfiles(directory):
-    return [f for f in os.listdir(directory)
-            if path.isfile(path.join(directory, f))]
-
-
-def copy_windows_dependencies(binary_path, destination):
+def copy_windows_dependencies(binary_path: str, destination: str) -> None:
     for f in os.listdir(binary_path):
         if os.path.isfile(path.join(binary_path, f)) and f.endswith(".dll"):
             shutil.copy(path.join(binary_path, f), destination)
 
 
-def check_call_with_randomized_backoff(args: List[str], retries: int) -> int:
+def check_call_with_randomized_backoff(args: list[str], retries: int) -> int:
     """
     Run the given command-line arguments via `subprocess.check_call()`. If the command
     fails sleep for a random number of seconds between 2 and 5 and then try to the command
@@ -99,30 +69,92 @@ def check_call_with_randomized_backoff(args: List[str], retries: int) -> int:
         return check_call_with_randomized_backoff(args, retries - 1)
 
 
+def copy_packaged_resources(top_dir: str, destination: str) -> None:
+    os.makedirs(destination, exist_ok=True)
+    shutil.copytree(path.join(top_dir, "resources"), destination, dirs_exist_ok=True)
+    shutil.copytree(
+        path.join(top_dir, "components", "default-resources", "resources"),
+        path.join(destination, "named_resources"),
+        dirs_exist_ok=True,
+    )
+
+
 @CommandProvider
 class PackageCommands(CommandBase):
-    @Command('package',
-             description='Package Servo',
-             category='package')
-    @CommandArgument('--android',
-                     default=None,
-                     action='store_true',
-                     help='Package Android')
-    @CommandArgument('--ohos',
-                     default=None,
-                     action='store_true',
-                     help='Package OpenHarmony')
-    @CommandArgument('--target', '-t',
-                     default=None,
-                     help='Package for given target platform')
+    @staticmethod
+    def _replace_workspace_version(content: str, new_version: str) -> str:
+        """
+        Given the `content` of servo's workspace Cargo.toml, update the workspace version to
+        `new_version` and return the modified Cargo.toml content.
+        """
+        lines = content.splitlines()
+        section_header = "[workspace.package]"
+        in_section = False
+
+        for index, line in enumerate(lines):
+            stripped_line = line.strip()
+            if stripped_line == section_header:
+                in_section = True
+                continue
+
+            if in_section and stripped_line.startswith("[") and stripped_line.endswith("]"):
+                break
+
+            if in_section and stripped_line.startswith("version"):
+                lines[index] = f'version = "{new_version}"'
+                return "\n".join(lines)
+
+        raise ValueError("Failed to update workspace package version.")
+
+    @staticmethod
+    def _replace_path_versions(content: str, new_version: str) -> str:
+        """
+        Given content of the workspace Cargo.toml file, update the version requirements of `path`
+        dependencies that are versioned with the workspace version.
+        We mark the relevant section in our Cargo.toml so we can easily find the dependencies
+        we need to update the version of.
+        """
+        begin_marker = "# Begin workspace-version dependencies - Don't change this comment, we grep for it in scripts!"
+        end_marker = "# End workspace-version dependencies - Don't change this comment, we grep for it in scripts!"
+        block_start = content.find(begin_marker)
+        if block_start == -1:
+            raise ValueError(f"Could not find begin marker: {begin_marker}")
+
+        block_start += len(begin_marker)
+        block_end = content.find(end_marker, block_start)
+        if block_end == -1:
+            raise ValueError(f"Could not find end marker: {end_marker}")
+
+        block = content[block_start:block_end]
+        updated_block, count = re.subn(r'version\s*=\s*"[^"]*"', f'version = "={new_version}"', block)
+        if count == 0:
+            raise ValueError("No workspace-version dependency references found in Cargo.toml.")
+        elif count == 1:
+            raise RuntimeError(
+                "Our regex only updated one version, but we expect to have many. Please check the regex."
+            )
+
+        return f"{content[:block_start]}{updated_block}{content[block_end:]}"
+
+    @Command("package", description="Package Servo", category="package")
+    @CommandArgument("--android", default=None, action="store_true", help="Package Android")
+    @CommandArgument("--ohos", default=None, action="store_true", help="Package OpenHarmony")
+    @CommandArgument("--target", "-t", default=None, help="Package for given target platform")
+    @CommandArgument("--preserve-app", action="store_true", help="On macOS, keep the .app bundle after packaging")
     @CommandBase.common_command_arguments(build_configuration=False, build_type=True, package_configuration=True)
     @CommandBase.allow_target_configuration
-    def package(self, build_type: BuildType, flavor=None, with_asan=False):
+    def package(
+        self,
+        build_type: BuildType,
+        flavor: str | None = None,
+        sanitizer: SanitizerKind = SanitizerKind.NONE,
+        preserve_app: bool = False,
+    ) -> int | None:
         env = self.build_env()
-        binary_path = self.get_binary_path(build_type, asan=with_asan)
+        binary_path = self.get_binary_path(build_type, sanitizer=sanitizer)
         dir_to_root = self.get_top_dir()
         target_dir = path.dirname(binary_path)
-        if self.is_android():
+        if is_android(self.target):
             target_triple = self.target.triple()
             if "aarch64" in target_triple:
                 arch_string = "Arm64"
@@ -137,22 +169,22 @@ class PackageCommands(CommandBase):
 
             if build_type.is_dev():
                 build_type_string = "Debug"
-            elif build_type.is_release():
+            elif build_type.is_release() or build_type.is_prod() or build_type.profile == "checked-release":
                 build_type_string = "Release"
             else:
-                raise Exception("TODO what should this be?")
+                print(f"Servo was built with custom cargo profile `{build_type.profile}`.")
+                print("Using Debug build for gradle.")
+                build_type_string = "Debug"
+            # Inform the android build of where `libservoshell.so` is located.
+            env["SERVO_TARGET_DIR"] = target_dir
 
-            flavor_name = "Basic"
-            if flavor is not None:
-                flavor_name = flavor.title()
-
-            dir_to_resources = path.join(self.get_top_dir(), 'target', 'android', 'resources')
+            dir_to_resources = path.join(self.get_top_dir(), "target", target_triple, "resources")
             if path.exists(dir_to_resources):
                 delete(dir_to_resources)
 
-            shutil.copytree(path.join(dir_to_root, 'resources'), dir_to_resources)
+            copy_packaged_resources(dir_to_root, dir_to_resources)
 
-            variant = ":assemble" + flavor_name + arch_string + build_type_string
+            variant = ":assemble" + arch_string + build_type_string
             apk_task_name = ":servoapp" + variant
             aar_task_name = ":servoview" + variant
             argv = ["./gradlew", "--no-daemon", apk_task_name, aar_task_name]
@@ -162,21 +194,18 @@ class PackageCommands(CommandBase):
             except subprocess.CalledProcessError as e:
                 print("Packaging Android exited with return value %d" % e.returncode)
                 return e.returncode
-        elif self.is_openharmony():
+        elif is_openharmony(self.target):
             # hvigor doesn't support an option to place output files in a specific directory
             # so copy the source files into the target/openharmony directory first.
             ohos_app_dir = path.join(self.get_top_dir(), "support", "openharmony")
             build_mode = build_type.directory_name()
-            ohos_target_dir = path.join(
-                self.get_top_dir(), "target", "openharmony", self.target.triple(), build_mode)
+            ohos_target_dir = path.join(self.get_top_dir(), "target", "openharmony", self.target.triple(), build_mode)
             if path.exists(ohos_target_dir):
                 print("Cleaning up from previous packaging")
                 delete(ohos_target_dir)
             shutil.copytree(ohos_app_dir, ohos_target_dir)
-            resources_src_dir = path.join(self.get_top_dir(), "resources")
             resources_app_dir = path.join(ohos_target_dir, "AppScope", "resources", "resfile", "servo")
-            os.makedirs(resources_app_dir, exist_ok=True)
-            shutil.copytree(resources_src_dir, resources_app_dir, dirs_exist_ok=True)
+            copy_packaged_resources(self.get_top_dir(), str(resources_app_dir))
 
             # Map non-debug profiles to 'release' buildMode HAP.
             if build_type.is_custom():
@@ -186,21 +215,33 @@ class PackageCommands(CommandBase):
             if flavor is not None:
                 flavor_name = flavor
 
-            hvigor_command = ["--no-daemon", "assembleHap",
-                              "-p", f"product={flavor_name}",
-                              "-p", f"buildMode={build_mode}"]
+            hvigor_command = [
+                "--no-daemon",
+                "assembleHap",
+                "-p",
+                f"product={flavor_name}",
+                "-p",
+                f"buildMode={build_mode}",
+            ]
+            if sanitizer.is_asan():
+                hvigor_command.extend(["-p", "ohos-debug-asan=true"])
+            elif sanitizer.is_tsan():
+                hvigor_command.extend(["-p", "ohos-enable-tsan=true"])
+
             # Detect if PATH already has hvigor, or else fallback to npm installation
             # provided via HVIGOR_PATH
             if "HVIGOR_PATH" not in env:
                 try:
                     with cd(ohos_target_dir):
                         version = check_output(["hvigorw", "--version", "--no-daemon"])
-                    print(f"Found `hvigorw` with version {str(version, 'utf-8').strip()} in system PATH")
+                    print(f"Found `hvigorw` with version {version.strip()} in system PATH")
                     hvigor_command[0:0] = ["hvigorw"]
                 except FileNotFoundError:
-                    print("Unable to find `hvigor` tool. Please either modify PATH to include the"
-                          "path to hvigorw or set the HVIGOR_PATH environment variable to the npm"
-                          "installation containing `node_modules` directory with hvigor modules.")
+                    print(
+                        "Unable to find `hvigor` tool. Please either modify PATH to include the"
+                        "path to hvigorw or set the HVIGOR_PATH environment variable to the npm"
+                        "installation containing `node_modules` directory with hvigor modules."
+                    )
                     sys.exit(1)
                 except subprocess.CalledProcessError as e:
                     print(f"hvigor exited with the following error: {e}")
@@ -212,7 +253,6 @@ class PackageCommands(CommandBase):
                 env["NODE_PATH"] = env["HVIGOR_PATH"] + "/node_modules"
                 hvigor_script = f"{env['HVIGOR_PATH']}/node_modules/@ohos/hvigor/bin/hvigor.js"
                 hvigor_command[0:0] = ["node", hvigor_script]
-
             abi_string = self.target.abi_string()
             ohos_libs_dir = path.join(ohos_target_dir, "entry", "libs", abi_string)
             os.makedirs(ohos_libs_dir)
@@ -227,42 +267,45 @@ class PackageCommands(CommandBase):
             except subprocess.CalledProcessError as e:
                 print("Packaging OpenHarmony exited with return value %d" % e.returncode)
                 return e.returncode
-        elif 'darwin' in self.target.triple():
+        elif "darwin" in self.target.triple():
             print("Creating Servo.app")
-            dir_to_dmg = path.join(target_dir, 'dmg')
-            dir_to_app = path.join(dir_to_dmg, 'Servo.app')
-            dir_to_resources = path.join(dir_to_app, 'Contents', 'Resources')
+            dir_to_dmg = path.join(target_dir, "dmg")
+            dir_to_app = path.join(dir_to_dmg, "Servo.app")
+            dir_to_resources = path.join(dir_to_app, "Contents", "Resources")
             if path.exists(dir_to_dmg):
                 print("Cleaning up from previous packaging")
                 delete(dir_to_dmg)
 
             print("Copying files")
-            shutil.copytree(path.join(dir_to_root, 'resources'), dir_to_resources)
-            shutil.copy2(path.join(dir_to_root, 'Info.plist'), path.join(dir_to_app, 'Contents', 'Info.plist'))
+            copy_packaged_resources(dir_to_root, dir_to_resources)
+            shutil.copy2(
+                path.join(dir_to_root, "ports/servoshell/platform/macos/Info.plist"),
+                path.join(dir_to_app, "Contents", "Info.plist"),
+            )
 
-            content_dir = path.join(dir_to_app, 'Contents', 'MacOS')
-            lib_dir = path.join(content_dir, 'lib')
+            content_dir = path.join(dir_to_app, "Contents", "MacOS")
+            lib_dir = path.join(content_dir, "lib")
             os.makedirs(lib_dir)
             shutil.copy2(binary_path, content_dir)
 
             print("Packaging GStreamer...")
-            dmg_binary = path.join(content_dir, "servo")
+            dmg_binary = path.join(content_dir, "servoshell")
             servo.gstreamer.package_gstreamer_dylibs(dmg_binary, lib_dir, self.target)
 
             print("Adding version to Credits.rtf")
-            version_command = [binary_path, '--version']
-            p = subprocess.Popen(version_command,
-                                 stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE,
-                                 universal_newlines=True)
+            version_command = [binary_path, "--version"]
+            p = subprocess.Popen(
+                version_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+            )
             version, stderr = p.communicate()
             if p.returncode != 0:
                 raise Exception("Error occurred when getting Servo version: " + stderr)
             version = "Nightly version: " + version
 
             import mako.template
-            template_path = path.join(dir_to_resources, 'Credits.rtf.mako')
-            credits_path = path.join(dir_to_resources, 'Credits.rtf')
+
+            template_path = path.join(dir_to_resources, "Credits.rtf.mako")
+            credits_path = path.join(dir_to_resources, "Credits.rtf")
             with open(template_path) as template_file:
                 template = mako.template.Template(template_file.read())
                 with open(credits_path, "w") as credits_file:
@@ -270,7 +313,7 @@ class PackageCommands(CommandBase):
             delete(template_path)
 
             print("Creating dmg")
-            os.symlink('/Applications', path.join(dir_to_dmg, 'Applications'))
+            os.symlink("/Applications", path.join(dir_to_dmg, "Applications"))
             dmg_path = path.join(target_dir, "servo-tech-demo.dmg")
 
             if path.exists(dmg_path):
@@ -282,146 +325,171 @@ class PackageCommands(CommandBase):
             # after a random wait.
             try:
                 check_call_with_randomized_backoff(
-                    ['hdiutil', 'create', '-volname', 'Servo',
-                     '-megabytes', '900', dmg_path,
-                     '-srcfolder', dir_to_dmg],
-                    retries=3)
+                    ["hdiutil", "create", "-volname", "Servo", "-megabytes", "900", dmg_path, "-srcfolder", dir_to_dmg],
+                    retries=3,
+                )
             except subprocess.CalledProcessError as e:
                 print("Packaging MacOS dmg exited with return value %d" % e.returncode)
                 return e.returncode
+
+            if preserve_app:
+                preserved_app = path.join(target_dir, "Servo.app")
+                if path.exists(preserved_app):
+                    delete(preserved_app)
+                shutil.copytree(dir_to_app, preserved_app)
+                print("Preserved app bundle at " + preserved_app)
 
             print("Cleaning up")
             delete(dir_to_dmg)
             print("Packaged Servo into " + dmg_path)
 
-        elif 'windows' in self.target.triple():
-            dir_to_msi = path.join(target_dir, 'msi')
+        elif "windows" in self.target.triple():
+            dir_to_msi = path.join(target_dir, "msi")
             if path.exists(dir_to_msi):
                 print("Cleaning up from previous packaging")
                 delete(dir_to_msi)
             os.makedirs(dir_to_msi)
 
             print("Copying files")
-            dir_to_temp = path.join(dir_to_msi, 'temp')
-            dir_to_resources = path.join(dir_to_temp, 'resources')
-            shutil.copytree(path.join(dir_to_root, 'resources'), dir_to_resources)
+            dir_to_temp = path.join(dir_to_msi, "temp")
+            dir_to_resources = path.join(dir_to_temp, "resources")
+            copy_packaged_resources(dir_to_root, dir_to_resources)
             shutil.copy(binary_path, dir_to_temp)
             copy_windows_dependencies(target_dir, dir_to_temp)
 
-            # generate Servo.wxs
+            # generate ServoShell.wxs
             import mako.template
-            template_path = path.join(dir_to_root, "support", "windows", "Servo.wxs.mako")
+
+            template_path = path.join(dir_to_root, "support", "windows", "ServoShell.wxs.mako")
             template = mako.template.Template(open(template_path).read())
             wxs_path = path.join(dir_to_msi, "Installer.wxs")
-            open(wxs_path, "w").write(template.render(
-                exe_path=target_dir,
-                dir_to_temp=dir_to_temp,
-                resources_path=dir_to_resources))
+            open(wxs_path, "w").write(
+                template.render(exe_path=target_dir, dir_to_temp=dir_to_temp, resources_path=dir_to_resources)
+            )
 
-            # run candle and light
+            # NOTE: `-acceptEula` below is accepting the conditions of WiX's
+            # Open Source Maintenance Fee. Servo is exempt per this clause in
+            # version 1.1 of the text, see https://github.com/wixtoolset/wix/blob/c5b1c40cd44145a24cb82349d988e7abdd0b94d5/OSMFEULA.txt
+            # > The Fee applies only to Users that use the Software as part of
+            # > revenue-generating activities and have an annual gross revenue
+            # > greater than or equal to US$10,000.
+
+            # Create the MSI installer.
             print("Creating MSI")
             try:
                 with cd(dir_to_msi):
-                    subprocess.check_call(['candle', wxs_path])
+                    subprocess.check_call(["wix", "build", "-arch", "x64", "-acceptEula", "wix7", wxs_path])
             except subprocess.CalledProcessError as e:
-                print("WiX candle exited with return value %d" % e.returncode)
-                return e.returncode
-            try:
-                wxsobj_path = "{}.wixobj".format(path.splitext(wxs_path)[0])
-                with cd(dir_to_msi):
-                    subprocess.check_call(['light', wxsobj_path])
-            except subprocess.CalledProcessError as e:
-                print("WiX light exited with return value %d" % e.returncode)
+                print("WiX build exited with return value %d" % e.returncode)
                 return e.returncode
             dir_to_installer = path.join(dir_to_msi, "Installer.msi")
             print("Packaged Servo into " + dir_to_installer)
 
+            # Register the WiX extension used by the bundle below. The extension is fetched
+            # from NuGet and cached under %USERPROFILE%\.wix\extensions. Pin the version to
+            # match the WiX toolset so the cache can be pre-populated on offline runners.
+            print("Registering WiX extensions")
+            extension = "WixToolset.BootstrapperApplications.wixext/7.0.0"
+            result = subprocess.run(
+                ["wix", "extension", "add", "-acceptEula", "wix7", "-g", extension],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                # `wix extension add` fails silently (exit code 2 with no output) when the
+                # extension cannot be resolved from NuGet.
+                print(result.stdout)
+                print(result.stderr)
+                print(
+                    f"WiX extension add exited with return value {result.returncode}. "
+                    f"The extension '{extension}' could not be added to the cache, most likely "
+                    "because it could not be downloaded from NuGet. Ensure the runner can reach "
+                    "nuget.org, or pre-populate the WiX extension cache (%USERPROFILE%\\.wix\\extensions)."
+                )
+                return result.returncode
+
             # Generate bundle with Servo installer.
             print("Creating bundle")
-            shutil.copy(path.join(dir_to_root, 'support', 'windows', 'Servo.wxs'), dir_to_msi)
-            bundle_wxs_path = path.join(dir_to_msi, 'Servo.wxs')
+            shutil.copy(path.join(dir_to_root, "support", "windows", "ServoShell.wxs"), dir_to_msi)
+            bundle_wxs_path = path.join(dir_to_msi, "ServoShell.wxs")
             try:
                 with cd(dir_to_msi):
-                    subprocess.check_call(['candle', bundle_wxs_path, '-ext', 'WixBalExtension'])
+                    subprocess.check_call(
+                        [
+                            "wix",
+                            "build",
+                            "-acceptEula",
+                            "wix7",
+                            "-ext",
+                            "WixToolset.BootstrapperApplications.wixext",
+                            bundle_wxs_path,
+                        ]
+                    )
             except subprocess.CalledProcessError as e:
-                print("WiX candle exited with return value %d" % e.returncode)
+                print("WiX build exited with return value %d" % e.returncode)
                 return e.returncode
-            try:
-                wxsobj_path = "{}.wixobj".format(path.splitext(bundle_wxs_path)[0])
-                with cd(dir_to_msi):
-                    subprocess.check_call(['light', wxsobj_path, '-ext', 'WixBalExtension'])
-            except subprocess.CalledProcessError as e:
-                print("WiX light exited with return value %d" % e.returncode)
-                return e.returncode
-            print("Packaged Servo into " + path.join(dir_to_msi, "Servo.exe"))
+            print("Packaged Servo into " + path.join(dir_to_msi, "ServoShell.exe"))
 
             print("Creating ZIP")
-            zip_path = path.join(dir_to_msi, "Servo.zip")
-            archive_deterministically(dir_to_temp, zip_path, prepend_path='servo/')
+            zip_path = path.join(dir_to_msi, "ServoShell.zip")
+            archive_deterministically(dir_to_temp, zip_path, prepend_path="servo/")
             print("Packaged Servo into " + zip_path)
 
             print("Cleaning up")
             delete(dir_to_temp)
             delete(dir_to_installer)
         else:
-            dir_to_temp = path.join(target_dir, 'packaging-temp')
+            dir_to_temp = path.join(target_dir, "packaging-temp")
             if path.exists(dir_to_temp):
                 # TODO(aneeshusa): lock dir_to_temp to prevent simultaneous builds
                 print("Cleaning up from previous packaging")
                 delete(dir_to_temp)
 
             print("Copying files")
-            dir_to_resources = path.join(dir_to_temp, 'resources')
-            shutil.copytree(path.join(dir_to_root, 'resources'), dir_to_resources)
+            dir_to_resources = path.join(dir_to_temp, "resources")
+            copy_packaged_resources(dir_to_root, dir_to_resources)
             shutil.copy(binary_path, dir_to_temp)
 
             print("Creating tarball")
-            tar_path = path.join(target_dir, 'servo-tech-demo.tar.gz')
+            tar_path = path.join(target_dir, "servo-tech-demo.tar.gz")
 
-            archive_deterministically(dir_to_temp, tar_path, prepend_path='servo/')
+            archive_deterministically(dir_to_temp, tar_path, prepend_path="servo/")
 
             print("Cleaning up")
             delete(dir_to_temp)
             print("Packaged Servo into " + tar_path)
 
-    @Command('install',
-             description='Install Servo (currently, Android and Windows only)',
-             category='package')
-    @CommandArgument('--android',
-                     action='store_true',
-                     help='Install on Android')
-    @CommandArgument('--ohos',
-                     action='store_true',
-                     help='Install on OpenHarmony')
-    @CommandArgument('--emulator',
-                     action='store_true',
-                     help='For Android, install to the only emulated device')
-    @CommandArgument('--usb',
-                     action='store_true',
-                     help='For Android, install to the only USB device')
-    @CommandArgument('--target', '-t',
-                     default=None,
-                     help='Install the given target platform')
+    @Command("install", description="Install Servo (currently, Android and Windows only)", category="package")
+    @CommandArgument("--android", action="store_true", help="Install on Android")
+    @CommandArgument("--ohos", action="store_true", help="Install on OpenHarmony")
+    @CommandArgument("--emulator", action="store_true", help="For Android, install to the only emulated device")
+    @CommandArgument("--usb", action="store_true", help="For Android, install to the only USB device")
+    @CommandArgument("--target", "-t", default=None, help="Install the given target platform")
     @CommandBase.common_command_arguments(build_configuration=False, build_type=True, package_configuration=True)
     @CommandBase.allow_target_configuration
-    def install(self, build_type: BuildType, emulator=False, usb=False, with_asan=False, flavor=None):
+    def install(
+        self,
+        build_type: BuildType,
+        emulator: bool = False,
+        usb: bool = False,
+        sanitizer: SanitizerKind = SanitizerKind.NONE,
+        flavor: str | None = None,
+    ) -> int:
         env = self.build_env()
         try:
-            binary_path = self.get_binary_path(build_type, asan=with_asan)
+            binary_path = self.get_binary_path(build_type, sanitizer=sanitizer)
         except BuildNotFound:
             print("Servo build not found. Building servo...")
-            result = Registrar.dispatch(
-                "build", context=self.context, build_type=build_type, flavor=flavor
-            )
+            result = Registrar.dispatch("build", context=self.context, build_type=build_type, flavor=flavor)
             if result:
                 return result
             try:
-                binary_path = self.get_binary_path(build_type, asan=with_asan)
+                binary_path = self.get_binary_path(build_type, sanitizer=sanitizer)
             except BuildNotFound:
                 print("Rebuilding Servo did not solve the missing build problem.")
                 return 1
 
-        if self.is_android():
+        if is_android(self.target):
             pkg_path = self.target.get_package_path(build_type.directory_name())
             exec_command = [self.android_adb_path(env)]
             if emulator and usb:
@@ -432,148 +500,132 @@ class PackageCommands(CommandBase):
             if usb:
                 exec_command += ["-d"]
             exec_command += ["install", "-r", pkg_path]
-        elif self.is_openharmony():
+        elif is_openharmony(self.target):
             pkg_path = self.target.get_package_path(build_type.directory_name(), flavor=flavor)
             hdc_path = path.join(env["OHOS_SDK_NATIVE"], "../", "toolchains", "hdc")
             exec_command = [hdc_path, "install", "-r", pkg_path]
         elif is_windows():
-            pkg_path = path.join(path.dirname(binary_path), 'msi', 'Servo.msi')
+            pkg_path = path.join(path.dirname(binary_path), "msi", "Servo.msi")
             exec_command = ["msiexec", "/i", pkg_path]
+        else:
+            print("install command not supported for the current target")
+            return 1
 
         if not path.exists(pkg_path):
             print("Servo package not found. Packaging servo...")
-            result = Registrar.dispatch(
-                "package", context=self.context, build_type=build_type, flavor=flavor
-            )
+            result = Registrar.dispatch("package", context=self.context, build_type=build_type, flavor=flavor)
             if result != 0:
                 return result
 
         print(" ".join(exec_command))
         return subprocess.call(exec_command, env=env)
 
-    @Command('upload-nightly',
-             description='Upload Servo nightly to S3',
-             category='package')
-    @CommandArgument('platform',
-                     choices=PACKAGES.keys(),
-                     help='Package platform type to upload')
-    @CommandArgument('--secret-from-environment',
-                     action='store_true',
-                     help='Retrieve the appropriate secrets from the environment.')
-    @CommandArgument('--github-release-id',
-                     default=None,
-                     type=int,
-                     help='The github release to upload the nightly builds.')
-    def upload_nightly(self, platform, secret_from_environment, github_release_id):
-        import boto3
+    @Command("upload-nightly", description="Upload Servo nightly to S3", category="package")
+    @CommandArgument("platform", help="Package platform type to upload")
+    @CommandArgument(
+        "--secret-from-environment", action="store_true", help="Retrieve the appropriate secrets from the environment."
+    )
+    @CommandArgument(
+        "--github-release-id", default=None, type=int, help="The github release to upload the nightly builds."
+    )
+    @CommandArgument("packages", nargs="+", help="The packages to upload.")
+    def upload_nightly(
+        self, platform: str, secret_from_environment: bool, github_release_id: int | None, packages: List[str]
+    ) -> int:
+        print("Error: This command was moved to a dedicated script: etc/ci/upload_nightly.py", file=sys.stderr)
+        return 1
 
-        def get_s3_secret():
-            aws_access_key = None
-            aws_secret_access_key = None
-            if secret_from_environment:
-                secret = json.loads(os.environ['S3_UPLOAD_CREDENTIALS'])
-                aws_access_key = secret["aws_access_key_id"]
-                aws_secret_access_key = secret["aws_secret_access_key"]
-            return (aws_access_key, aws_secret_access_key)
+    @Command(
+        "release", description="Perform necessary updates before releasing a new servo version", category="package"
+    )
+    @CommandArgument("target", type=str, help="Target version to bump to")
+    @CommandArgument("--allow-dirty", action="store_true", help="Allow working directory to be dirty")
+    def bump_version(self, target: str, allow_dirty: bool) -> int:
+        if not allow_dirty:
+            # Check if the working directory is clean
+            status_output = check_output(["git", "status", "--porcelain"]).strip()
+            if status_output:
+                print("Working directory is dirty. Please commit or stash your changes before bumping version.")
+                print("To bypass this check, use --allow-dirty.")
+                return 1
+        print("\r ➤  Bumping version number...")
+        workspace_toml_path = path.join(self.get_top_dir(), "Cargo.toml")
+        with open(workspace_toml_path, "r") as file:
+            workspace_toml_content = file.read()
 
-        def nightly_filename(package, timestamp):
-            return '{}-{}'.format(
-                timestamp.isoformat() + 'Z',  # The `Z` denotes UTC
-                path.basename(package)
+        try:
+            workspace_toml_content = self._replace_workspace_version(workspace_toml_content, target)
+            workspace_toml_content = self._replace_path_versions(workspace_toml_content, target)
+        except (ValueError, RuntimeError) as error:
+            print(f"Failed to update workspace version: `{error}`", file=sys.stderr)
+            return 1
+
+        # Add a trailing newline to the file if it doesn't already have one.
+        if not workspace_toml_content.endswith("\n"):
+            workspace_toml_content += "\n"
+
+        with open(workspace_toml_path, "w") as file:
+            file.write(workspace_toml_content)
+
+        print("Updated occurrences in workspace Cargo.toml.")
+
+        replacements = {
+            "ports/servoshell/platform/windows/servoshell.exe.manifest": r'assemblyIdentity[^\/>]+version="(?P<version>.*?).0\"[^\/>]*\/>',
+            "support/windows/servoshell.wxs.mako": r'<Package(?:.|\n)*?\sVersion="(?P<version>[^"]*)"',
+            "ports/servoshell/platform/macos/Info.plist": r"<key>CFBundleShortVersionString</key>\n\s*<string>(?P<version>.*?)</string>",
+            "support/android/apk/servoapp/build.gradle.kts": r'versionName\s*=\s*"(?P<version>.*?)"',
+            "support/openharmony/oh-package.json5": r'"version"\s*:\s*"(?P<version>.*?)"',
+            "support/openharmony/entry/oh-package.json5": r'"version"\s*:\s*"(?P<version>.*?)"',
+        }
+
+        for filename, expression in replacements.items():
+            filepath = path.join(self.get_top_dir(), filename)
+            with open(filepath, "r") as file:
+                content = file.read()
+
+            compiled_pattern = re.compile(expression, re.MULTILINE)
+
+            new_content, count = compiled_pattern.subn(
+                lambda m: m.group(0).replace(m.group("version"), target),
+                content,
             )
 
-        def upload_to_github_release(platform, package, package_hash):
-            if not github_release_id:
-                return
-
-            extension = path.basename(package).partition('.')[2]
-            g = Github(os.environ['NIGHTLY_REPO_TOKEN'])
-            nightly_repo = g.get_repo(os.environ['NIGHTLY_REPO'])
-            release = nightly_repo.get_release(github_release_id)
-            package_hash_fileobj = io.BytesIO(package_hash.encode('utf-8'))
-
-            asset_name = f'servo-latest.{extension}'
-            release.upload_asset(package, name=asset_name)
-            release.upload_asset_from_memory(
-                package_hash_fileobj,
-                package_hash_fileobj.getbuffer().nbytes,
-                name=f'{asset_name}.sha256')
-
-        def upload_to_s3(platform, package, package_hash, timestamp):
-            (aws_access_key, aws_secret_access_key) = get_s3_secret()
-            s3 = boto3.client(
-                's3',
-                aws_access_key_id=aws_access_key,
-                aws_secret_access_key=aws_secret_access_key
-            )
-
-            cloudfront = boto3.client(
-                'cloudfront',
-                aws_access_key_id=aws_access_key,
-                aws_secret_access_key=aws_secret_access_key
-            )
-
-            BUCKET = 'servo-builds2'
-            DISTRIBUTION_ID = 'EJ8ZWSJKFCJS2'
-
-            nightly_dir = f'nightly/{platform}'
-            filename = nightly_filename(package, timestamp)
-            package_upload_key = '{}/{}'.format(nightly_dir, filename)
-            extension = path.basename(package).partition('.')[2]
-            latest_upload_key = '{}/servo-latest.{}'.format(nightly_dir, extension)
-
-            package_hash_fileobj = io.BytesIO(package_hash.encode('utf-8'))
-            latest_hash_upload_key = f'{latest_upload_key}.sha256'
-
-            s3.upload_file(package, BUCKET, package_upload_key)
-
-            copy_source = {
-                'Bucket': BUCKET,
-                'Key': package_upload_key,
-            }
-            s3.copy(copy_source, BUCKET, latest_upload_key)
-            s3.upload_fileobj(
-                package_hash_fileobj, BUCKET, latest_hash_upload_key, ExtraArgs={'ContentType': 'text/plain'}
-            )
-
-            # Invalidate previous "latest" nightly files from
-            # CloudFront edge caches
-            cloudfront.create_invalidation(
-                DistributionId=DISTRIBUTION_ID,
-                InvalidationBatch={
-                    'CallerReference': f'{latest_upload_key}-{timestamp}',
-                    'Paths': {
-                        'Quantity': 1,
-                        'Items': [
-                            f'/{latest_upload_key}*'
-                        ]
-                    }
-                }
-            )
-
-        timestamp = datetime.utcnow().replace(microsecond=0)
-        for package in packages_for_platform(platform):
-            if path.isdir(package):
-                continue
-            if not path.isfile(package):
-                print("Could not find package for {} at {}".format(
-                    platform,
-                    package
-                ), file=sys.stderr)
+            if count == 0:
+                print(f"No occurrences found in {filename} to replace.")
+                return 1
+            elif count > 1:
+                print(f"Warning: Multiple ({count}) occurrences found in {filename}. Only one expected.")
+                # Print all occurrences for debugging
+                matches = compiled_pattern.findall(content)
+                for match in matches:
+                    print(f"Found occurrence: {match}")
                 return 1
 
-            # Compute the hash
-            SHA_BUF_SIZE = 1048576  # read in 1 MiB chunks
-            sha256_digest = hashlib.sha256()
-            with open(package, 'rb') as package_file:
-                while True:
-                    data = package_file.read(SHA_BUF_SIZE)
-                    if not data:
-                        break
-                    sha256_digest.update(data)
-            package_hash = sha256_digest.hexdigest()
+            with open(filepath, "w") as file:
+                file.write(new_content)
 
-            upload_to_s3(platform, package, package_hash, timestamp)
-            upload_to_github_release(platform, package, package_hash)
-
+            print(f"Updated occurrence in {filename}.")
+        print("\r ➤  Updating license.html...")
+        # cargo about generate etc/about.hbs > resources/resource_protocol/license.html
+        if shutil.which("cargo-about") is None:
+            print("Updating license.html requires cargo-about, but it is not installed.", file=sys.stderr)
+            print("Install it with: `cargo install cargo-about --locked`", file=sys.stderr)
+            return 1
+        try:
+            # Remove resources/resource_protocol/license.html before regenerating it
+            license_html_path = path.join("resources", "resource_protocol", "license.html")
+            if path.exists(license_html_path):
+                os.remove(license_html_path)
+            subprocess.check_call(
+                [
+                    "cargo",
+                    "about",
+                    "generate",
+                    "etc/about.hbs",
+                ],
+                stdout=open("resources/resource_protocol/license.html", "w"),
+            )
+        except subprocess.CalledProcessError as e:
+            print("Updating license.html exited with return value %d" % e.returncode)
+            return e.returncode
         return 0

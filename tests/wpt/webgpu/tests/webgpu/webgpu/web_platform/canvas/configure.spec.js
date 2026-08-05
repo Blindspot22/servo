@@ -8,18 +8,25 @@ TODO:
 - Test toneMapping
 `;import { makeTestGroup } from '../../../common/framework/test_group.js';
 import { assert } from '../../../common/util/util.js';
-import { kCanvasTextureFormats, kTextureUsages } from '../../capability_info.js';
+import {
+  isValidTextureUsageCombination,
+  kCanvasTextureFormats,
+  kSomeBogusTextureUsage,
+  kTextureUsages,
+  kValidCombinationsOfOneOrTwoTextureUsages,
+  usageIsTypeErrorForConfigure } from
+'../../capability_info.js';
 import { GPUConst } from '../../constants.js';
 import {
   kAllTextureFormats,
   kFeaturesForFormats,
   filterFormatsByFeature,
-  viewCompatible } from
+  textureFormatsAreViewCompatible } from
 '../../format_info.js';
-import { GPUTest } from '../../gpu_test.js';
+import { AllFeaturesMaxLimitsGPUTest } from '../../gpu_test.js';
 import { kAllCanvasTypes, createCanvas } from '../../util/create_elements.js';
 
-export const g = makeTestGroup(GPUTest);
+export const g = makeTestGroup(AllFeaturesMaxLimitsGPUTest);
 
 g.test('defaults').
 desc(
@@ -49,7 +56,7 @@ fn((t) => {
   t.expect(configuration.usage === GPUTextureUsage.RENDER_ATTACHMENT);
   t.expect(configuration.viewFormats.length === 0);
   t.expect(configuration.colorSpace === 'srgb');
-  t.expect(configuration.toneMapping.mode === 'standard');
+  t.expect(configuration.toneMapping?.mode === 'standard');
   t.expect(configuration.alphaMode === 'opaque');
 
   const currentTexture = ctx.getCurrentTexture();
@@ -94,6 +101,11 @@ fn((t) => {
     ctx.getCurrentTexture();
   });
 
+  // Should throw on the second call to getCurrentTexture also.
+  t.shouldThrow('InvalidStateError', () => {
+    ctx.getCurrentTexture();
+  });
+
   // Calling configure with a device should succeed.
   ctx.configure({
     device: t.device,
@@ -109,7 +121,7 @@ fn((t) => {
   t.expect(configuration.usage === GPUTextureUsage.RENDER_ATTACHMENT);
   t.expect(configuration.viewFormats.length === 0);
   t.expect(configuration.colorSpace === 'srgb');
-  t.expect(configuration.toneMapping.mode === 'standard');
+  t.expect(configuration.toneMapping?.mode === 'standard');
   t.expect(configuration.alphaMode === 'opaque');
 
   // getCurrentTexture will succeed with a valid device.
@@ -140,7 +152,7 @@ fn((t) => {
   t.expect(newConfiguration.usage === GPUTextureUsage.RENDER_ATTACHMENT);
   t.expect(newConfiguration.viewFormats.length === 0);
   t.expect(newConfiguration.colorSpace === 'srgb');
-  t.expect(newConfiguration.toneMapping.mode === 'standard');
+  t.expect(newConfiguration.toneMapping?.mode === 'standard');
   t.expect(newConfiguration.alphaMode === 'premultiplied');
 });
 
@@ -155,11 +167,9 @@ u //
 .combine('canvasType', kAllCanvasTypes).
 combine('format', kAllTextureFormats)
 ).
-beforeAllSubcases((t) => {
-  t.selectDeviceForTextureFormatOrSkipTestCase(t.params.format);
-}).
 fn((t) => {
   const { canvasType, format } = t.params;
+  t.skipIfTextureFormatNotSupported(format);
   const canvas = createCanvas(t, canvasType, 2, 2);
   const ctx = canvas.getContext('webgpu');
   assert(ctx instanceof GPUCanvasContext, 'Failed to get WebGPU context from canvas');
@@ -200,18 +210,21 @@ params((u) =>
 u //
 .combine('canvasType', kAllCanvasTypes).
 beginSubcases().
-expand('usage', () => {
-  const usageSet = new Set();
-  for (const usage0 of kTextureUsages) {
-    for (const usage1 of kTextureUsages) {
-      usageSet.add(usage0 | usage1);
-    }
-  }
-  return usageSet;
-})
+combine(
+  'usage',
+  kValidCombinationsOfOneOrTwoTextureUsages
+  // TypeError cases are tested in the next test.
+  .filter((usage) => !usageIsTypeErrorForConfigure(usage))
+)
 ).
 fn((t) => {
   const { canvasType, usage } = t.params;
+
+  // MAINTENANCE_TODO(#4509): Remove this after all implementations have TRANSIENT_ATTACHMENT.
+  if ((usage & GPUConst.TextureUsage.TRANSIENT_ATTACHMENT) !== 0) {
+    t.skipIfTransientAttachmentNotSupported();
+  }
+
   const canvas = createCanvas(t, canvasType, 2, 2);
   const ctx = canvas.getContext('webgpu');
   assert(ctx instanceof GPUCanvasContext, 'Failed to get WebGPU context from canvas');
@@ -269,7 +282,13 @@ fn((t) => {
     });
   }
 
-  if (usage & GPUConst.TextureUsage.STORAGE_BINDING) {
+  const canUseStorageTextureInFragmentShader =
+  !t.isCompatibility || t.device.limits.maxStorageTexturesInFragmentStage > 0;
+
+  if (
+  (usage & GPUConst.TextureUsage.STORAGE_BINDING) !== 0 &&
+  canUseStorageTextureInFragmentShader)
+  {
     const bgl = t.device.createBindGroupLayout({
       entries: [
       {
@@ -308,6 +327,72 @@ fn((t) => {
     const encoder = t.device.createCommandEncoder();
     encoder.copyTextureToTexture({ texture: currentTexture }, { texture: dstTexture }, size);
     t.device.queue.submit([encoder.finish()]);
+  }
+});
+
+g.test('invalid_usage').
+desc(`Test what happens when an invalid usage is passed to configure().`).
+params((u) =>
+u //
+.combine('canvasType', kAllCanvasTypes)
+// Test all formats because sometimes they're handled differently (require internal blits).
+.combine('format', kCanvasTextureFormats).
+combine('usage', [
+0,
+GPUConst.TextureUsage.COPY_DST,
+// Special case for bgra8unorm vs other formats
+GPUConst.TextureUsage.STORAGE_BINDING,
+// Special case(s) for canvases vs regular textures
+...kTextureUsages.filter(usageIsTypeErrorForConfigure),
+GPUConst.TextureUsage.TRANSIENT_ATTACHMENT | GPUConst.TextureUsage.RENDER_ATTACHMENT,
+// Various usages containing a bogus usage
+kSomeBogusTextureUsage,
+GPUConst.TextureUsage.COPY_DST | kSomeBogusTextureUsage,
+GPUConst.TextureUsage.STORAGE_BINDING | kSomeBogusTextureUsage,
+GPUConst.TextureUsage.TRANSIENT_ATTACHMENT | kSomeBogusTextureUsage]
+)
+).
+fn((t) => {
+  const { canvasType, format, usage } = t.params;
+
+  // MAINTENANCE_TODO(#4509): Remove this after all implementations have TRANSIENT_ATTACHMENT.
+  if ((usage & GPUConst.TextureUsage.TRANSIENT_ATTACHMENT) !== 0) {
+    t.skipIfTransientAttachmentNotSupported();
+  }
+
+  const canvas = createCanvas(t, canvasType, 2, 2);
+  const ctx = canvas.getContext('webgpu');
+  assert(ctx instanceof GPUCanvasContext, 'Failed to get WebGPU context from canvas');
+
+  if (usageIsTypeErrorForConfigure(usage)) {
+    t.shouldThrow('TypeError', () => {
+      ctx.configure({ device: t.device, format, usage });
+    });
+
+    const configuration = ctx.getConfiguration();
+    assert(configuration === null);
+
+    t.shouldThrow('InvalidStateError', () => {
+      ctx.getCurrentTexture();
+    });
+  } else {
+    // Otherwise just the normal createTexture() usage validation applies.
+    const invalidUsage = !isValidTextureUsageCombination(usage);
+    t.expectValidationError(() => {
+      ctx.configure({ device: t.device, format, usage });
+    }, invalidUsage);
+
+    // The canvas still gets configured, and getCurrentTexture() can still be called.
+    const configuration = ctx.getConfiguration();
+    assert(configuration !== null);
+    t.expect(configuration.usage === usage);
+
+    let currentTexture;
+    t.expectValidationError(() => {
+      currentTexture = ctx.getCurrentTexture();
+    }, invalidUsage);
+    assert(currentTexture !== undefined && currentTexture instanceof GPUTexture);
+    t.expect(currentTexture.usage === usage);
   }
 });
 
@@ -438,9 +523,6 @@ expand('viewFormat', ({ viewFormatFeature }) =>
 filterFormatsByFeature(viewFormatFeature, kAllTextureFormats)
 )
 ).
-beforeAllSubcases((t) => {
-  t.selectDeviceOrSkipTestCase([t.params.viewFormatFeature]);
-}).
 fn((t) => {
   const { canvasType, format, viewFormat } = t.params;
 
@@ -450,7 +532,7 @@ fn((t) => {
   const ctx = canvas.getContext('webgpu');
   assert(ctx instanceof GPUCanvasContext, 'Failed to get WebGPU context from canvas');
 
-  const compatible = viewCompatible(t.isCompatibility, format, viewFormat);
+  const compatible = textureFormatsAreViewCompatible(t.device.features, format, viewFormat);
 
   // Test configure() produces an error if the formats aren't compatible.
   t.expectValidationError(() => {

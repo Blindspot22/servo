@@ -4,23 +4,26 @@
 
 use geom::{FlexAxis, MainStartCrossStart};
 use malloc_size_of_derive::MallocSizeOf;
+use script::layout_dom::ServoLayoutNode;
 use servo_arc::Arc as ServoArc;
+use style::context::SharedStyleContext;
 use style::logical_geometry::WritingMode;
 use style::properties::ComputedValues;
 use style::properties::longhands::align_items::computed_value::T as AlignItems;
 use style::properties::longhands::flex_direction::computed_value::T as FlexDirection;
 use style::properties::longhands::flex_wrap::computed_value::T as FlexWrap;
-use style::values::computed::{AlignContent, JustifyContent};
+use style::values::computed::ContentDistribution;
 use style::values::specified::align::AlignFlags;
 
 use crate::PropagatedBoxTreeData;
 use crate::cell::ArcRefCell;
 use crate::construct_modern::{ModernContainerBuilder, ModernItemKind};
 use crate::context::LayoutContext;
-use crate::dom::LayoutBox;
+use crate::dom::{LayoutBox, WeakLayoutBox};
 use crate::dom_traversal::{NodeAndStyleInfo, NonReplacedContents};
 use crate::formatting_contexts::IndependentFormattingContext;
-use crate::fragment_tree::{BaseFragmentInfo, Fragment};
+use crate::fragment_tree::BaseFragmentInfo;
+use crate::layout_box_base::LayoutBoxBase;
 use crate::positioned::AbsolutelyPositionedBox;
 
 mod geom;
@@ -38,9 +41,9 @@ pub(crate) struct FlexContainerConfig {
     flex_wrap: FlexWrap,
     flex_wrap_is_reversed: bool,
     main_start_cross_start_sides_are: MainStartCrossStart,
-    align_content: AlignContent,
+    align_content: ContentDistribution,
     align_items: AlignItems,
-    justify_content: JustifyContent,
+    justify_content: ContentDistribution,
 }
 
 impl FlexContainerConfig {
@@ -90,7 +93,6 @@ impl FlexContainerConfig {
 pub(crate) struct FlexContainer {
     children: Vec<ArcRefCell<FlexLevelBox>>,
 
-    #[conditional_malloc_size_of]
     style: ServoArc<ComputedValues>,
 
     /// The configuration of this [`FlexContainer`].
@@ -104,30 +106,34 @@ impl FlexContainer {
         contents: NonReplacedContents,
         propagated_data: PropagatedBoxTreeData,
     ) -> Self {
-        let mut builder =
-            ModernContainerBuilder::new(context, info, propagated_data.union(&info.style));
+        let mut builder = ModernContainerBuilder::new(context, info, propagated_data);
         contents.traverse(context, info, &mut builder);
         let items = builder.finish();
 
         let children = items
             .into_iter()
             .map(|item| {
-                let box_ = match item.kind {
-                    ModernItemKind::InFlow => ArcRefCell::new(FlexLevelBox::FlexItem(
-                        FlexItemBox::new(item.formatting_context),
-                    )),
-                    ModernItemKind::OutOfFlow => {
-                        let abs_pos_box =
-                            ArcRefCell::new(AbsolutelyPositionedBox::new(item.formatting_context));
+                let flex_item_box = match item.kind {
+                    ModernItemKind::InFlow(independent_formatting_context) => ArcRefCell::new(
+                        FlexLevelBox::FlexItem(FlexItemBox::new(independent_formatting_context)),
+                    ),
+                    ModernItemKind::OutOfFlow(independent_formatting_context) => {
+                        let abs_pos_box = ArcRefCell::new(AbsolutelyPositionedBox::new(
+                            independent_formatting_context,
+                        ));
                         ArcRefCell::new(FlexLevelBox::OutOfFlowAbsolutelyPositionedBox(abs_pos_box))
+                    },
+                    ModernItemKind::ReusedBox(layout_box) => match layout_box {
+                        LayoutBox::FlexLevel(flex_level_box) => flex_level_box,
+                        _ => unreachable!(
+                            "Undamaged flex level element should be associated with flex level box"
+                        ),
                     },
                 };
 
-                if let Some(box_slot) = item.box_slot {
-                    box_slot.set(LayoutBox::FlexLevel(box_.clone()));
-                }
-
-                box_
+                item.box_slot
+                    .set(LayoutBox::FlexLevel(flex_item_box.clone()));
+                flex_item_box
             })
             .collect();
 
@@ -137,8 +143,21 @@ impl FlexContainer {
             config: FlexContainerConfig::new(&info.style),
         }
     }
+
+    pub(crate) fn repair_style(&mut self, new_style: &ServoArc<ComputedValues>) {
+        self.config = FlexContainerConfig::new(new_style);
+        self.style = new_style.clone();
+    }
+
+    pub(crate) fn subtree_size(&self) -> usize {
+        self.children
+            .iter()
+            .map(|child| child.borrow().with_base(|base| base.subtree_size()))
+            .sum()
+    }
 }
 
+#[expect(clippy::large_enum_variant)]
 #[derive(Debug, MallocSizeOf)]
 pub(crate) enum FlexLevelBox {
     FlexItem(FlexItemBox),
@@ -146,36 +165,61 @@ pub(crate) enum FlexLevelBox {
 }
 
 impl FlexLevelBox {
-    pub(crate) fn invalidate_cached_fragment(&self) {
+    pub(crate) fn repair_style(
+        &mut self,
+        context: &SharedStyleContext,
+        node: &ServoLayoutNode,
+        new_style: &ServoArc<ComputedValues>,
+    ) {
         match self {
             FlexLevelBox::FlexItem(flex_item_box) => flex_item_box
                 .independent_formatting_context
-                .base
-                .invalidate_cached_fragment(),
+                .repair_style(context, node, new_style),
             FlexLevelBox::OutOfFlowAbsolutelyPositionedBox(positioned_box) => positioned_box
-                .borrow()
+                .borrow_mut()
                 .context
-                .base
-                .invalidate_cached_fragment(),
+                .repair_style(context, node, new_style),
         }
     }
 
-    pub(crate) fn fragments(&self) -> Vec<Fragment> {
+    pub(crate) fn with_base<T>(&self, callback: impl FnOnce(&LayoutBoxBase) -> T) -> T {
         match self {
-            FlexLevelBox::FlexItem(flex_item_box) => flex_item_box
-                .independent_formatting_context
-                .base
-                .fragments(),
-            FlexLevelBox::OutOfFlowAbsolutelyPositionedBox(positioned_box) => {
-                positioned_box.borrow().context.base.fragments()
+            FlexLevelBox::FlexItem(flex_item_box) => {
+                callback(&flex_item_box.independent_formatting_context.base)
             },
+            FlexLevelBox::OutOfFlowAbsolutelyPositionedBox(positioned_box) => {
+                callback(&positioned_box.borrow().context.base)
+            },
+        }
+    }
+
+    pub(crate) fn with_base_mut<T>(&mut self, callback: impl FnOnce(&mut LayoutBoxBase) -> T) -> T {
+        match self {
+            FlexLevelBox::FlexItem(flex_item_box) => {
+                callback(&mut flex_item_box.independent_formatting_context.base)
+            },
+            FlexLevelBox::OutOfFlowAbsolutelyPositionedBox(positioned_box) => {
+                callback(&mut positioned_box.borrow_mut().context.base)
+            },
+        }
+    }
+
+    pub(crate) fn attached_to_tree(&self, layout_box: WeakLayoutBox) {
+        match self {
+            Self::FlexItem(flex_item_box) => flex_item_box
+                .independent_formatting_context
+                .attached_to_tree(layout_box),
+            Self::OutOfFlowAbsolutelyPositionedBox(positioned_box) => positioned_box
+                .borrow_mut()
+                .context
+                .attached_to_tree(layout_box),
         }
     }
 }
 
 #[derive(MallocSizeOf)]
 pub(crate) struct FlexItemBox {
-    independent_formatting_context: IndependentFormattingContext,
+    pub(crate) independent_formatting_context: IndependentFormattingContext,
 }
 
 impl std::fmt::Debug for FlexItemBox {
@@ -191,7 +235,7 @@ impl FlexItemBox {
         }
     }
 
-    fn style(&self) -> &ServoArc<ComputedValues> {
+    pub(crate) fn style(&self) -> &ServoArc<ComputedValues> {
         self.independent_formatting_context.style()
     }
 

@@ -15,29 +15,29 @@ pub fn deinit(clean_shutdown: bool) {
     let thread_count = unsafe { macos_count_running_threads() };
 
     if thread_count != 1 {
-        println!(
+        log::debug!(
             "{} threads are still running after shutdown (bad).",
             thread_count
         );
         if clean_shutdown {
-            println!("Waiting until all threads have shutdown");
+            log::debug!("Waiting until all threads have shutdown");
             loop {
                 let thread_count = unsafe { macos_count_running_threads() };
                 if thread_count == 1 {
                     break;
                 }
                 thread::sleep(Duration::from_millis(1000));
-                println!("{} threads are still running.", thread_count);
+                log::debug!("{} threads are still running.", thread_count);
             }
         }
     } else {
-        println!("All threads have shutdown (good).");
+        log::debug!("All threads have shutdown (good).");
     }
 }
 
 #[unsafe(link_section = "__TEXT,__info_plist")]
 #[unsafe(no_mangle)]
-pub static INFO_PLIST: [u8; 619] = *include_bytes!("Info.plist");
+pub static INFO_PLIST: [u8; 1050] = *include_bytes!("Info.plist");
 
 #[link(name = "count_threads")]
 unsafe extern "C" {

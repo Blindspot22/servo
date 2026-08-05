@@ -45,9 +45,9 @@ interface Element : Node {
   [CEReactions, Throws]
   boolean toggleAttribute(DOMString name, optional boolean force);
   [CEReactions, Throws]
-  undefined setAttribute(DOMString name, DOMString value);
+  undefined setAttribute(DOMString name, (TrustedType or DOMString) value);
   [CEReactions, Throws]
-  undefined setAttributeNS(DOMString? namespace, DOMString name, DOMString value);
+  undefined setAttributeNS(DOMString? namespace, DOMString name, (TrustedType or DOMString) value);
   [CEReactions]
   undefined removeAttribute(DOMString name);
   [CEReactions]
@@ -82,10 +82,12 @@ interface Element : Node {
   [Throws]
   undefined insertAdjacentText(DOMString where_, DOMString data);
   [CEReactions, Throws]
-  undefined insertAdjacentHTML(DOMString position, DOMString html);
+  undefined insertAdjacentHTML(DOMString position, (TrustedHTML or DOMString) string);
 
-  [Throws, Pref="dom_shadowdom_enabled"] ShadowRoot attachShadow(ShadowRootInit init);
+  [Throws] ShadowRoot attachShadow(ShadowRootInit init);
   readonly attribute ShadowRoot? shadowRoot;
+
+  readonly attribute CustomElementRegistry? customElementRegistry;
 };
 
 dictionary ShadowRootInit {
@@ -102,6 +104,7 @@ partial interface Element {
   [NewObject]
   DOMRect getBoundingClientRect();
 
+  undefined scrollIntoView(optional (boolean or ScrollIntoViewOptions) arg = {});
   undefined scroll(optional ScrollToOptions options = {});
   undefined scroll(unrestricted double x, unrestricted double y);
 
@@ -118,15 +121,17 @@ partial interface Element {
   readonly attribute long clientLeft;
   readonly attribute long clientWidth;
   readonly attribute long clientHeight;
+
+  readonly attribute double currentCSSZoom;
 };
 
 // https://html.spec.whatwg.org/multipage/#dom-parsing-and-serialization
 partial interface Element {
-  [CEReactions] undefined setHTMLUnsafe(DOMString html);
+  [CEReactions, Throws] undefined setHTMLUnsafe((TrustedHTML or DOMString) html, optional SetHTMLUnsafeOptions options = {});
   DOMString getHTML(optional GetHTMLOptions options = {});
 
-  [CEReactions, Throws] attribute [LegacyNullToEmptyString] DOMString innerHTML;
-  [CEReactions, Throws] attribute [LegacyNullToEmptyString] DOMString outerHTML;
+  [CEReactions, Throws] attribute (TrustedHTML or [LegacyNullToEmptyString] DOMString) innerHTML;
+  [CEReactions, Throws] attribute (TrustedHTML or [LegacyNullToEmptyString] DOMString) outerHTML;
 };
 
 dictionary GetHTMLOptions {
@@ -134,9 +139,26 @@ dictionary GetHTMLOptions {
   sequence<ShadowRoot> shadowRoots = [];
 };
 
+// https://drafts.csswg.org/cssom-view/#dictdef-scrollintoviewoptions
+dictionary ScrollIntoViewOptions : ScrollOptions {
+  ScrollLogicalPosition block = "start";
+  ScrollLogicalPosition inline = "nearest";
+  ScrollIntoViewContainer container = "all";
+};
+
+enum ScrollLogicalPosition { "start", "center", "end", "nearest" };
+enum ScrollIntoViewContainer { "all", "nearest" };
+
 // https://fullscreen.spec.whatwg.org/#api
 partial interface Element {
   Promise<undefined> requestFullscreen();
+};
+
+// https://w3c.github.io/pointerevents/#extensions-to-the-element-interface
+partial interface Element {
+  [Throws] undefined setPointerCapture(long pointerId);
+  [Throws] undefined releasePointerCapture(long pointerId);
+  boolean hasPointerCapture(long pointerId);
 };
 
 Element includes ChildNode;
@@ -144,3 +166,16 @@ Element includes NonDocumentTypeChildNode;
 Element includes ParentNode;
 Element includes ActivatableElement;
 Element includes ARIAMixin;
+
+// https://drafts.csswg.org/css-shadow-parts/#idl
+partial interface Element {
+  [SameObject, PutForwards=value] readonly attribute DOMTokenList part;
+};
+
+// https://wicg.github.io/sanitizer-api/#sanitizer-api
+partial interface Element {
+  [CEReactions, Throws] undefined setHTML(DOMString html, optional SetHTMLOptions options = {});
+};
+
+// https://drafts.csswg.org/web-animations-1/#extensions-to-the-element-interface
+Element includes Animatable;

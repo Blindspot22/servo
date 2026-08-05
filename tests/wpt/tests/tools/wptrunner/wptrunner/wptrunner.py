@@ -43,10 +43,25 @@ format. This manifest is used directly to determine which tests exist. Local
 metadata files are used to store the expected test results.
 """
 
-def setup_logging(*args, **kwargs):
-    global logger
-    logger = wptlogging.setup(*args, **kwargs)
-    return logger
+def setup_logging(wptrunner_kwargs, defaults, formatter_defaults=None):
+    # Legacy entry point
+    return GlobalLogger(wptrunner_kwargs, defaults, formatter_defaults).__enter__()
+
+
+class GlobalLogger(wptlogging.LoggerManager):
+    def __enter__(self):
+        global logger
+        if logger is not None:
+            raise ValueError("logger is already configured")
+        logger = super().__enter__()
+        assert logger is not None
+        return self._logger
+
+    def __exit__(self, *args, **kwargs):
+        global logger
+        assert logger is not None
+        super().__exit__(self, *args, **kwargs)
+        logger = None
 
 
 def get_loader(test_paths: wptcommandline.TestPaths,
@@ -121,7 +136,6 @@ def get_loader(test_paths: wptcommandline.TestPaths,
                                         chunk_number=kwargs["this_chunk"],
                                         include_https=ssl_enabled,
                                         include_h2=h2_enabled,
-                                        include_webtransport_h3=kwargs["enable_webtransport_h3"],
                                         skip_timeout=kwargs["skip_timeout"],
                                         skip_crash=kwargs["skip_crash"],
                                         skip_implementation_status=kwargs["skip_implementation_status"],
@@ -164,6 +178,25 @@ def list_tests(test_paths, product, **kwargs):
 
     for test in test_loader.test_ids:
         print(test)
+
+
+def list_tests_json(test_paths, product, **kwargs):
+    env.do_delayed_imports(logger, test_paths)
+
+    _, test_loader = get_loader(test_paths, product, **kwargs)
+
+    tests = {}
+    targets = [(test_loader.tests, False),
+               (test_loader.disabled_tests, True)]
+    for subsuite in test_loader.subsuites:
+        tests[subsuite] = {}
+        for test_type in test_loader.test_types:
+            tests[subsuite][test_type] = {}
+            for target, disabled in targets:
+                for test in target[subsuite][test_type]:
+                    tests[subsuite][test_type][test.id] = {"disabled": disabled,
+                                                           "expected": test.expected()}
+    print(json.dumps(tests, indent=2))
 
 
 def get_pause_after_test(test_loader, **kwargs):
@@ -313,6 +346,8 @@ def run_test_iteration(test_status, test_loader, test_queue_builder,
                           kwargs["restart_on_new_group"],
                           recording=recording,
                           max_restarts=kwargs["max_restarts"],
+                          max_restart_backoff=kwargs["max_restart_backoff"],
+                          update_status_on_crash=kwargs["update_status_on_crash"]
                           ) as manager_group:
             try:
                 handle_interrupt_signals()
@@ -456,6 +491,7 @@ def run_tests(config, product, test_paths, **kwargs):
                                  ssl_config,
                                  env_extras,
                                  kwargs["enable_webtransport_h3"],
+                                 kwargs["enable_dns"],
                                  mojojs_path,
                                  inject_script,
                                  kwargs["suppress_handler_traceback"],
@@ -547,14 +583,14 @@ def check_stability(**kwargs):
                                      **kwargs)
 
 
-def start(**kwargs):
+def start(**kwargs: Any) -> int:
     assert logger is not None
 
     logged_critical = wptlogging.LoggedAboveLevelHandler("CRITICAL")
     handler = handlers.LogLevelFilter(logged_critical, "CRITICAL")
     logger.add_handler(handler)
 
-    rv = False
+    rv = 0
     try:
         if kwargs["list_test_groups"]:
             list_test_groups(**kwargs)
@@ -562,13 +598,21 @@ def start(**kwargs):
             list_disabled(**kwargs)
         elif kwargs["list_tests"]:
             list_tests(**kwargs)
+        elif kwargs["list_tests_json"]:
+            list_tests_json(**kwargs)
         elif kwargs["verify"] or kwargs["stability"]:
-            rv = check_stability(**kwargs) or logged_critical.has_log
+            rv = check_stability(**kwargs) or 0
         else:
-            rv = not run_tests(**kwargs)[0] or logged_critical.has_log
+            rv = int(not run_tests(**kwargs)[0])
     finally:
-        logger.shutdown()
         logger.remove_handler(handler)
+
+    # Reserve everything above 64 for our global usage.
+    assert 0 <= rv < 64, "Exit codes above 64 are reserved"
+    if logged_critical.has_log:
+        print("Did log critical")
+        rv = 64
+
     return rv
 
 
@@ -580,9 +624,8 @@ def main():
         if kwargs["prefs_root"] is None:
             kwargs["prefs_root"] = os.path.abspath(os.path.join(here, "prefs"))
 
-        setup_logging(kwargs, {"raw": sys.stdout})
-
-        return start(**kwargs)
+        with GlobalLogger(kwargs, {"raw": sys.stdout}):
+            return start(**kwargs)
     except Exception:
         if kwargs["pdb"]:
             import pdb

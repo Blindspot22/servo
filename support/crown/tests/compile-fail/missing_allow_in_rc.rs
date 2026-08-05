@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 //@rustc-env:RUSTC_BOOTSTRAP=1
 
-#![allow(dead_code)]
+#![expect(dead_code)]
 
 use std::rc::Rc;
 
@@ -23,8 +23,12 @@ impl TypeHolderTrait for TypeHolder {
 struct Foo;
 
 fn foo<T: TypeHolderTrait>() -> Rc<T::F> {
-    //~^ ERROR: Type must be rooted. [crown::unrooted_must_root]
     unimplemented!()
+}
+
+fn bar<T: TypeHolderTrait>() {
+    let foo = foo::<T>();
+    //~^ ERROR: Expression of type std::rc::Rc
 }
 
 fn main() {}

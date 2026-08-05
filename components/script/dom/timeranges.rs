@@ -5,14 +5,14 @@
 use std::fmt;
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
 
 use crate::dom::bindings::codegen::Bindings::TimeRangesBinding::TimeRangesMethods;
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::num::Finite;
-use crate::dom::bindings::reflector::{Reflector, reflect_dom_object};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
 
 #[derive(Clone, JSTraceable, MallocSizeOf)]
 struct TimeRange {
@@ -63,7 +63,7 @@ pub struct TimeRangesContainer {
 }
 
 impl TimeRangesContainer {
-    #[allow(clippy::len_without_is_empty)]
+    #[expect(clippy::len_without_is_empty)]
     pub fn len(&self) -> u32 {
         self.ranges.len() as u32
     }
@@ -141,33 +141,33 @@ impl TimeRanges {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         window: &Window,
         ranges: TimeRangesContainer,
-        can_gc: CanGc,
     ) -> DomRoot<TimeRanges> {
-        reflect_dom_object(Box::new(TimeRanges::new_inherited(ranges)), window, can_gc)
+        reflect_dom_object_with_cx(Box::new(TimeRanges::new_inherited(ranges)), window, cx)
     }
 }
 
 impl TimeRangesMethods<crate::DomTypeHolder> for TimeRanges {
-    // https://html.spec.whatwg.org/multipage/#dom-timeranges-length
+    /// <https://html.spec.whatwg.org/multipage/#dom-timeranges-length>
     fn Length(&self) -> u32 {
         self.ranges.len()
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-timeranges-start
+    /// <https://html.spec.whatwg.org/multipage/#dom-timeranges-start>
     fn Start(&self, index: u32) -> Fallible<Finite<f64>> {
         self.ranges
             .start(index)
             .map(Finite::wrap)
-            .map_err(|_| Error::IndexSize)
+            .map_err(|_| Error::IndexSize(None))
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-timeranges-end
+    /// <https://html.spec.whatwg.org/multipage/#dom-timeranges-end>
     fn End(&self, index: u32) -> Fallible<Finite<f64>> {
         self.ranges
             .end(index)
             .map(Finite::wrap)
-            .map_err(|_| Error::IndexSize)
+            .map_err(|_| Error::IndexSize(None))
     }
 }

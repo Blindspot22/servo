@@ -11,27 +11,34 @@
 mod from_script_message;
 mod structured_data;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fmt;
 use std::time::Duration;
 
-use base::Epoch;
-use base::cross_process_instant::CrossProcessInstant;
-use base::id::{MessagePortId, PipelineId, WebViewId};
-use embedder_traits::{
-    CompositorHitTestResult, Cursor, InputEvent, MediaSessionActionType, Theme, ViewportDetails,
-    WebDriverCommandMsg,
+use embedder_traits::user_contents::{
+    UserContentManagerId, UserScript, UserScriptId, UserStyleSheet, UserStyleSheetId,
 };
-use euclid::Vector2D;
+use embedder_traits::{
+    EmbedderControlId, EmbedderControlResponse, InputEventAndId, JavaScriptEvaluationId,
+    MediaSessionActionType, NewWebViewDetails, PaintHitTestResult, Theme, TraversalId, UrlRequest,
+    ViewportDetails, WebDriverCommandMsg,
+};
 pub use from_script_message::*;
-use ipc_channel::ipc::IpcSender;
 use malloc_size_of_derive::MallocSizeOf;
+use paint_api::PinchZoomInfos;
+use paint_api::largest_contentful_paint_candidate::LCPCandidateID;
+use profile_traits::mem::MemoryReportResult;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use servo_base::cross_process_instant::CrossProcessInstant;
+use servo_base::generic_channel::GenericCallback;
+use servo_base::id::{MessagePortId, PipelineId, ScriptEventLoopId, WebViewId};
+use servo_config::prefs::PrefValue;
 use servo_url::{ImmutableOrigin, ServoUrl};
 pub use structured_data::*;
-use strum_macros::IntoStaticStr;
-use webrender_api::ExternalScrollId;
-use webrender_api::units::LayoutPixel;
+use strum::IntoStaticStr;
+use webrender_api::units::LayoutVector2D;
+use webrender_api::{ExternalScrollId, ImageKey};
 
 /// Messages to the Constellation from the embedding layer, whether from `ServoRenderer` or
 /// from `libservo` itself.
@@ -39,46 +46,44 @@ use webrender_api::units::LayoutPixel;
 pub enum EmbedderToConstellationMessage {
     /// Exit the constellation.
     Exit,
-    /// Request that the constellation send the current focused top-level browsing context id,
-    /// over a provided channel.
-    GetFocusTopLevelBrowsingContext(IpcSender<Option<WebViewId>>),
-    /// Query the constellation to see if the current compositor output is stable
-    IsReadyToSaveImage(HashMap<PipelineId, Epoch>),
     /// Whether to allow script to navigate.
     AllowNavigationResponse(PipelineId, bool),
-    /// Request to load a page.
-    LoadUrl(WebViewId, ServoUrl),
-    /// Clear the network cache.
-    ClearCache,
+    /// Request to load a page, with optionally additional data in [`URLRequest`].
+    LoadUrl(WebViewId, UrlRequest),
     /// Request to traverse the joint session history of the provided browsing context.
-    TraverseHistory(WebViewId, TraversalDirection),
+    TraverseHistory(WebViewId, TraversalDirection, TraversalId),
     /// Inform the Constellation that a `WebView`'s [`ViewportDetails`] have changed.
     ChangeViewportDetails(WebViewId, ViewportDetails, WindowSizeType),
     /// Inform the constellation of a theme change.
-    ThemeChange(Theme),
+    ThemeChange(WebViewId, Theme),
     /// Requests that the constellation instruct script/layout to try to layout again and tick
     /// animations.
     TickAnimation(Vec<WebViewId>),
+    /// Notify the `ScriptThread` that the Servo renderer is no longer waiting on
+    /// asynchronous image uploads for the given `Pipeline`. These are mainly used
+    /// by canvas to perform uploads while the display list is being built.
+    NoLongerWaitingOnAsynchronousImageUpdates(Vec<PipelineId>),
     /// Dispatch a webdriver command
     WebDriverCommand(WebDriverCommandMsg),
     /// Reload a top-level browsing context.
     Reload(WebViewId),
     /// A log entry, with the top-level browsing context id and thread name
-    LogEntry(Option<WebViewId>, Option<String>, LogEntry),
+    LogEntry(Option<ScriptEventLoopId>, Option<String>, LogEntry),
     /// Create a new top level browsing context.
-    NewWebView(ServoUrl, WebViewId, ViewportDetails),
+    NewWebView(ServoUrl, NewWebViewDetails),
     /// Close a top level browsing context.
     CloseWebView(WebViewId),
-    /// Panic a top level browsing context.
-    SendError(Option<WebViewId>, String),
-    /// Make a webview focused.
+    /// Make a webview focused. [EmbedderMsg::WebViewFocused] will be sent with
+    /// the result of this operation.
     FocusWebView(WebViewId),
     /// Make none of the webviews focused.
     BlurWebView,
     /// Forward an input event to an appropriate ScriptTask.
-    ForwardInputEvent(WebViewId, InputEvent, Option<CompositorHitTestResult>),
-    /// Requesting a change to the onscreen cursor.
-    SetCursor(WebViewId, Cursor),
+    ForwardInputEvent(WebViewId, InputEventAndId, Option<PaintHitTestResult>),
+    /// Request that the given pipeline refresh the cursor by doing a hit test at the most
+    /// recently hovered cursor position and resetting the cursor. This happens after a
+    /// display list update is rendered.
+    RefreshCursor(PipelineId),
     /// Enable the sampling profiler, with a given sampling rate and max total sampling duration.
     ToggleProfiler(Duration, Duration),
     /// Request to exit from fullscreen mode
@@ -89,9 +94,37 @@ pub enum EmbedderToConstellationMessage {
     SetWebViewThrottled(WebViewId, bool),
     /// The Servo renderer scrolled and is updating the scroll states of the nodes in the
     /// given pipeline via the constellation.
-    SetScrollStates(PipelineId, Vec<ScrollState>),
+    SetScrollStates(PipelineId, ScrollStateUpdate),
     /// Notify the constellation that a particular paint metric event has happened for the given pipeline.
     PaintMetric(PipelineId, PaintMetricEvent),
+    /// Evaluate a JavaScript string in the context of a `WebView`. When execution is complete or an
+    /// error is encountered, a correpsonding message will be sent to the embedding layer.
+    EvaluateJavaScript(WebViewId, JavaScriptEvaluationId, String),
+    /// Create a memory report and return it via the [`GenericCallback`]
+    CreateMemoryReport(GenericCallback<MemoryReportResult>),
+    /// Sends the generated image key to the image cache associated with this pipeline.
+    SendImageKeysForPipeline(PipelineId, Vec<ImageKey>),
+    /// A set of preferences were updated with the given new values.
+    PreferencesUpdated(Vec<(&'static str, PrefValue)>),
+    /// Request preparation for a screenshot of the given WebView. The Constellation will
+    /// send a message to the Embedder when the screenshot is ready to be taken.
+    RequestScreenshotReadiness(WebViewId),
+    /// A response to a request to show an embedder user interface control.
+    EmbedderControlResponse(EmbedderControlId, EmbedderControlResponse),
+    /// An action to perform on the given `UserContentManagerId`.
+    UserContentManagerAction(UserContentManagerId, UserContentManagerAction),
+    /// Update pinch zoom details stored in the top level window
+    UpdatePinchZoomInfos(PipelineId, PinchZoomInfos),
+    /// Activate or deactivate accessibility features for the given `WebView`.
+    SetAccessibilityActive(WebViewId, bool),
+}
+
+pub enum UserContentManagerAction {
+    AddUserScript(UserScript),
+    DestroyUserContentManager,
+    RemoveUserScript(UserScriptId),
+    AddUserStyleSheet(UserStyleSheet),
+    RemoveUserStyleSheet(UserStyleSheetId),
 }
 
 /// A description of a paint metric that is sent from the Servo renderer to the
@@ -99,6 +132,12 @@ pub enum EmbedderToConstellationMessage {
 pub enum PaintMetricEvent {
     FirstPaint(CrossProcessInstant, bool /* first_reflow */),
     FirstContentfulPaint(CrossProcessInstant, bool /* first_reflow */),
+    LargestContentfulPaint(
+        CrossProcessInstant,
+        usize, /* area */
+        Option<ServoUrl>,
+        LCPCandidateID,
+    ),
 }
 
 impl fmt::Debug for EmbedderToConstellationMessage {
@@ -128,15 +167,6 @@ pub enum WindowSizeType {
     Initial,
     /// Window resize.
     Resize,
-}
-
-/// The scroll state of a stacking context.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-pub struct ScrollState {
-    /// The ID of the scroll root.
-    pub scroll_id: ExternalScrollId,
-    /// The scrolling offset of this stacking context.
-    pub scroll_offset: Vector2D<f32, LayoutPixel>,
 }
 
 /// The direction of a history traversal
@@ -170,10 +200,10 @@ pub struct PortTransferInfo {
 
 /// Messages for communication between the constellation and a global managing ports.
 #[derive(Debug, Deserialize, Serialize)]
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant)]
 pub enum MessagePortMsg {
     /// Complete the transfer for a batch of ports.
-    CompleteTransfer(HashMap<MessagePortId, PortTransferInfo>),
+    CompleteTransfer(FxHashMap<MessagePortId, PortTransferInfo>),
     /// Complete the transfer of a single port,
     /// whose transfer was pending because it had been requested
     /// while a previous failed transfer was being rolled-back.
@@ -182,4 +212,15 @@ pub enum MessagePortMsg {
     CompleteDisentanglement(MessagePortId),
     /// Handle a new port-message-task.
     NewTask(MessagePortId, PortMessageTask),
+}
+
+/// A data structure which contains information for the pipeline after a scroll happens in the
+/// embedder-side `WebView`.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ScrollStateUpdate {
+    /// The [`ExternalScrollId`] of the node that that was scrolled.
+    pub scrolled_node: ExternalScrollId,
+    /// A map containing the scroll offsets of the entire scroll tree. This is necessary,
+    /// because scroll events can cause other nodes to scroll due to sticky positioning.
+    pub offsets: FxHashMap<ExternalScrollId, LayoutVector2D>,
 }

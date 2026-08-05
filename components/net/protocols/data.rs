@@ -6,7 +6,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use data_url::DataUrl;
-use headers::HeaderValue;
+use http::HeaderValue;
 use net_traits::http_status::HttpStatus;
 use net_traits::request::Request;
 use net_traits::response::{Response, ResponseBody};
@@ -34,12 +34,16 @@ impl ProtocolHandler for DataProtocolHander {
                 Ok((bytes, _fragment_id)) => {
                     let mut response =
                         Response::new(url, ResourceFetchTiming::new(request.timing_type()));
-                    *response.body.lock().unwrap() = ResponseBody::Done(bytes);
-                    let mime = data_url.mime_type();
-                    response.headers.insert(
-                        http::header::CONTENT_TYPE,
-                        HeaderValue::from_str(&mime.to_string()).unwrap(),
-                    );
+                    *response.body.lock() = ResponseBody::Done(bytes);
+
+                    if let Ok(content_type_header_value) =
+                        HeaderValue::from_str(&data_url.mime_type().to_string())
+                    {
+                        response
+                            .headers
+                            .insert(http::header::CONTENT_TYPE, content_type_header_value);
+                    }
+
                     response.status = HttpStatus::default();
                     Some(response)
                 },
@@ -48,7 +52,9 @@ impl ProtocolHandler for DataProtocolHander {
             Err(_) => None,
         }
         .unwrap_or_else(|| {
-            Response::network_error(NetworkError::Internal("Decoding data URL failed".into()))
+            Response::network_error(NetworkError::ResourceLoadError(
+                "Decoding data URL failed".into(),
+            ))
         });
 
         Box::pin(std::future::ready(response))

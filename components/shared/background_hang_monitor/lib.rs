@@ -9,23 +9,24 @@
 use std::time::Duration;
 use std::{fmt, mem};
 
-use base::id::PipelineId;
-use ipc_channel::ipc::IpcSender;
 use serde::{Deserialize, Serialize};
+use servo_base::id::ScriptEventLoopId;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 /// The equivalent of script::script_runtime::ScriptEventCategory
 pub enum ScriptHangAnnotation {
-    AttachLayout,
+    SpawnPipeline,
     ConstellationMsg,
+    DatabaseAccessEvent,
     DevtoolsMsg,
     DocumentEvent,
     FileRead,
     FontLoading,
     FormPlannedNavigation,
+    GeolocationEvent,
     ImageCacheMsg,
     InputEvent,
-    HistoryEvent,
+    NavigationAndTraversalEvent,
     NetworkEvent,
     Rendering,
     Resize,
@@ -157,7 +158,7 @@ pub enum MonitoredComponentType {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-pub struct MonitoredComponentId(pub PipelineId, pub MonitoredComponentType);
+pub struct MonitoredComponentId(pub ScriptEventLoopId, pub MonitoredComponentType);
 
 /// A handle to register components for hang monitoring,
 /// and to receive a means to communicate with the underlying hang monitor worker.
@@ -169,7 +170,7 @@ pub trait BackgroundHangMonitorRegister: BackgroundHangMonitorClone + Send {
         component: MonitoredComponentId,
         transient_hang_timeout: Duration,
         permanent_hang_timeout: Duration,
-        exit_signal: Option<Box<dyn BackgroundHangMonitorExitSignal>>,
+        exit_signal: Box<dyn BackgroundHangMonitorExitSignal>,
     ) -> Box<dyn BackgroundHangMonitor>;
 }
 
@@ -203,10 +204,10 @@ pub trait BackgroundHangMonitorExitSignal: Send {
 }
 
 /// Messages to control the sampling profiler.
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum BackgroundHangMonitorControlMsg {
     /// Toggle the sampler, with a given sampling rate and max total sampling duration.
     ToggleSampler(Duration, Duration),
-    /// Exit, and propagate the signal to monitored components.
-    Exit(IpcSender<()>),
+    /// Propagate exit signal to monitored components, and shutdown when they have.
+    Exit,
 }

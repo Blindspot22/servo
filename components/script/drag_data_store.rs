@@ -4,18 +4,19 @@
 
 use std::sync::Arc;
 
-use constellation_traits::BlobImpl;
 use indexmap::IndexMap;
-use pixels::Image;
+use js::context::JSContext;
+use pixels::RasterImage;
+use servo_constellation_traits::BlobImpl;
 
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::file::File;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::CanGc;
 
 /// <https://html.spec.whatwg.org/multipage/#the-drag-data-item-kind>
+#[derive(MallocSizeOf)]
 pub(crate) enum Kind {
     Text {
         data: DOMString,
@@ -45,20 +46,24 @@ impl Kind {
 
     // TODO for now we create a new BlobImpl
     // since File constructor requires moving it.
-    pub(crate) fn as_file(&self, global: &GlobalScope, can_gc: CanGc) -> Option<DomRoot<File>> {
+    pub(crate) fn as_file(
+        &self,
+        cx: &mut JSContext,
+        global: &GlobalScope,
+    ) -> Option<DomRoot<File>> {
         match self {
             Kind::Text { .. } => None,
             Kind::File { bytes, name, type_ } => Some(File::new(
+                cx,
                 global,
                 BlobImpl::new_from_bytes(bytes.clone(), type_.clone()),
                 name.clone(),
                 None,
-                can_gc,
             )),
         }
     }
 
-    fn text_type_matches(&self, text_type: &str) -> bool {
+    fn text_type_matches(&self, text_type: &DOMString) -> bool {
         matches!(self, Kind::Text { type_, .. } if type_.eq(text_type))
     }
 
@@ -68,15 +73,16 @@ impl Kind {
 }
 
 /// <https://html.spec.whatwg.org/multipage/#drag-data-store-bitmap>
-#[allow(dead_code)] // TODO this used by DragEvent.
+#[derive(MallocSizeOf)]
 struct Bitmap {
-    image: Option<Arc<Image>>,
+    #[conditional_malloc_size_of]
+    image: Option<Arc<RasterImage>>,
     x: i32,
     y: i32,
 }
 
 /// Control the behaviour of the drag data store
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, MallocSizeOf, PartialEq)]
 pub(crate) enum Mode {
     /// <https://html.spec.whatwg.org/multipage/#concept-dnd-rw>
     ReadWrite,
@@ -86,7 +92,7 @@ pub(crate) enum Mode {
     Protected,
 }
 
-#[allow(dead_code)] // TODO some fields are used by DragEvent.
+#[derive(MallocSizeOf)]
 pub(crate) struct DragDataStore {
     /// <https://html.spec.whatwg.org/multipage/#drag-data-store-item-list>
     item_list: IndexMap<u16, Kind>,
@@ -103,7 +109,6 @@ pub(crate) struct DragDataStore {
 impl DragDataStore {
     /// <https://html.spec.whatwg.org/multipage/#create-a-drag-data-store>
     // We don't really need it since it's only instantiated by DataTransfer.
-    #[allow(clippy::new_without_default)]
     pub(crate) fn new() -> DragDataStore {
         DragDataStore {
             item_list: IndexMap::new(),
@@ -126,7 +131,7 @@ impl DragDataStore {
         self.mode = mode;
     }
 
-    pub(crate) fn set_bitmap(&mut self, image: Option<Arc<Image>>, x: i32, y: i32) {
+    pub(crate) fn set_bitmap(&mut self, image: Option<Arc<RasterImage>>, x: i32, y: i32) {
         self.bitmap = Some(Bitmap { image, x, y });
     }
 
@@ -153,7 +158,7 @@ impl DragDataStore {
         types
     }
 
-    pub(crate) fn find_matching_text(&self, type_: &str) -> Option<DOMString> {
+    pub(crate) fn find_matching_text(&self, type_: &DOMString) -> Option<DOMString> {
         self.item_list
             .values()
             .find(|item| item.text_type_matches(type_))
@@ -170,7 +175,7 @@ impl DragDataStore {
                 .values()
                 .any(|item| item.text_type_matches(type_))
             {
-                return Err(Error::NotSupported);
+                return Err(Error::NotSupported(None));
             }
         }
 
@@ -231,8 +236,8 @@ impl DragDataStore {
 
     pub(crate) fn files(
         &self,
+        cx: &mut JSContext,
         global: &GlobalScope,
-        can_gc: CanGc,
         file_list: &mut Vec<DomRoot<File>>,
     ) {
         // Step 3 If the data store is in the protected mode return the empty list.
@@ -243,7 +248,7 @@ impl DragDataStore {
         // Step 4 For each item in the drag data store item list whose kind is File, add the item's data to the list L.
         self.item_list
             .values()
-            .filter_map(|item| item.as_file(global, can_gc))
+            .filter_map(|item| item.as_file(cx, global))
             .for_each(|file| file_list.push(file));
     }
 
@@ -277,7 +282,7 @@ fn normalize_mime(mut format: DOMString) -> DOMString {
     // Convert format to ASCII lowercase.
     format.make_ascii_lowercase();
 
-    match format.as_ref() {
+    match &*format.str() {
         // If format equals "text", change it to "text/plain".
         "text" => DOMString::from("text/plain"),
         // If format equals "url", change it to "text/uri-list".

@@ -2,26 +2,33 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::rc::Rc;
+use std::sync::Arc;
+
 use data_url::mime::Mime;
 use dom_struct::dom_struct;
+use js::context::{JSContext, NoGC};
+use net_traits::image_cache::ImageCache;
 use net_traits::request::InsecureRequestsPolicy;
+use script_bindings::codegen::GenericBindings::WindowBinding::WindowMethods;
+use script_bindings::reflector::reflect_dom_object_with_cx;
 use script_traits::DocumentActivity;
 use servo_url::{MutableOrigin, ServoUrl};
 
 use crate::document_loader::DocumentLoader;
+use crate::dom::animations::documenttimeline::DocumentTimeline;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
     DocumentMethods, NamedPropertyValue,
 };
 use crate::dom::bindings::codegen::Bindings::XMLDocumentBinding::XMLDocumentMethods;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::reflect_dom_object;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
+use crate::dom::customelementregistry::CustomElementReactionStack;
 use crate::dom::document::{Document, DocumentSource, HasBrowsingContext, IsHTMLDocument};
 use crate::dom::location::Location;
 use crate::dom::node::Node;
 use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
 
 // https://dom.spec.whatwg.org/#xmldocument
 #[dom_struct]
@@ -30,7 +37,7 @@ pub(crate) struct XMLDocument {
 }
 
 impl XMLDocument {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn new_inherited(
         window: &Window,
         has_browsing_context: HasBrowsingContext,
@@ -44,12 +51,16 @@ impl XMLDocument {
         doc_loader: DocumentLoader,
         inherited_insecure_requests_policy: Option<InsecureRequestsPolicy>,
         has_trustworthy_ancestor_origin: bool,
+        custom_element_reaction_stack: Rc<CustomElementReactionStack>,
+        timeline: &DocumentTimeline,
+        image_cache: Arc<dyn ImageCache>,
     ) -> XMLDocument {
         XMLDocument {
             document: Document::new_inherited(
                 window,
                 has_browsing_context,
                 url,
+                None,
                 origin,
                 is_html_document,
                 content_type,
@@ -64,12 +75,18 @@ impl XMLDocument {
                 false,
                 inherited_insecure_requests_policy,
                 has_trustworthy_ancestor_origin,
+                custom_element_reaction_stack,
+                window.Document().creation_sandboxing_flag_set(),
+                timeline,
+                window.pipeline_id(),
+                image_cache,
             ),
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
+        cx: &mut JSContext,
         window: &Window,
         has_browsing_context: HasBrowsingContext,
         url: Option<ServoUrl>,
@@ -82,9 +99,11 @@ impl XMLDocument {
         doc_loader: DocumentLoader,
         inherited_insecure_requests_policy: Option<InsecureRequestsPolicy>,
         has_trustworthy_ancestor_origin: bool,
-        can_gc: CanGc,
+        custom_element_reaction_stack: Rc<CustomElementReactionStack>,
+        image_cache: Arc<dyn ImageCache>,
     ) -> DomRoot<XMLDocument> {
-        let doc = reflect_dom_object(
+        let timeline = DocumentTimeline::new(cx, window);
+        let doc = reflect_dom_object_with_cx(
             Box::new(XMLDocument::new_inherited(
                 window,
                 has_browsing_context,
@@ -98,9 +117,12 @@ impl XMLDocument {
                 doc_loader,
                 inherited_insecure_requests_policy,
                 has_trustworthy_ancestor_origin,
+                custom_element_reaction_stack,
+                &timeline,
+                image_cache,
             )),
             window,
-            can_gc,
+            cx,
         );
         {
             let node = doc.upcast::<Node>();
@@ -111,18 +133,22 @@ impl XMLDocument {
 }
 
 impl XMLDocumentMethods<crate::DomTypeHolder> for XMLDocument {
-    // https://html.spec.whatwg.org/multipage/#dom-document-location
-    fn GetLocation(&self) -> Option<DomRoot<Location>> {
-        self.upcast::<Document>().GetLocation()
+    /// <https://html.spec.whatwg.org/multipage/#dom-document-location>
+    fn GetLocation(&self, cx: &mut JSContext) -> Option<DomRoot<Location>> {
+        self.upcast::<Document>().GetLocation(cx)
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-tree-accessors:supported-property-names
-    fn SupportedPropertyNames(&self) -> Vec<DOMString> {
-        self.upcast::<Document>().SupportedPropertyNames()
+    /// <https://html.spec.whatwg.org/multipage/#dom-tree-accessors:supported-property-names>
+    fn SupportedPropertyNames(&self, no_gc: &NoGC) -> Vec<DOMString> {
+        self.upcast::<Document>().SupportedPropertyNames(no_gc)
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-tree-accessors:dom-document-nameditem-filter
-    fn NamedGetter(&self, name: DOMString) -> Option<NamedPropertyValue> {
-        self.upcast::<Document>().NamedGetter(name)
+    /// <https://html.spec.whatwg.org/multipage/#dom-tree-accessors:dom-document-nameditem-filter>
+    fn NamedGetter(
+        &self,
+        cx: &mut js::context::JSContext,
+        name: DOMString,
+    ) -> Option<NamedPropertyValue> {
+        self.upcast::<Document>().NamedGetter(cx, name)
     }
 }

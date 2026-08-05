@@ -3,7 +3,7 @@
 **/export const description = `
 Execution Tests for array indexing expressions
 `;import { makeTestGroup } from '../../../../../../common/framework/test_group.js';
-import { GPUTest } from '../../../../../gpu_test.js';
+import { AllFeaturesMaxLimitsGPUTest } from '../../../../../gpu_test.js';
 import {
   False,
   True,
@@ -17,27 +17,25 @@ import { align } from '../../../../../util/math.js';
 
 import { allInputSources, basicExpressionBuilder, run } from '../../expression.js';
 
-export const g = makeTestGroup(GPUTest);
+export const g = makeTestGroup(AllFeaturesMaxLimitsGPUTest);
 
 g.test('concrete_scalar').
 specURL('https://www.w3.org/TR/WGSL/#array-access-expr').
 desc(`Test indexing of an array of concrete scalars`).
 params((u) =>
 u.
-combine(
-  'inputSource',
-  // 'uniform' address space requires array stride to be multiple of 16 bytes
-  allInputSources.filter((s) => s !== 'uniform')
-).
+combine('inputSource', allInputSources).
 combine('elementType', ['i32', 'u32', 'f32', 'f16']).
 combine('indexType', ['i32', 'u32'])
 ).
-beforeAllSubcases((t) => {
-  if (t.params.elementType === 'f16') {
-    t.selectDeviceOrSkipTestCase('shader-f16');
-  }
-}).
 fn(async (t) => {
+  if (t.params.elementType === 'f16') {
+    t.skipIfDeviceDoesNotHaveFeature('shader-f16');
+  }
+  if (t.params.inputSource === 'uniform') {
+    // 'uniform' address space requires array stride to be multiple of 16 bytes without this language feature.
+    t.skipIfLanguageFeatureNotSupported('uniform_buffer_standard_layout');
+  }
   const elementType = Type[t.params.elementType];
   const indexType = Type[t.params.indexType];
   const cases = [
@@ -89,15 +87,14 @@ g.test('bool').
 specURL('https://www.w3.org/TR/WGSL/#array-access-expr').
 desc(`Test indexing of an array of booleans`).
 params((u) =>
-u.
-combine(
-  'inputSource',
-  // 'uniform' address space requires array stride to be multiple of 16 bytes
-  allInputSources.filter((s) => s !== 'uniform')
-).
-combine('indexType', ['i32', 'u32'])
+u.combine('inputSource', allInputSources).combine('indexType', ['i32', 'u32'])
 ).
 fn(async (t) => {
+  if (t.params.inputSource === 'uniform') {
+    // 'uniform' address space requires array stride to be multiple of 16 bytes without this language feature.
+    t.skipIfLanguageFeatureNotSupported('uniform_buffer_standard_layout');
+  }
+
   const indexType = Type[t.params.indexType];
   const cases = [
   {
@@ -196,16 +193,15 @@ combine('elementType', [
 ).
 combine('indexType', ['i32', 'u32'])
 ).
-beforeAllSubcases((t) => {
-  if (scalarTypeOf(Type[t.params.elementType]).kind === 'f16') {
-    t.selectDeviceOrSkipTestCase('shader-f16');
-  }
-}).
 fn((t) => {
   const elementType = Type[t.params.elementType];
   const valueArrayType = Type.array(0, elementType);
   const indexType = Type[t.params.indexType];
   const indexArrayType = Type.array(0, indexType);
+
+  if (scalarTypeOf(elementType).kind === 'f16') {
+    t.skipIfDeviceDoesNotHaveFeature('shader-f16');
+  }
 
   const wgsl = `
 ${scalarTypeOf(elementType).kind === 'f16' ? 'enable f16;' : ''}
@@ -293,21 +289,20 @@ desc(`Test indexing of an array of vectors`).
 params((u) =>
 u.
 combine('inputSource', allInputSources).
-expand('elementType', (t) =>
-t.inputSource === 'uniform' ?
-['vec4i', 'vec4u', 'vec4f'] :
-['vec4i', 'vec4u', 'vec4f', 'vec4h']
-).
+expand('elementType', (_) => ['vec4i', 'vec4u', 'vec4f', 'vec4h']).
 combine('indexType', ['i32', 'u32'])
 ).
-beforeAllSubcases((t) => {
-  if (t.params.elementType === 'vec4h') {
-    t.selectDeviceOrSkipTestCase('shader-f16');
-  }
-}).
 fn(async (t) => {
+  if (t.params.elementType === 'vec4h') {
+    t.skipIfDeviceDoesNotHaveFeature('shader-f16');
+    if (t.params.inputSource === 'uniform') {
+      // 'uniform' address space requires array stride to be multiple of 16 bytes without this language feature.
+      t.skipIfLanguageFeatureNotSupported('uniform_buffer_standard_layout');
+    }
+  }
   const elementType = Type[t.params.elementType];
   const indexType = Type[t.params.indexType];
+
   const cases = [
   {
     input: [
@@ -372,12 +367,18 @@ filter((u) => {
   return (align(mat.size, mat.alignment) & 15) === 0;
 })
 ).
-beforeAllSubcases((t) => {
-  if (t.params.elementType === 'f16') {
-    t.selectDeviceOrSkipTestCase('shader-f16');
-  }
-}).
 fn(async (t) => {
+  if (t.params.elementType === 'f16') {
+    t.skipIfDeviceDoesNotHaveFeature('shader-f16');
+  }
+  if (
+  t.params.inputSource === 'uniform' &&
+  !t.hasLanguageFeature('uniform_buffer_standard_layout'))
+  {
+    // 'uniform' address space requires array stride to be multiple of 16 bytes without this language feature.
+    const mat = Type.mat(t.params.columns, t.params.rows, Type[t.params.elementType]);
+    t.skipIf((align(mat.size, mat.alignment) & 15) !== 0);
+  }
   const elementType = Type[t.params.elementType];
   const indexType = Type[t.params.indexType];
   const matrixType = Type.mat(t.params.columns, t.params.rows, elementType);

@@ -9,13 +9,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use background_hang_monitor::HangMonitorRegister;
 use background_hang_monitor_api::{
     BackgroundHangMonitorControlMsg, BackgroundHangMonitorExitSignal, HangAlert, HangAnnotation,
     HangMonitorAlert, MonitoredComponentId, MonitoredComponentType, ScriptHangAnnotation,
 };
-use base::id::TEST_PIPELINE_ID;
-use ipc_channel::ipc;
+use servo_background_hang_monitor::HangMonitorRegister;
+use servo_base::generic_channel;
+use servo_base::id::TEST_SCRIPT_EVENT_LOOP_ID;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -24,23 +24,28 @@ fn test_hang_monitoring() {
     let _lock = SERIAL.lock().unwrap();
 
     let (background_hang_monitor_ipc_sender, background_hang_monitor_receiver) =
-        ipc::channel().expect("ipc channel failure");
-    let (_sampler_sender, sampler_receiver) = ipc::channel().expect("ipc channel failure");
+        generic_channel::channel().expect("ipc channel failure");
+    let (_sampler_sender, sampler_receiver) =
+        generic_channel::channel().expect("ipc channel failure");
 
-    let background_hang_monitor_register = HangMonitorRegister::init(
-        background_hang_monitor_ipc_sender.clone(),
-        sampler_receiver,
-        true,
-    );
+    let (background_hang_monitor_register, join_handle) =
+        HangMonitorRegister::init(background_hang_monitor_ipc_sender, sampler_receiver, true);
+
+    struct BHMExitSignal;
+
+    impl BackgroundHangMonitorExitSignal for BHMExitSignal {
+        fn signal_to_exit(&self) {}
+    }
+
     let background_hang_monitor = background_hang_monitor_register.register_component(
-        MonitoredComponentId(TEST_PIPELINE_ID, MonitoredComponentType::Script),
+        MonitoredComponentId(TEST_SCRIPT_EVENT_LOOP_ID, MonitoredComponentType::Script),
         Duration::from_millis(10),
         Duration::from_millis(1000),
-        None,
+        Box::new(BHMExitSignal),
     );
 
     // Start an activity.
-    let hang_annotation = HangAnnotation::Script(ScriptHangAnnotation::AttachLayout);
+    let hang_annotation = HangAnnotation::Script(ScriptHangAnnotation::SpawnPipeline);
     background_hang_monitor.notify_activity(hang_annotation);
 
     // Sleep until the "transient" timeout has been reached.
@@ -49,7 +54,8 @@ fn test_hang_monitoring() {
     // Check for a transient hang alert.
     match background_hang_monitor_receiver.recv().unwrap() {
         HangMonitorAlert::Hang(HangAlert::Transient(component_id, _annotation)) => {
-            let expected = MonitoredComponentId(TEST_PIPELINE_ID, MonitoredComponentType::Script);
+            let expected =
+                MonitoredComponentId(TEST_SCRIPT_EVENT_LOOP_ID, MonitoredComponentType::Script);
             assert_eq!(expected, component_id);
         },
         _ => unreachable!(),
@@ -61,7 +67,8 @@ fn test_hang_monitoring() {
     // Check for a permanent hang alert.
     match background_hang_monitor_receiver.recv().unwrap() {
         HangMonitorAlert::Hang(HangAlert::Permanent(component_id, _annotation, _profile)) => {
-            let expected = MonitoredComponentId(TEST_PIPELINE_ID, MonitoredComponentType::Script);
+            let expected =
+                MonitoredComponentId(TEST_SCRIPT_EVENT_LOOP_ID, MonitoredComponentType::Script);
             assert_eq!(expected, component_id);
         },
         _ => unreachable!(),
@@ -77,7 +84,8 @@ fn test_hang_monitoring() {
     // Check for a transient hang alert.
     match background_hang_monitor_receiver.recv().unwrap() {
         HangMonitorAlert::Hang(HangAlert::Transient(component_id, _annotation)) => {
-            let expected = MonitoredComponentId(TEST_PIPELINE_ID, MonitoredComponentType::Script);
+            let expected =
+                MonitoredComponentId(TEST_SCRIPT_EVENT_LOOP_ID, MonitoredComponentType::Script);
             assert_eq!(expected, component_id);
         },
         _ => unreachable!(),
@@ -101,7 +109,8 @@ fn test_hang_monitoring() {
     // We're getting new hang alerts for the latest task.
     match background_hang_monitor_receiver.recv().unwrap() {
         HangMonitorAlert::Hang(HangAlert::Transient(component_id, _annotation)) => {
-            let expected = MonitoredComponentId(TEST_PIPELINE_ID, MonitoredComponentType::Script);
+            let expected =
+                MonitoredComponentId(TEST_SCRIPT_EVENT_LOOP_ID, MonitoredComponentType::Script);
             assert_eq!(expected, component_id);
         },
         _ => unreachable!(),
@@ -119,6 +128,11 @@ fn test_hang_monitoring() {
 
     // Still no new alerts because the hang monitor has shut-down already.
     assert!(background_hang_monitor_receiver.try_recv().is_err());
+
+    // Join on the worker thread(channels are dropped above).
+    join_handle
+        .join()
+        .expect("Failed to join on the BHM worker thread");
 }
 
 #[test]
@@ -128,23 +142,28 @@ fn test_hang_monitoring_unregister() {
     let _lock = SERIAL.lock().unwrap();
 
     let (background_hang_monitor_ipc_sender, background_hang_monitor_receiver) =
-        ipc::channel().expect("ipc channel failure");
-    let (_sampler_sender, sampler_receiver) = ipc::channel().expect("ipc channel failure");
+        generic_channel::channel().expect("ipc channel failure");
+    let (_sampler_sender, sampler_receiver) =
+        generic_channel::channel().expect("ipc channel failure");
 
-    let background_hang_monitor_register = HangMonitorRegister::init(
-        background_hang_monitor_ipc_sender.clone(),
-        sampler_receiver,
-        true,
-    );
+    let (background_hang_monitor_register, join_handle) =
+        HangMonitorRegister::init(background_hang_monitor_ipc_sender, sampler_receiver, true);
+
+    struct BHMExitSignal;
+
+    impl BackgroundHangMonitorExitSignal for BHMExitSignal {
+        fn signal_to_exit(&self) {}
+    }
+
     let background_hang_monitor = background_hang_monitor_register.register_component(
-        MonitoredComponentId(TEST_PIPELINE_ID, MonitoredComponentType::Script),
+        MonitoredComponentId(TEST_SCRIPT_EVENT_LOOP_ID, MonitoredComponentType::Script),
         Duration::from_millis(10),
         Duration::from_millis(1000),
-        None,
+        Box::new(BHMExitSignal),
     );
 
     // Start an activity.
-    let hang_annotation = HangAnnotation::Script(ScriptHangAnnotation::AttachLayout);
+    let hang_annotation = HangAnnotation::Script(ScriptHangAnnotation::SpawnPipeline);
     background_hang_monitor.notify_activity(hang_annotation);
 
     // Unregister the component.
@@ -155,6 +174,13 @@ fn test_hang_monitoring_unregister() {
 
     // No new alert yet
     assert!(background_hang_monitor_receiver.try_recv().is_err());
+
+    // Drop the channels and join on the worker thread.
+    drop(background_hang_monitor);
+    drop(background_hang_monitor_register);
+    join_handle
+        .join()
+        .expect("Failed to join on the BHM worker thread");
 }
 
 // Perform two certain steps in `test_hang_monitoring_exit_signal_inner` in
@@ -199,8 +225,9 @@ fn test_hang_monitoring_exit_signal_inner(op_order: fn(&mut dyn FnMut(), &mut dy
     let _lock = SERIAL.lock().unwrap();
 
     let (background_hang_monitor_ipc_sender, _background_hang_monitor_receiver) =
-        ipc::channel().expect("ipc channel failure");
-    let (control_sender, control_receiver) = ipc::channel().expect("ipc channel failure");
+        generic_channel::channel().expect("ipc channel failure");
+    let (control_sender, control_receiver) =
+        generic_channel::channel().expect("ipc channel failure");
 
     struct BHMExitSignal {
         closing: Arc<AtomicBool>,
@@ -218,15 +245,10 @@ fn test_hang_monitoring_exit_signal_inner(op_order: fn(&mut dyn FnMut(), &mut dy
     }));
 
     // Init a worker, without active monitoring.
-    let background_hang_monitor_register = HangMonitorRegister::init(
-        background_hang_monitor_ipc_sender.clone(),
-        control_receiver,
-        false,
-    );
+    let (background_hang_monitor_register, join_handle) =
+        HangMonitorRegister::init(background_hang_monitor_ipc_sender, control_receiver, false);
 
     let mut background_hang_monitor = None;
-    let (exit_sender, exit_receiver) = ipc::channel().expect("Failed to create IPC channel!");
-    let mut exit_sender = Some(exit_sender);
 
     // `op_order` determines the order in which these two closures are
     // executed.
@@ -234,27 +256,29 @@ fn test_hang_monitoring_exit_signal_inner(op_order: fn(&mut dyn FnMut(), &mut dy
         &mut || {
             // Register a component.
             background_hang_monitor = Some(background_hang_monitor_register.register_component(
-                MonitoredComponentId(TEST_PIPELINE_ID, MonitoredComponentType::Script),
+                MonitoredComponentId(TEST_SCRIPT_EVENT_LOOP_ID, MonitoredComponentType::Script),
                 Duration::from_millis(10),
                 Duration::from_millis(1000),
-                Some(signal.take().unwrap()),
+                signal.take().unwrap(),
             ));
         },
         &mut || {
             // Send the exit message.
             control_sender
-                .send(BackgroundHangMonitorControlMsg::Exit(
-                    exit_sender.take().unwrap(),
-                ))
+                .send(BackgroundHangMonitorControlMsg::Exit)
                 .unwrap();
         },
     );
-
-    // Assert we receive a confirmation back.
-    assert!(exit_receiver.recv().is_ok());
 
     // Assert we get the exit signal.
     while !closing.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(10));
     }
+
+    // Drop the channels and join on the worker thread.
+    drop(background_hang_monitor);
+    drop(background_hang_monitor_register);
+    join_handle
+        .join()
+        .expect("Failed to join on the BHM worker thread");
 }

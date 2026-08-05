@@ -5,39 +5,36 @@
 //! The layout actor informs the DevTools client of the layout properties of the document, such as
 //! grids or flexboxes. It acts as a placeholder for now.
 
-use std::net::TcpStream;
+use std::sync::Arc;
 
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::StreamId;
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
-use crate::protocol::JsonPacketStream;
+use crate::actor::{Actor, ActorEncode, ActorError, ActorRegistry, new_actor_name};
+use crate::protocol::ClientRequest;
+use crate::{ActorMsg, StreamId};
 
-#[derive(Serialize)]
-pub struct LayoutInspectorActorMsg {
-    actor: String,
-}
-
-pub struct LayoutInspectorActor {
+#[derive(MallocSizeOf)]
+pub(crate) struct LayoutInspectorActor {
     name: String,
 }
 
 #[derive(Serialize)]
-pub struct GetGridsReply {
+pub(crate) struct GetGridsReply {
     from: String,
     grids: Vec<String>,
 }
 
 #[derive(Serialize)]
-pub struct GetCurrentFlexboxReply {
+pub(crate) struct GetCurrentFlexboxReply {
     from: String,
     flexbox: Option<()>,
 }
 
 impl Actor for LayoutInspectorActor {
-    fn name(&self) -> String {
-        self.name.clone()
+    fn name(&self) -> &str {
+        &self.name
     }
 
     /// The layout inspector actor can handle the following messages:
@@ -47,42 +44,47 @@ impl Actor for LayoutInspectorActor {
     /// - `getCurrentFlexbox`: Returns the active flexbox, non functional at the moment
     fn handle_message(
         &self,
+        request: ClientRequest,
         _registry: &ActorRegistry,
         msg_type: &str,
         _msg: &Map<String, Value>,
-        stream: &mut TcpStream,
         _id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
-        Ok(match msg_type {
+    ) -> Result<(), ActorError> {
+        match msg_type {
             "getGrids" => {
                 let msg = GetGridsReply {
-                    from: self.name(),
+                    from: self.name().into(),
                     // TODO: Actually create a list of grids
                     grids: vec![],
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
             "getCurrentFlexbox" => {
                 let msg = GetCurrentFlexboxReply {
-                    from: self.name(),
+                    from: self.name().into(),
                     // TODO: Create and return the current flexbox object
                     flexbox: None,
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
-            _ => ActorMessageStatus::Ignored,
-        })
+            _ => return Err(ActorError::UnrecognizedPacketType),
+        };
+        Ok(())
     }
 }
 
 impl LayoutInspectorActor {
-    pub fn new(name: String) -> Self {
-        Self { name }
+    pub fn register(registry: &ActorRegistry) -> Arc<Self> {
+        let name = new_actor_name::<Self>();
+        let actor = Self { name };
+        registry.register::<Self>(actor)
     }
+}
 
-    pub fn encodable(&self) -> LayoutInspectorActorMsg {
-        LayoutInspectorActorMsg { actor: self.name() }
+impl ActorEncode<ActorMsg> for LayoutInspectorActor {
+    fn encode(&self, _: &ActorRegistry) -> ActorMsg {
+        ActorMsg {
+            actor: self.name().into(),
+        }
     }
 }

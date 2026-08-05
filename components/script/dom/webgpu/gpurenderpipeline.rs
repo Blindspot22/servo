@@ -3,34 +3,54 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
-use ipc_channel::ipc::IpcSender;
+use js::context::{JSContext, NoGC};
+use script_bindings::cell::DomRefCell;
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use servo_base::generic_channel::GenericCallback;
 use webgpu_traits::{
     WebGPU, WebGPUBindGroupLayout, WebGPURenderPipeline, WebGPURenderPipelineResponse,
     WebGPURequest,
 };
 use wgpu_core::pipeline::RenderPipelineDescriptor;
 
-use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::WebGPUBinding::GPURenderPipelineMethods;
 use crate::dom::bindings::error::Fallible;
-use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object};
+use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::USVString;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::webgpu::gpubindgrouplayout::GPUBindGroupLayout;
-use crate::dom::webgpu::gpudevice::{GPUDevice, PipelineLayout};
-use crate::script_runtime::CanGc;
+use crate::dom::webgpu::gpudevice::GPUDevice;
+
+#[derive(JSTraceable, MallocSizeOf)]
+struct DroppableGPURenderPipeline {
+    #[no_trace]
+    channel: WebGPU,
+    #[no_trace]
+    render_pipeline: WebGPURenderPipeline,
+}
+
+impl Drop for DroppableGPURenderPipeline {
+    fn drop(&mut self) {
+        if let Err(e) = self
+            .channel
+            .0
+            .send(WebGPURequest::DropRenderPipeline(self.render_pipeline.0))
+        {
+            warn!(
+                "Failed to send WebGPURequest::DropRenderPipeline({:?}) ({})",
+                self.render_pipeline.0, e
+            );
+        };
+    }
+}
 
 #[dom_struct]
 pub(crate) struct GPURenderPipeline {
     reflector_: Reflector,
-    #[ignore_malloc_size_of = "channels are hard"]
-    #[no_trace]
-    channel: WebGPU,
     label: DomRefCell<USVString>,
-    #[no_trace]
-    render_pipeline: WebGPURenderPipeline,
     device: Dom<GPUDevice>,
+    droppable: DroppableGPURenderPipeline,
 }
 
 impl GPURenderPipeline {
@@ -41,43 +61,44 @@ impl GPURenderPipeline {
     ) -> Self {
         Self {
             reflector_: Reflector::new(),
-            channel: device.channel(),
             label: DomRefCell::new(label),
-            render_pipeline,
             device: Dom::from_ref(device),
+            droppable: DroppableGPURenderPipeline {
+                channel: device.channel(),
+                render_pipeline,
+            },
         }
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
         render_pipeline: WebGPURenderPipeline,
         label: USVString,
         device: &GPUDevice,
-        can_gc: CanGc,
     ) -> DomRoot<Self> {
-        reflect_dom_object(
+        reflect_dom_object_with_cx(
             Box::new(GPURenderPipeline::new_inherited(
                 render_pipeline,
                 label,
                 device,
             )),
             global,
-            can_gc,
+            cx,
         )
     }
 }
 
 impl GPURenderPipeline {
     pub(crate) fn id(&self) -> WebGPURenderPipeline {
-        self.render_pipeline
+        self.droppable.render_pipeline
     }
 
     /// <https://gpuweb.github.io/gpuweb/#dom-gpudevice-createrenderpipeline>
     pub(crate) fn create(
         device: &GPUDevice,
-        pipeline_layout: PipelineLayout,
         descriptor: RenderPipelineDescriptor<'static>,
-        async_sender: Option<IpcSender<WebGPURenderPipelineResponse>>,
+        async_sender: Option<GenericCallback<WebGPURenderPipelineResponse>>,
     ) -> Fallible<WebGPURenderPipeline> {
         let render_pipeline_id = device.global().wgpu_id_hub().create_render_pipeline_id();
 
@@ -88,7 +109,6 @@ impl GPURenderPipeline {
                 device_id: device.id().0,
                 render_pipeline_id,
                 descriptor,
-                implicit_ids: pipeline_layout.implicit(),
                 async_sender,
             })
             .expect("Failed to create WebGPU render pipeline");
@@ -104,20 +124,25 @@ impl GPURenderPipelineMethods<crate::DomTypeHolder> for GPURenderPipeline {
     }
 
     /// <https://gpuweb.github.io/gpuweb/#dom-gpuobjectbase-label>
-    fn SetLabel(&self, value: USVString) {
-        *self.label.borrow_mut() = value;
+    fn SetLabel(&self, no_gc: &NoGC, value: USVString) {
+        *self.label.safe_borrow_mut(no_gc) = value;
     }
 
     /// <https://gpuweb.github.io/gpuweb/#dom-gpupipelinebase-getbindgrouplayout>
-    fn GetBindGroupLayout(&self, index: u32) -> Fallible<DomRoot<GPUBindGroupLayout>> {
+    fn GetBindGroupLayout(
+        &self,
+        cx: &mut JSContext,
+        index: u32,
+    ) -> Fallible<DomRoot<GPUBindGroupLayout>> {
         let id = self.global().wgpu_id_hub().create_bind_group_layout_id();
 
         if let Err(e) = self
+            .droppable
             .channel
             .0
             .send(WebGPURequest::RenderGetBindGroupLayout {
                 device_id: self.device.id().0,
-                pipeline_id: self.render_pipeline.0,
+                pipeline_id: self.id().0,
                 index,
                 id,
             })
@@ -126,26 +151,11 @@ impl GPURenderPipelineMethods<crate::DomTypeHolder> for GPURenderPipeline {
         }
 
         Ok(GPUBindGroupLayout::new(
+            cx,
             &self.global(),
-            self.channel.clone(),
+            self.droppable.channel.clone(),
             WebGPUBindGroupLayout(id),
             USVString::default(),
-            CanGc::note(),
         ))
-    }
-}
-
-impl Drop for GPURenderPipeline {
-    fn drop(&mut self) {
-        if let Err(e) = self
-            .channel
-            .0
-            .send(WebGPURequest::DropRenderPipeline(self.render_pipeline.0))
-        {
-            warn!(
-                "Failed to send WebGPURequest::DropRenderPipeline({:?}) ({})",
-                self.render_pipeline.0, e
-            );
-        };
     }
 }

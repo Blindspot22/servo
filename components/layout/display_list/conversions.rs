@@ -4,6 +4,7 @@
 
 use app_units::Au;
 use style::color::AbsoluteColor;
+use style::computed_values::background_blend_mode::SingleComputedValue as BackgroundBlendMode;
 use style::computed_values::image_rendering::T as ComputedImageRendering;
 use style::computed_values::mix_blend_mode::T as ComputedMixBlendMode;
 use style::computed_values::text_decoration_style::T as ComputedTextDecorationStyle;
@@ -34,7 +35,7 @@ impl FilterToWebRender for ComputedFilter {
             ComputedFilter::Brightness(amount) => FilterOp::Brightness(amount.0),
             ComputedFilter::Contrast(amount) => FilterOp::Contrast(amount.0),
             ComputedFilter::Grayscale(amount) => FilterOp::Grayscale(amount.0),
-            ComputedFilter::HueRotate(angle) => FilterOp::HueRotate(angle.radians()),
+            ComputedFilter::HueRotate(angle) => FilterOp::HueRotate(angle.degrees()),
             ComputedFilter::Invert(amount) => FilterOp::Invert(amount.0),
             ComputedFilter::Opacity(amount) => FilterOp::Opacity(amount.0.into(), amount.0),
             ComputedFilter::Saturate(amount) => FilterOp::Saturate(amount.0),
@@ -125,11 +126,15 @@ impl ToWebRender for ComputedTextDecorationStyle {
     type Type = LineStyle;
     fn to_webrender(&self) -> Self::Type {
         match *self {
-            ComputedTextDecorationStyle::Solid => LineStyle::Solid,
+            ComputedTextDecorationStyle::Solid | ComputedTextDecorationStyle::Double => {
+                LineStyle::Solid
+            },
             ComputedTextDecorationStyle::Dotted => LineStyle::Dotted,
             ComputedTextDecorationStyle::Dashed => LineStyle::Dashed,
             ComputedTextDecorationStyle::Wavy => LineStyle::Wavy,
-            _ => LineStyle::Solid,
+            ComputedTextDecorationStyle::MozNone => {
+                unreachable!("Should never try to draw a moz-none text decoration")
+            },
         }
     }
 }
@@ -155,6 +160,30 @@ impl ToWebRender for ComputedImageRendering {
             ComputedImageRendering::Auto => ImageRendering::Auto,
             ComputedImageRendering::CrispEdges => ImageRendering::CrispEdges,
             ComputedImageRendering::Pixelated => ImageRendering::Pixelated,
+        }
+    }
+}
+
+impl ToWebRender for BackgroundBlendMode {
+    type Type = MixBlendMode;
+    fn to_webrender(&self) -> Self::Type {
+        match *self {
+            Self::Normal => MixBlendMode::Normal,
+            Self::Multiply => MixBlendMode::Multiply,
+            Self::Screen => MixBlendMode::Screen,
+            Self::Overlay => MixBlendMode::Overlay,
+            Self::Darken => MixBlendMode::Darken,
+            Self::Lighten => MixBlendMode::Lighten,
+            Self::ColorDodge => MixBlendMode::ColorDodge,
+            Self::ColorBurn => MixBlendMode::ColorBurn,
+            Self::HardLight => MixBlendMode::HardLight,
+            Self::SoftLight => MixBlendMode::SoftLight,
+            Self::Difference => MixBlendMode::Difference,
+            Self::Exclusion => MixBlendMode::Exclusion,
+            Self::Hue => MixBlendMode::Hue,
+            Self::Saturation => MixBlendMode::Saturation,
+            Self::Color => MixBlendMode::Color,
+            Self::Luminosity => MixBlendMode::Luminosity,
         }
     }
 }

@@ -5,30 +5,34 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use base::id::TEST_WEBVIEW_ID;
-use embedder_traits::FilterPattern;
+use embedder_traits::{
+    EmbedderControlId, EmbedderControlResponse, FilePickerRequest, FilterPattern,
+};
 use ipc_channel::ipc;
+use net::async_runtime::init_async_runtime;
+use net::embedder::NetToEmbedderMsg;
 use net::filemanager_thread::FileManager;
-use net::resource_thread::CoreResourceThreadPool;
-use net_traits::blob_url_store::BlobURLStoreError;
+use net_traits::blob_url_store::{BlobTokenCommunicator, BlobURLStoreError};
 use net_traits::filemanager_thread::{
     FileManagerThreadError, FileManagerThreadMsg, ReadFileProgress,
 };
+use servo_base::id::{TEST_PIPELINE_ID, TEST_WEBVIEW_ID};
+use servo_base::{Epoch, generic_channel};
 use servo_config::prefs::Preferences;
+use servo_url::ServoUrl;
 
-use crate::create_embedder_proxy;
+use crate::create_generic_embedder_proxy_and_receiver;
 
 #[test]
 fn test_filemanager() {
+    let _runtime = init_async_runtime();
     let mut preferences = Preferences::default();
     preferences.dom_testing_html_input_element_select_files_enabled = true;
     servo_config::prefs::set(preferences);
 
-    let pool = CoreResourceThreadPool::new(1, "CoreResourceTestPool".to_string());
-    let pool_handle = Arc::new(pool);
-    let filemanager = FileManager::new(create_embedder_proxy(), Arc::downgrade(&pool_handle));
+    let (embedder_proxy, embedder_receiver) = create_generic_embedder_proxy_and_receiver();
+    let filemanager = FileManager::new(embedder_proxy, BlobTokenCommunicator::stub_for_testing());
 
     // Try to open a dummy file "components/net/tests/test.jpeg" in tree
     let mut handler = File::open("tests/test.jpeg").expect("test.jpeg is stolen");
@@ -38,23 +42,58 @@ fn test_filemanager() {
         .read_to_end(&mut test_file_content)
         .expect("Read components/net/tests/test.jpeg error");
 
-    let patterns = vec![FilterPattern(".txt".to_string())];
-    let origin = "test.com".to_string();
+    let origin = ServoUrl::parse("http://test.com").unwrap().origin();
 
     {
         // Try to select a dummy file "components/net/tests/test.jpeg"
-        let (tx, rx) = ipc::channel().unwrap();
-        filemanager.handle(FileManagerThreadMsg::SelectFile(
-            TEST_WEBVIEW_ID,
-            patterns.clone(),
-            tx,
-            origin.clone(),
-            Some("tests/test.jpeg".into()),
+        let (result_sender, result_receiver) = crossbeam_channel::unbounded();
+        let callback = profile_traits::generic_callback::GenericCallback::new(
+            profile_traits::time::ProfilerChan(None),
+            move |msg| {
+                result_sender.send(msg.unwrap()).unwrap();
+            },
+        )
+        .unwrap();
+        let control_id = EmbedderControlId {
+            webview_id: TEST_WEBVIEW_ID,
+            pipeline_id: TEST_PIPELINE_ID,
+            index: Epoch(0),
+        };
+        let file_picker_request = FilePickerRequest {
+            origin: origin.clone(),
+            current_paths: vec!["tests/test.jpeg".into()],
+            filter_patterns: vec![FilterPattern(".txt".to_string())],
+            allow_select_multiple: false,
+            accept_current_paths_for_testing: true,
+        };
+        filemanager.handle(FileManagerThreadMsg::SelectFiles(
+            control_id,
+            file_picker_request,
+            callback,
         ));
-        let selected = rx
-            .recv()
-            .expect("Broken channel")
-            .expect("The file manager failed to find test.jpeg");
+
+        loop {
+            let message = embedder_receiver
+                .recv()
+                .expect("Should always read message properly");
+            match message {
+                NetToEmbedderMsg::SelectFiles(_, file_picker_request, response_sender) => {
+                    let _ = response_sender.send(Some(file_picker_request.current_paths));
+                    break;
+                },
+                _ => {},
+            }
+        }
+
+        let selected_files = match result_receiver.recv().expect("Broken channel") {
+            EmbedderControlResponse::FilePicker(selected_files) => selected_files,
+            _ => unreachable!("Received unexpected EmbedderControlResponse"),
+        }
+        .expect("Expected to get a list of files from embedder.");
+
+        let selected = selected_files
+            .first()
+            .expect("Should receive at least one file");
 
         // Expecting attributes conforming the spec
         assert_eq!(selected.filename, PathBuf::from("test.jpeg"));
@@ -102,15 +141,14 @@ fn test_filemanager() {
 
         // Delete the id
         {
-            let (tx2, rx2) = ipc::channel().unwrap();
+            let (tx2, rx2) = generic_channel::channel().unwrap();
             filemanager.handle(FileManagerThreadMsg::DecRef(
                 selected.id.clone(),
                 origin.clone(),
                 tx2,
             ));
 
-            let ret = rx2.recv().expect("Broken channel");
-            assert!(ret.is_ok(), "DecRef is not okay");
+            assert!(rx2.recv().is_ok(), "DecRef is not okay");
         }
 
         // Test by reading again, expecting read error because we invalidated the id

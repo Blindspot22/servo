@@ -3,20 +3,20 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use js::rust::HandleObject;
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 
 use crate::dom::bindings::codegen::Bindings::XRMediaBindingBinding::XRMediaBinding_Binding::XRMediaBindingMethods;
 use crate::dom::bindings::codegen::Bindings::XRMediaBindingBinding::XRMediaLayerInit;
 use crate::dom::bindings::error::{Error, Fallible};
-use crate::dom::bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 use crate::dom::bindings::root::{Dom, DomRoot};
-use crate::dom::htmlvideoelement::HTMLVideoElement;
+use crate::dom::html::htmlvideoelement::HTMLVideoElement;
 use crate::dom::window::Window;
 use crate::dom::xrcylinderlayer::XRCylinderLayer;
 use crate::dom::xrequirectlayer::XREquirectLayer;
 use crate::dom::xrquadlayer::XRQuadLayer;
 use crate::dom::xrsession::XRSession;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct XRMediaBinding {
@@ -33,16 +33,16 @@ impl XRMediaBinding {
     }
 
     fn new(
+        cx: &mut JSContext,
         global: &Window,
         proto: Option<HandleObject>,
         session: &XRSession,
-        can_gc: CanGc,
     ) -> DomRoot<XRMediaBinding> {
         reflect_dom_object_with_proto(
+            cx,
             Box::new(XRMediaBinding::new_inherited(session)),
             global,
             proto,
-            can_gc,
         )
     }
 }
@@ -50,23 +50,23 @@ impl XRMediaBinding {
 impl XRMediaBindingMethods<crate::DomTypeHolder> for XRMediaBinding {
     /// <https://immersive-web.github.io/layers/#dom-xrmediabinding-xrmediabinding>
     fn Constructor(
+        cx: &mut JSContext,
         global: &Window,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
         session: &XRSession,
     ) -> Fallible<DomRoot<XRMediaBinding>> {
         // Step 1.
         if session.is_ended() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         // Step 2.
         if !session.is_immersive() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         // Steps 3-5.
-        Ok(XRMediaBinding::new(global, proto, session, can_gc))
+        Ok(XRMediaBinding::new(cx, global, proto, session))
     }
 
     /// <https://immersive-web.github.io/layers/#dom-xrmediabinding-createquadlayer>
@@ -76,7 +76,7 @@ impl XRMediaBindingMethods<crate::DomTypeHolder> for XRMediaBinding {
         _: &XRMediaLayerInit,
     ) -> Fallible<DomRoot<XRQuadLayer>> {
         // https://github.com/servo/servo/issues/27493
-        Err(Error::NotSupported)
+        Err(Error::NotSupported(None))
     }
 
     /// <https://immersive-web.github.io/layers/#dom-xrmediabinding-createcylinderlayer>
@@ -86,7 +86,7 @@ impl XRMediaBindingMethods<crate::DomTypeHolder> for XRMediaBinding {
         _: &XRMediaLayerInit,
     ) -> Fallible<DomRoot<XRCylinderLayer>> {
         // https://github.com/servo/servo/issues/27493
-        Err(Error::NotSupported)
+        Err(Error::NotSupported(None))
     }
 
     /// <https://immersive-web.github.io/layers/#dom-xrmediabinding-createequirectlayer>
@@ -96,6 +96,6 @@ impl XRMediaBindingMethods<crate::DomTypeHolder> for XRMediaBinding {
         _: &XRMediaLayerInit,
     ) -> Fallible<DomRoot<XREquirectLayer>> {
         // https://github.com/servo/servo/issues/27493
-        Err(Error::NotSupported)
+        Err(Error::NotSupported(None))
     }
 }

@@ -10,158 +10,167 @@ use std::cell::Cell;
 use std::mem;
 use std::rc::Rc;
 
-use base::id::PipelineId;
-use js::jsapi::{JSAutoRealm, JobQueueIsEmpty, JobQueueMayNotBeEmpty};
+use js::context::JSContext;
+use js::rust::wrappers2::JobQueueMayNotBeEmpty;
+use malloc_size_of::MallocSizeOf;
+use script_bindings::cell::DomRefCell;
+use script_bindings::root::Dom;
 
+use crate::JSTraceable;
 use crate::dom::bindings::callback::ExceptionHandling;
-use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::PromiseBinding::PromiseJobCallback;
 use crate::dom::bindings::codegen::Bindings::VoidFunctionBinding::VoidFunction;
 use crate::dom::bindings::root::DomRoot;
-use crate::dom::defaultteereadrequest::DefaultTeeReadRequestMicrotask;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::htmlimageelement::ImageElementMicrotask;
-use crate::dom::htmlmediaelement::MediaElementMicrotask;
-use crate::dom::mutationobserver::MutationObserver;
-use crate::realms::enter_realm;
-use crate::script_runtime::{CanGc, JSContext, notify_about_rejected_promises};
+use crate::realms::enter_auto_realm;
+use crate::script_runtime::notify_about_rejected_promises;
 use crate::script_thread::ScriptThread;
 
 /// A collection of microtasks in FIFO order.
 #[derive(Default, JSTraceable, MallocSizeOf)]
 pub(crate) struct MicrotaskQueue {
     /// The list of enqueued microtasks that will be invoked at the next microtask checkpoint.
-    microtask_queue: DomRefCell<Vec<Microtask>>,
+    microtask_queue: DomRefCell<Vec<Box<dyn MicrotaskRunnable>>>,
     /// <https://html.spec.whatwg.org/multipage/#performing-a-microtask-checkpoint>
     performing_a_microtask_checkpoint: Cell<bool>,
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
-pub(crate) enum Microtask {
-    Promise(EnqueuedPromiseCallback),
-    User(UserMicrotask),
-    MediaElement(MediaElementMicrotask),
-    ImageElement(ImageElementMicrotask),
-    ReadableStreamTeeReadRequest(DefaultTeeReadRequestMicrotask),
-    CustomElementReaction,
-    NotifyMutationObservers,
+pub struct NotifyMutationObserversMicrotask;
+
+impl NotifyMutationObserversMicrotask {
+    pub(crate) fn new() -> Self {
+        Self
+    }
 }
 
-pub(crate) trait MicrotaskRunnable {
-    fn handler(&self, _can_gc: CanGc) {}
-    fn enter_realm(&self) -> JSAutoRealm;
+impl MicrotaskRunnable for NotifyMutationObserversMicrotask {
+    fn handler(&self, cx: &mut JSContext) {
+        ScriptThread::mutation_observers().notify_mutation_observers(cx);
+    }
+}
+
+#[derive(JSTraceable, MallocSizeOf)]
+pub struct CustomElementReactionMicrotask;
+
+impl CustomElementReactionMicrotask {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+}
+
+impl MicrotaskRunnable for CustomElementReactionMicrotask {
+    fn handler(&self, cx: &mut JSContext) {
+        ScriptThread::invoke_backup_element_queue(cx);
+    }
+}
+
+pub(crate) trait MicrotaskRunnable: JSTraceable + MallocSizeOf {
+    // must also take care of entering the realm
+    fn handler(&self, _cx: &mut JSContext) {}
 }
 
 /// A promise callback scheduled to run during the next microtask checkpoint (#4283).
 #[derive(JSTraceable, MallocSizeOf)]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 pub(crate) struct EnqueuedPromiseCallback {
-    #[ignore_malloc_size_of = "Rc has unclear ownership"]
+    #[conditional_malloc_size_of]
     pub(crate) callback: Rc<PromiseJobCallback>,
-    #[no_trace]
-    pub(crate) pipeline: PipelineId,
+    pub(crate) global: Dom<GlobalScope>,
     pub(crate) is_user_interacting: bool,
+}
+
+impl MicrotaskRunnable for EnqueuedPromiseCallback {
+    fn handler(&self, cx: &mut JSContext) {
+        let _guard = ScriptThread::user_interacting_guard();
+        let mut realm = enter_auto_realm(cx, &*self.global);
+        let cx = &mut realm;
+        let _ = self
+            .callback
+            .Call_(cx, &*self.global, ExceptionHandling::Report);
+    }
 }
 
 /// A microtask that comes from a queueMicrotask() Javascript call,
 /// identical to EnqueuedPromiseCallback once it's on the queue
 #[derive(JSTraceable, MallocSizeOf)]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 pub(crate) struct UserMicrotask {
-    #[ignore_malloc_size_of = "Rc has unclear ownership"]
+    #[conditional_malloc_size_of]
     pub(crate) callback: Rc<VoidFunction>,
-    #[no_trace]
-    pub(crate) pipeline: PipelineId,
+    pub(crate) global: Dom<GlobalScope>,
+}
+
+impl MicrotaskRunnable for UserMicrotask {
+    fn handler(&self, cx: &mut JSContext) {
+        let mut realm = enter_auto_realm(cx, &*self.global);
+        let cx = &mut realm;
+        let _ = self
+            .callback
+            .Call_(cx, &*self.global, ExceptionHandling::Report);
+    }
 }
 
 impl MicrotaskQueue {
     /// Add a new microtask to this queue. It will be invoked as part of the next
     /// microtask checkpoint.
-    #[allow(unsafe_code)]
-    pub(crate) fn enqueue(&self, job: Microtask, cx: JSContext) {
-        self.microtask_queue.borrow_mut().push(job);
-        unsafe { JobQueueMayNotBeEmpty(*cx) };
+    #[expect(unsafe_code)]
+    pub(crate) fn enqueue(&self, cx: &JSContext, task: Box<dyn MicrotaskRunnable>) {
+        self.microtask_queue.borrow_mut().push(task);
+        unsafe { JobQueueMayNotBeEmpty(cx) };
     }
 
     /// <https://html.spec.whatwg.org/multipage/#perform-a-microtask-checkpoint>
     /// Perform a microtask checkpoint, executing all queued microtasks until the queue is empty.
-    #[allow(unsafe_code)]
-    pub(crate) fn checkpoint<F>(
-        &self,
-        cx: JSContext,
-        target_provider: F,
-        globalscopes: Vec<DomRoot<GlobalScope>>,
-        can_gc: CanGc,
-    ) where
-        F: Fn(PipelineId) -> Option<DomRoot<GlobalScope>>,
-    {
+    #[expect(unsafe_code)]
+    pub(crate) fn checkpoint(&self, cx: &mut JSContext, globalscopes: Vec<DomRoot<GlobalScope>>) {
+        // Step 1. If the event loop's performing a microtask checkpoint is true, then return.
         if self.performing_a_microtask_checkpoint.get() {
             return;
         }
 
-        // Step 1
+        // Step 2. Set the event loop's performing a microtask checkpoint to true.
         self.performing_a_microtask_checkpoint.set(true);
 
         debug!("Now performing a microtask checkpoint");
 
-        // Steps 2
+        // Step 3. While the event loop's microtask queue is not empty:
         while !self.microtask_queue.borrow().is_empty() {
             rooted_vec!(let mut pending_queue);
             mem::swap(&mut *pending_queue, &mut *self.microtask_queue.borrow_mut());
 
             for (idx, job) in pending_queue.iter().enumerate() {
                 if idx == pending_queue.len() - 1 && self.microtask_queue.borrow().is_empty() {
-                    unsafe { JobQueueIsEmpty(*cx) };
+                    unsafe { js::rust::wrappers2::JobQueueIsEmpty(cx) };
                 }
 
-                match *job {
-                    Microtask::Promise(ref job) => {
-                        if let Some(target) = target_provider(job.pipeline) {
-                            let was_interacting = ScriptThread::is_user_interacting();
-                            ScriptThread::set_user_interacting(job.is_user_interacting);
-                            let _realm = enter_realm(&*target);
-                            let _ = job
-                                .callback
-                                .Call_(&*target, ExceptionHandling::Report, can_gc);
-                            ScriptThread::set_user_interacting(was_interacting);
-                        }
-                    },
-                    Microtask::User(ref job) => {
-                        if let Some(target) = target_provider(job.pipeline) {
-                            let _realm = enter_realm(&*target);
-                            let _ = job
-                                .callback
-                                .Call_(&*target, ExceptionHandling::Report, can_gc);
-                        }
-                    },
-                    Microtask::MediaElement(ref task) => {
-                        let _realm = task.enter_realm();
-                        task.handler(can_gc);
-                    },
-                    Microtask::ImageElement(ref task) => {
-                        let _realm = task.enter_realm();
-                        task.handler(can_gc);
-                    },
-                    Microtask::CustomElementReaction => {
-                        ScriptThread::invoke_backup_element_queue(can_gc);
-                    },
-                    Microtask::NotifyMutationObservers => {
-                        MutationObserver::notify_mutation_observers(can_gc);
-                    },
-                    Microtask::ReadableStreamTeeReadRequest(ref task) => {
-                        task.microtask_chunk_steps(cx, can_gc)
-                    },
-                }
+                job.handler(cx);
             }
         }
 
-        // Step 3
-        for global in globalscopes.into_iter() {
-            notify_about_rejected_promises(&global);
+        // Step 4. For each environment settings object settingsObject whose responsible
+        // event loop is this event loop, notify about rejected promises given
+        // settingsObject's global object.
+        for global in globalscopes.clone().into_iter() {
+            notify_about_rejected_promises(cx, &global);
         }
 
-        // TODO: Step 4 - Cleanup Indexed Database transactions.
+        // https://html.spec.whatwg.org/multipage/#perform-a-microtask-checkpoint
+        // Step 5. Cleanup Indexed Database transactions.
+        // https://w3c.github.io/IndexedDB/#cleanup-indexed-database-transactions
+        // “These steps are invoked by [HTML]. They ensure that transactions created by a script call
+        // to transaction() are deactivated once the task that invoked the script has completed.”
+        for global in globalscopes.iter() {
+            if let Some(factory) = global.indexeddb_factory() {
+                let _ = factory.cleanup_indexeddb_transactions(cx);
+            }
+        }
 
-        // Step 5
+        // TODO: Step 6. Perform ClearKeptObjects().
+
+        // Step 7. Set the event loop's performing a microtask checkpoint to false.
         self.performing_a_microtask_checkpoint.set(false);
+        // TODO: Step 8. Record timing info for microtask checkpoint.
     }
 
     pub(crate) fn empty(&self) -> bool {

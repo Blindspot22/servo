@@ -2,10 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-#[cfg(not(windows))]
-use std::env;
 use std::ffi::OsStr;
-use std::process;
+use std::{env, process};
 
 #[cfg(any(
     target_os = "macos",
@@ -15,38 +13,40 @@ use std::process;
         not(target_os = "android"),
         not(target_env = "ohos"),
         not(target_arch = "arm"),
-        not(target_arch = "aarch64")
+        not(target_arch = "aarch64"),
+        not(target_arch = "riscv32"),
+        not(target_arch = "riscv64")
     )
 ))]
 use gaol::profile::{Operation, PathPattern, Profile};
-use ipc_channel::Error;
+use ipc_channel::IpcError;
 use serde::{Deserialize, Serialize};
 use servo_config::opts::Opts;
 use servo_config::prefs::Preferences;
 
-use crate::pipeline::UnprivilegedPipelineContent;
+use crate::event_loop::NewScriptEventLoopProcessInfo;
 use crate::process_manager::Process;
 use crate::serviceworker::ServiceWorkerUnprivilegedContent;
 
 #[derive(Deserialize, Serialize)]
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant)]
 pub enum UnprivilegedContent {
-    Pipeline(UnprivilegedPipelineContent),
+    ScriptEventLoop(NewScriptEventLoopProcessInfo),
     ServiceWorker(ServiceWorkerUnprivilegedContent),
 }
 
 impl UnprivilegedContent {
     pub fn opts(&self) -> Opts {
         match self {
-            UnprivilegedContent::Pipeline(content) => content.opts(),
-            UnprivilegedContent::ServiceWorker(content) => content.opts(),
+            UnprivilegedContent::ScriptEventLoop(content) => content.opts.clone(),
+            UnprivilegedContent::ServiceWorker(content) => content.opts.clone(),
         }
     }
 
     pub fn prefs(&self) -> &Preferences {
         match self {
-            UnprivilegedContent::Pipeline(content) => content.prefs(),
-            UnprivilegedContent::ServiceWorker(content) => content.prefs(),
+            UnprivilegedContent::ScriptEventLoop(content) => &content.prefs,
+            UnprivilegedContent::ServiceWorker(content) => &content.prefs,
         }
     }
 }
@@ -101,7 +101,9 @@ pub fn content_process_sandbox_profile() -> Profile {
     not(target_os = "android"),
     not(target_env = "ohos"),
     not(target_arch = "arm"),
-    not(target_arch = "aarch64")
+    not(target_arch = "aarch64"),
+    not(target_arch = "riscv32"),
+    not(target_arch = "riscv64")
 ))]
 pub fn content_process_sandbox_profile() -> Profile {
     use std::path::PathBuf;
@@ -132,6 +134,8 @@ pub fn content_process_sandbox_profile() -> Profile {
     target_os = "android",
     target_env = "ohos",
     target_arch = "arm",
+    target_arch = "riscv32",
+    target_arch = "riscv64",
 
     // exclude apple arm devices
     all(target_arch = "aarch64", not(target_os = "macos"))
@@ -142,12 +146,15 @@ pub fn content_process_sandbox_profile() {
 }
 
 #[cfg(any(
+    target_os = "windows",
     target_os = "android",
     target_env = "ohos",
     target_arch = "arm",
-    all(target_arch = "aarch64", not(target_os = "windows"))
+    target_arch = "aarch64",
+    target_arch = "riscv32",
+    target_arch = "riscv64"
 ))]
-pub fn spawn_multiprocess(content: UnprivilegedContent) -> Result<Process, Error> {
+pub fn spawn_multiprocess(content: UnprivilegedContent) -> Result<Process, IpcError> {
     use ipc_channel::ipc::{IpcOneShotServer, IpcSender};
     // Note that this function can panic, due to process creation,
     // avoiding this panic would require a mechanism for dealing
@@ -159,6 +166,7 @@ pub fn spawn_multiprocess(content: UnprivilegedContent) -> Result<Process, Error
     let mut child_process = process::Command::new(path_to_self);
     setup_common(&mut child_process, token);
 
+    #[allow(clippy::zombie_processes)]
     let child = child_process
         .spawn()
         .expect("Failed to start unsandboxed child process!");
@@ -175,9 +183,11 @@ pub fn spawn_multiprocess(content: UnprivilegedContent) -> Result<Process, Error
     not(target_os = "android"),
     not(target_env = "ohos"),
     not(target_arch = "arm"),
-    not(target_arch = "aarch64")
+    not(target_arch = "aarch64"),
+    not(target_arch = "riscv32"),
+    not(target_arch = "riscv64")
 ))]
-pub fn spawn_multiprocess(content: UnprivilegedContent) -> Result<Process, Error> {
+pub fn spawn_multiprocess(content: UnprivilegedContent) -> Result<Process, IpcError> {
     use gaol::sandbox::{self, Sandbox, SandboxMethods};
     use ipc_channel::ipc::{IpcOneShotServer, IpcSender};
 
@@ -237,13 +247,12 @@ pub fn spawn_multiprocess(content: UnprivilegedContent) -> Result<Process, Error
     Ok(process)
 }
 
-#[cfg(any(target_os = "windows", target_os = "ios"))]
+#[cfg(target_os = "ios")]
 pub fn spawn_multiprocess(_content: UnprivilegedContent) -> Result<Process, Error> {
-    log::error!("Multiprocess is not supported on Windows or iOS.");
+    log::error!("Multiprocess is not supported on iOS.");
     process::exit(1);
 }
 
-#[cfg(not(windows))]
 fn setup_common<C: CommandMethods>(command: &mut C, token: String) {
     C::arg(command, "--content-process");
     C::arg(command, token);
@@ -258,7 +267,6 @@ fn setup_common<C: CommandMethods>(command: &mut C, token: String) {
 }
 
 /// A trait to unify commands launched as multiprocess with or without a sandbox.
-#[allow(dead_code)]
 trait CommandMethods {
     /// A command line argument.
     fn arg<T>(&mut self, arg: T)

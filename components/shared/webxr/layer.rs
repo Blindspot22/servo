@@ -7,15 +7,13 @@ use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use euclid::{Rect, Size2D};
+use malloc_size_of_derive::MallocSizeOf;
+use serde::{Deserialize, Serialize};
 
 use crate::{Error, Viewport, Viewports};
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[cfg_attr(feature = "ipc", derive(Deserialize, Serialize))]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
 pub struct ContextId(pub u64);
-
-#[cfg(feature = "ipc")]
-use serde::{Deserialize, Serialize};
 
 pub trait GLTypes {
     type Device;
@@ -24,8 +22,9 @@ pub trait GLTypes {
 }
 
 pub trait GLContexts<GL: GLTypes> {
-    fn bindings(&mut self, device: &GL::Device, context_id: ContextId) -> Option<&GL::Bindings>;
-    fn context(&mut self, device: &GL::Device, context_id: ContextId) -> Option<&mut GL::Context>;
+    fn device(&self, context_id: ContextId) -> Option<GL::Device>;
+    fn bindings(&mut self, context_id: ContextId) -> Option<&GL::Bindings>;
+    fn context(&mut self, context_id: ContextId) -> Option<&mut GL::Context>;
 }
 
 impl GLTypes for () {
@@ -35,11 +34,15 @@ impl GLTypes for () {
 }
 
 impl GLContexts<()> for () {
-    fn context(&mut self, _: &(), _: ContextId) -> Option<&mut ()> {
+    fn device(&self, _: ContextId) -> Option<()> {
+        Some(())
+    }
+
+    fn context(&mut self, _: ContextId) -> Option<&mut ()> {
         Some(self)
     }
 
-    fn bindings(&mut self, _: &(), _: ContextId) -> Option<&()> {
+    fn bindings(&mut self, _: ContextId) -> Option<&()> {
         Some(self)
     }
 }
@@ -75,7 +78,7 @@ impl<GL: GLTypes> LayerGrandManager<GL> {
 
     pub fn create_layer_manager<F, M>(&self, factory: F) -> Result<LayerManager, Error>
     where
-        F: 'static + Send + FnOnce(&mut GL::Device, &mut dyn GLContexts<GL>) -> Result<M, Error>,
+        F: 'static + Send + FnOnce(&mut dyn GLContexts<GL>) -> Result<M, Error>,
         M: 'static + LayerManagerAPI<GL>,
     {
         self.0
@@ -86,7 +89,6 @@ impl<GL: GLTypes> LayerGrandManager<GL> {
 pub trait LayerManagerAPI<GL: GLTypes> {
     fn create_layer(
         &mut self,
-        device: &mut GL::Device,
         contexts: &mut dyn GLContexts<GL>,
         context_id: ContextId,
         init: LayerInit,
@@ -94,7 +96,6 @@ pub trait LayerManagerAPI<GL: GLTypes> {
 
     fn destroy_layer(
         &mut self,
-        device: &mut GL::Device,
         contexts: &mut dyn GLContexts<GL>,
         context_id: ContextId,
         layer_id: LayerId,
@@ -104,14 +105,12 @@ pub trait LayerManagerAPI<GL: GLTypes> {
 
     fn begin_frame(
         &mut self,
-        device: &mut GL::Device,
         contexts: &mut dyn GLContexts<GL>,
         layers: &[(ContextId, LayerId)],
     ) -> Result<Vec<SubImages>, Error>;
 
     fn end_frame(
         &mut self,
-        device: &mut GL::Device,
         contexts: &mut dyn GLContexts<GL>,
         layers: &[(ContextId, LayerId)],
     ) -> Result<(), Error>;
@@ -131,22 +130,22 @@ impl LayerManager {
         context_id: ContextId,
         init: LayerInit,
     ) -> Result<LayerId, Error> {
-        self.0.create_layer(&mut (), &mut (), context_id, init)
+        self.0.create_layer(&mut (), context_id, init)
     }
 
     pub fn destroy_layer(&mut self, context_id: ContextId, layer_id: LayerId) {
-        self.0.destroy_layer(&mut (), &mut (), context_id, layer_id);
+        self.0.destroy_layer(&mut (), context_id, layer_id);
     }
 
     pub fn begin_frame(
         &mut self,
         layers: &[(ContextId, LayerId)],
     ) -> Result<Vec<SubImages>, Error> {
-        self.0.begin_frame(&mut (), &mut (), layers)
+        self.0.begin_frame(&mut (), layers)
     }
 
     pub fn end_frame(&mut self, layers: &[(ContextId, LayerId)]) -> Result<(), Error> {
-        self.0.end_frame(&mut (), &mut (), layers)
+        self.0.end_frame(&mut (), layers)
     }
 }
 
@@ -169,15 +168,9 @@ impl Drop for LayerManager {
     }
 }
 
-#[allow(clippy::type_complexity)]
+#[expect(clippy::type_complexity)]
 pub struct LayerManagerFactory<GL: GLTypes>(
-    Box<
-        dyn Send
-            + FnOnce(
-                &mut GL::Device,
-                &mut dyn GLContexts<GL>,
-            ) -> Result<Box<dyn LayerManagerAPI<GL>>, Error>,
-    >,
+    Box<dyn Send + FnOnce(&mut dyn GLContexts<GL>) -> Result<Box<dyn LayerManagerAPI<GL>>, Error>>,
 );
 
 impl<GL: GLTypes> Debug for LayerManagerFactory<GL> {
@@ -189,25 +182,21 @@ impl<GL: GLTypes> Debug for LayerManagerFactory<GL> {
 impl<GL: GLTypes> LayerManagerFactory<GL> {
     pub fn new<F, M>(factory: F) -> LayerManagerFactory<GL>
     where
-        F: 'static + Send + FnOnce(&mut GL::Device, &mut dyn GLContexts<GL>) -> Result<M, Error>,
+        F: 'static + Send + FnOnce(&mut dyn GLContexts<GL>) -> Result<M, Error>,
         M: 'static + LayerManagerAPI<GL>,
     {
-        LayerManagerFactory(Box::new(move |device, contexts| {
-            Ok(Box::new(factory(device, contexts)?))
-        }))
+        LayerManagerFactory(Box::new(move |contexts| Ok(Box::new(factory(contexts)?))))
     }
 
     pub fn build(
         self,
-        device: &mut GL::Device,
         contexts: &mut dyn GLContexts<GL>,
     ) -> Result<Box<dyn LayerManagerAPI<GL>>, Error> {
-        (self.0)(device, contexts)
+        (self.0)(contexts)
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[cfg_attr(feature = "ipc", derive(Deserialize, Serialize))]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize, MallocSizeOf)]
 pub struct LayerId(usize);
 
 static NEXT_LAYER_ID: AtomicUsize = AtomicUsize::new(0);
@@ -218,8 +207,7 @@ impl Default for LayerId {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-#[cfg_attr(feature = "ipc", derive(Deserialize, Serialize))]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub enum LayerInit {
     /// <https://www.w3.org/TR/webxr/#dictdef-xrwebgllayerinit>
     WebGLLayer {
@@ -263,8 +251,7 @@ impl LayerInit {
 }
 
 /// <https://immersive-web.github.io/layers/#enumdef-xrlayerlayout>
-#[derive(Clone, Copy, Debug)]
-#[cfg_attr(feature = "ipc", derive(Deserialize, Serialize))]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub enum LayerLayout {
     // TODO: Default
     // Allocates one texture
@@ -275,8 +262,7 @@ pub enum LayerLayout {
     StereoTopBottom,
 }
 
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "ipc", derive(Deserialize, Serialize))]
+#[derive(Clone, Debug, Deserialize, Serialize, MallocSizeOf)]
 pub struct SubImages {
     pub layer_id: LayerId,
     pub sub_image: Option<SubImage>,
@@ -284,8 +270,7 @@ pub struct SubImages {
 }
 
 /// <https://immersive-web.github.io/layers/#xrsubimagetype>
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "ipc", derive(Deserialize, Serialize))]
+#[derive(Clone, Debug, Deserialize, Serialize, MallocSizeOf)]
 pub struct SubImage {
     pub color_texture: Option<NonZeroU32>,
     pub depth_stencil_texture: Option<NonZeroU32>,

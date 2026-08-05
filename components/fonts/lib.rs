@@ -6,62 +6,49 @@
 
 mod font;
 mod font_context;
+pub mod font_feature_values;
 mod font_store;
-mod font_template;
 mod glyph;
-#[allow(unsafe_code)]
-pub mod platform;
-mod shaper;
+#[expect(unsafe_code)]
+pub mod platform; // Public because integration tests need this
+mod shapers;
 mod system_font_service;
 
-use std::sync::Arc;
-
-pub use font::*;
-pub use font_context::*;
-pub use font_store::*;
-pub use font_template::*;
-pub use glyph::*;
-use ipc_channel::ipc::IpcSharedMemory;
-pub use platform::LocalFontIdentifier;
-pub use shaper::*;
-pub use system_font_service::*;
+pub(crate) use font::*;
+// These items are not meant to be part of the public API but are used for integration tests
+pub use font::{Font, FontFamilyDescriptor, FontSearchScope, PlatformFontMethods};
+pub use font::{
+    FontBaseline, FontGroup, FontMetrics, FontRef, LAST_RESORT_GLYPH_ADVANCE, ShapingFlags,
+    ShapingOptions,
+};
+pub use font_context::{
+    CspViolationHandler, FontContext, FontContextWebFontMethods, NetworkTimingHandler,
+    WebFontDocumentContext,
+};
+pub use font_store::FontTemplates;
+pub use fonts_traits::*;
+pub(crate) use glyph::*;
+pub use glyph::{GlyphInfo, ShapedText, ShapedTextSlice, ShapedTextSliceType, ShapedTextSlicer};
+use icu_locid::subtags::Language;
+pub use platform::font_list::fallback_font_families;
+pub(crate) use shapers::*;
+pub use system_font_service::SystemFontService;
 use unicode_properties::{EmojiStatus, UnicodeEmoji, emoji};
-
-/// A data structure to store data for fonts. Data is stored internally in an
-/// [`IpcSharedMemory`] handle, so that it can be send without serialization
-/// across IPC channels.
-#[derive(Clone)]
-pub struct FontData(pub(crate) Arc<IpcSharedMemory>);
-
-impl FontData {
-    pub fn from_bytes(bytes: &[u8]) -> Self {
-        Self(Arc::new(IpcSharedMemory::from_bytes(bytes)))
-    }
-
-    pub(crate) fn as_ipc_shared_memory(&self) -> Arc<IpcSharedMemory> {
-        self.0.clone()
-    }
-}
-
-impl AsRef<[u8]> for FontData {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
 
 /// Whether or not font fallback selection prefers the emoji or text representation
 /// of a character. If `None` then either presentation is acceptable.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum EmojiPresentationPreference {
+pub(crate) enum EmojiPresentationPreference {
     None,
     Text,
     Emoji,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct FallbackFontSelectionOptions {
-    pub character: char,
-    pub presentation_preference: EmojiPresentationPreference,
+    pub(crate) character: char,
+    pub(crate) presentation_preference: EmojiPresentationPreference,
+    pub(crate) language: Language,
 }
 
 impl Default for FallbackFontSelectionOptions {
@@ -69,12 +56,13 @@ impl Default for FallbackFontSelectionOptions {
         Self {
             character: ' ',
             presentation_preference: EmojiPresentationPreference::None,
+            language: Language::UND,
         }
     }
 }
 
 impl FallbackFontSelectionOptions {
-    pub fn new(character: char, next_character: Option<char>) -> Self {
+    pub(crate) fn new(character: char, next_character: Option<char>, language: Language) -> Self {
         let presentation_preference = match next_character {
             Some(next_character) if emoji::is_emoji_presentation_selector(next_character) => {
                 EmojiPresentationPreference::Emoji
@@ -102,6 +90,7 @@ impl FallbackFontSelectionOptions {
         Self {
             character,
             presentation_preference,
+            language,
         }
     }
 }

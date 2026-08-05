@@ -5,9 +5,10 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use constellation_traits::EmbedderToConstellationMessage;
-use crossbeam_channel::{SendError, Sender};
+use crossbeam_channel::{Receiver, SendError, Sender};
 use log::warn;
+use servo_config::prefs::{PrefValue, PreferencesObserver};
+use servo_constellation_traits::EmbedderToConstellationMessage;
 
 #[derive(Clone)]
 pub(crate) struct ConstellationProxy {
@@ -16,11 +17,15 @@ pub(crate) struct ConstellationProxy {
 }
 
 impl ConstellationProxy {
-    pub fn new(sender: Sender<EmbedderToConstellationMessage>) -> Self {
-        Self {
-            sender,
-            disconnected: Arc::default(),
-        }
+    pub fn new() -> (Self, Receiver<EmbedderToConstellationMessage>) {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        (
+            Self {
+                sender,
+                disconnected: Arc::default(),
+            },
+            receiver,
+        )
     }
 
     pub fn disconnected(&self) -> bool {
@@ -33,6 +38,7 @@ impl ConstellationProxy {
         }
     }
 
+    #[expect(clippy::result_large_err)]
     fn try_send(
         &self,
         msg: EmbedderToConstellationMessage,
@@ -50,5 +56,13 @@ impl ConstellationProxy {
 
     pub fn sender(&self) -> Sender<EmbedderToConstellationMessage> {
         self.sender.clone()
+    }
+}
+
+impl PreferencesObserver for ConstellationProxy {
+    fn prefs_changed(&self, changes: &[(&'static str, PrefValue)]) {
+        self.send(EmbedderToConstellationMessage::PreferencesUpdated(
+            changes.to_owned(),
+        ));
     }
 }

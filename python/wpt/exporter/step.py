@@ -19,7 +19,7 @@ import logging
 import os
 import textwrap
 
-from typing import TYPE_CHECKING, Generic, Optional, TypeVar
+from typing import TYPE_CHECKING, Generic, Optional, TypeVar, Callable, Any
 
 from .common import COULD_NOT_APPLY_CHANGES_DOWNSTREAM_COMMENT
 from .common import COULD_NOT_APPLY_CHANGES_UPSTREAM_COMMENT
@@ -36,48 +36,47 @@ PATCH_FILE_NAME = "tmp.patch"
 
 
 class Step:
-    def __init__(self, name):
+    def __init__(self, name: str) -> None:
         self.name = name
 
     def provides(self) -> Optional[AsyncValue]:
         return None
 
-    def run(self, _: SyncRun):
+    def run(self, run: SyncRun) -> None:
         return
 
 
-T = TypeVar('T')
+T = TypeVar("T")
 
 
 class AsyncValue(Generic[T]):
-    def __init__(self, value: Optional[T] = None):
+    def __init__(self, value: Optional[T] = None) -> None:
         self._value = value
 
-    def resolve(self, value: T):
+    def resolve(self, value: Optional[T]) -> None:
         self._value = value
 
     def value(self) -> T:
         assert self._value is not None
         return self._value
 
-    def has_value(self):
+    def has_value(self) -> bool:
         return self._value is not None
 
 
 class CreateOrUpdateBranchForPRStep(Step):
-    def __init__(self, pull_data: dict, pull_request: PullRequest):
+    def __init__(self, pull_data: dict, pull_request: PullRequest) -> None:
         Step.__init__(self, "CreateOrUpdateBranchForPRStep")
         self.pull_data = pull_data
         self.pull_request = pull_request
         self.branch: AsyncValue[GithubBranch] = AsyncValue()
 
-    def provides(self):
+    def provides(self) -> AsyncValue[GithubBranch]:
         return self.branch
 
-    def run(self, run: SyncRun):
+    def run(self, run: SyncRun) -> None:
         try:
-            commits = self._get_upstreamable_commits_from_local_servo_repo(
-                run.sync)
+            commits = self._get_upstreamable_commits_from_local_servo_repo(run.sync)
             branch_name = self._create_or_update_branch_for_pr(run, commits)
             branch = run.sync.downstream_wpt.get_branch(branch_name)
 
@@ -88,21 +87,17 @@ class CreateOrUpdateBranchForPRStep(Step):
             logging.info(exception, exc_info=True)
 
             run.steps = []
-            run.add_step(CommentStep(
-                self.pull_request, COULD_NOT_APPLY_CHANGES_DOWNSTREAM_COMMENT
-            ))
+            run.add_step(CommentStep(self.pull_request, COULD_NOT_APPLY_CHANGES_DOWNSTREAM_COMMENT))
             if run.upstream_pr.has_value():
-                run.add_step(CommentStep(
-                    run.upstream_pr.value(), COULD_NOT_APPLY_CHANGES_UPSTREAM_COMMENT
-                ))
+                run.add_step(CommentStep(run.upstream_pr.value(), COULD_NOT_APPLY_CHANGES_UPSTREAM_COMMENT))
 
-    def _get_upstreamable_commits_from_local_servo_repo(self, sync: WPTSync):
+    def _get_upstreamable_commits_from_local_servo_repo(
+        self, sync: WPTSync
+    ) -> list[dict[str, bytes | str] | dict[str, str]]:
         local_servo_repo = sync.local_servo_repo
         number_of_commits = self.pull_data["commits"]
         pr_head = self.pull_data["head"]["sha"]
-        commit_shas = local_servo_repo.run(
-            "log", "--pretty=%H", pr_head, f"-{number_of_commits}"
-        ).splitlines()
+        commit_shas = local_servo_repo.run("log", "--pretty=%H", pr_head, f"-{number_of_commits}").splitlines()
 
         filtered_commits = []
         # We must iterate the commits in reverse to ensure we apply older changes first,
@@ -116,10 +111,10 @@ class CreateOrUpdateBranchForPRStep(Step):
             # TODO: If we could cleverly parse and manipulate the full commit diff
             # we could avoid cloning the servo repository altogether and only
             # have to fetch the commit diffs from GitHub.
-            # NB: The output of git show might include binary files or non-UTF8 text,
+            # NB: The output of git might include binary files or non-UTF8 text,
             # so store the content of the diff as a `bytes`.
             diff = local_servo_repo.run_without_encoding(
-                "show", "--binary", "--format=%b", sha, "--", UPSTREAMABLE_PATH
+                "diff-tree", "--binary", "--no-commit-id", "-p", sha, "--", UPSTREAMABLE_PATH
             )
 
             # Retrieve the diff of any changes to files that are relevant
@@ -128,41 +123,32 @@ class CreateOrUpdateBranchForPRStep(Step):
                 # commit to another repository.
                 filtered_commits += [
                     {
-                        "author": local_servo_repo.run(
-                            "show", "-s", "--pretty=%an <%ae>", sha
-                        ),
-                        "message": local_servo_repo.run(
-                            "show", "-s", "--pretty=%B", sha
-                        ),
+                        "author": local_servo_repo.run("show", "-s", "--pretty=%an <%ae>", sha),
+                        "message": local_servo_repo.run("show", "-s", "--pretty=%B", sha),
                         "diff": diff,
                     }
                 ]
         return filtered_commits
 
-    def _apply_filtered_servo_commit_to_wpt(self, run: SyncRun, commit: dict):
+    def _apply_filtered_servo_commit_to_wpt(self, run: SyncRun, commit: dict) -> None:
         patch_path = os.path.join(run.sync.wpt_path, PATCH_FILE_NAME)
         strip_count = UPSTREAMABLE_PATH.count("/") + 1
 
         try:
             with open(patch_path, "wb") as file:
                 file.write(commit["diff"])
-            run.sync.local_wpt_repo.run(
-                "apply", PATCH_FILE_NAME, "-p", str(strip_count)
-            )
+            run.sync.local_wpt_repo.run("apply", PATCH_FILE_NAME, "-p", str(strip_count))
         finally:
             # Ensure the patch file is not added with the other changes.
             os.remove(patch_path)
 
         run.sync.local_wpt_repo.run("add", "--all")
-        run.sync.local_wpt_repo.run(
-            "commit", "--message", commit["message"], "--author", commit["author"]
-        )
+        run.sync.local_wpt_repo.run("commit", "--message", commit["message"], "--author", commit["author"])
 
     def _create_or_update_branch_for_pr(
-        self, run: SyncRun, commits: list[dict], pre_commit_callback=None
-    ):
-        branch_name = wpt_branch_name_from_servo_pr_number(
-            self.pull_data["number"])
+        self, run: SyncRun, commits: list[dict], pre_commit_callback: Callable[[], None] | None = None
+    ) -> str:
+        branch_name = wpt_branch_name_from_servo_pr_number(self.pull_data["number"])
         try:
             # Create a new branch with a unique name that is consistent between
             # updates of the same PR.
@@ -176,7 +162,6 @@ class CreateOrUpdateBranchForPRStep(Step):
 
             # Push the branch upstream (forcing to overwrite any existing changes).
             if not run.sync.suppress_force_push:
-
                 # In order to push to our downstream branch we need to ensure that
                 # the local repository isn't a shallow clone. Shallow clones are
                 # commonly created by GitHub actions.
@@ -186,10 +171,8 @@ class CreateOrUpdateBranchForPRStep(Step):
                 token = run.sync.github_api_token
                 repo = run.sync.downstream_wpt_repo
                 remote_url = f"https://{user}:{token}@github.com/{repo}.git"
-                run.sync.local_wpt_repo.run(
-                    "push", "-f", remote_url, branch_name)
+                run.sync.local_wpt_repo.run("push", "-f", remote_url, branch_name)
 
-            return branch_name
         finally:
             try:
                 run.sync.local_wpt_repo.run("checkout", "master")
@@ -197,14 +180,15 @@ class CreateOrUpdateBranchForPRStep(Step):
             except Exception:
                 pass
 
+        return branch_name
+
 
 class RemoveBranchForPRStep(Step):
-    def __init__(self, pull_request):
+    def __init__(self, pull_request: dict[str, Any]) -> None:
         Step.__init__(self, "RemoveBranchForPRStep")
-        self.branch_name = wpt_branch_name_from_servo_pr_number(
-            pull_request["number"])
+        self.branch_name = wpt_branch_name_from_servo_pr_number(pull_request["number"])
 
-    def run(self, run: SyncRun):
+    def run(self, run: SyncRun) -> None:
         self.name += f":{run.sync.downstream_wpt.get_branch(self.branch_name)}"
         logging.info("  -> Removing branch used for upstream PR")
         if not run.sync.suppress_force_push:
@@ -212,8 +196,7 @@ class RemoveBranchForPRStep(Step):
             token = run.sync.github_api_token
             repo = run.sync.downstream_wpt_repo
             remote_url = f"https://{user}:{token}@github.com/{repo}.git"
-            run.sync.local_wpt_repo.run("push", remote_url, "--delete",
-                                        self.branch_name)
+            run.sync.local_wpt_repo.run("push", remote_url, "--delete", self.branch_name)
 
 
 class ChangePRStep(Step):
@@ -223,7 +206,7 @@ class ChangePRStep(Step):
         state: str,
         title: Optional[str] = None,
         body: Optional[str] = None,
-    ):
+    ) -> None:
         name = f"ChangePRStep:{pull_request}:{state}"
         if title:
             name += f":{title}"
@@ -234,39 +217,33 @@ class ChangePRStep(Step):
         self.title = title
         self.body = body
 
-    def run(self, run: SyncRun):
+    def run(self, run: SyncRun) -> None:
         body = self.body
         if body:
             body = run.prepare_body_text(body)
-            self.name += (
-                f':{textwrap.shorten(body, width=20, placeholder="...")}[{len(body)}]'
-            )
+            self.name += f":{textwrap.shorten(body, width=20, placeholder='...')}[{len(body)}]"
 
         self.pull_request.change(state=self.state, title=self.title, body=body)
 
 
 class MergePRStep(Step):
-    def __init__(self, pull_request: PullRequest, labels_to_remove: list[str] = []):
+    def __init__(self, pull_request: PullRequest, labels_to_remove: list[str] = []) -> None:
         Step.__init__(self, f"MergePRStep:{pull_request}")
         self.pull_request = pull_request
         self.labels_to_remove = labels_to_remove
 
-    def run(self, run: SyncRun):
-        for label in self.labels_to_remove:
-            self.pull_request.remove_label(label)
+    def run(self, run: SyncRun) -> None:
         try:
+            for label in self.labels_to_remove:
+                self.pull_request.remove_label(label)
             self.pull_request.merge()
         except Exception as exception:
             logging.warning("Could not merge PR (%s).", self.pull_request)
             logging.warning(exception, exc_info=True)
 
             run.steps = []
-            run.add_step(CommentStep(
-                self.pull_request, COULD_NOT_MERGE_CHANGES_UPSTREAM_COMMENT
-            ))
-            run.add_step(CommentStep(
-                run.servo_pr, COULD_NOT_MERGE_CHANGES_DOWNSTREAM_COMMENT
-            ))
+            run.add_step(CommentStep(self.pull_request, COULD_NOT_MERGE_CHANGES_UPSTREAM_COMMENT))
+            run.add_step(CommentStep(run.servo_pr, COULD_NOT_MERGE_CHANGES_DOWNSTREAM_COMMENT))
             self.pull_request.add_labels(["stale-servo-export"])
 
 
@@ -278,7 +255,7 @@ class OpenPRStep(Step):
         title: str,
         body: str,
         labels: list[str],
-    ):
+    ) -> None:
         Step.__init__(self, "OpenPRStep")
         self.title = title
         self.body = body
@@ -287,10 +264,10 @@ class OpenPRStep(Step):
         self.new_pr: AsyncValue[PullRequest] = AsyncValue()
         self.labels = labels
 
-    def provides(self):
+    def provides(self) -> AsyncValue[PullRequest]:
         return self.new_pr
 
-    def run(self, run: SyncRun):
+    def run(self, run: SyncRun) -> None:
         pull_request = self.target_repo.open_pull_request(
             self.source_branch.value(), self.title, run.prepare_body_text(self.body)
         )
@@ -304,12 +281,12 @@ class OpenPRStep(Step):
 
 
 class CommentStep(Step):
-    def __init__(self, pull_request: PullRequest, comment_template: str):
+    def __init__(self, pull_request: PullRequest, comment_template: str) -> None:
         Step.__init__(self, "CommentStep")
         self.pull_request = pull_request
         self.comment_template = comment_template
 
-    def run(self, run: SyncRun):
+    def run(self, run: SyncRun) -> None:
         comment = run.make_comment(self.comment_template)
         self.name += f":{self.pull_request}:{comment}"
         self.pull_request.leave_comment(comment)

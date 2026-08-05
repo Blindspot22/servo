@@ -5,32 +5,52 @@
 use std::borrow::Cow;
 
 use dom_struct::dom_struct;
+use js::context::{JSContext, NoGC};
+use script_bindings::cell::DomRefCell;
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
 use webgpu_traits::{WebGPU, WebGPUBindGroupLayout, WebGPURequest};
 use wgpu_core::binding_model::BindGroupLayoutDescriptor;
 
 use crate::conversions::Convert;
-use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::WebGPUBinding::{
     GPUBindGroupLayoutDescriptor, GPUBindGroupLayoutMethods,
 };
 use crate::dom::bindings::error::Fallible;
-use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object};
+use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::USVString;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::webgpu::gpuconvert::convert_bind_group_layout_entry;
 use crate::dom::webgpu::gpudevice::GPUDevice;
-use crate::script_runtime::CanGc;
+
+#[derive(JSTraceable, MallocSizeOf)]
+struct DroppableGPUBindGroupLayout {
+    #[no_trace]
+    channel: WebGPU,
+    #[no_trace]
+    bind_group_layout: WebGPUBindGroupLayout,
+}
+
+impl Drop for DroppableGPUBindGroupLayout {
+    fn drop(&mut self) {
+        if let Err(e) = self
+            .channel
+            .0
+            .send(WebGPURequest::DropBindGroupLayout(self.bind_group_layout.0))
+        {
+            warn!(
+                "Failed to send WebGPURequest::DropBindGroupLayout({:?}) ({})",
+                self.bind_group_layout.0, e
+            );
+        };
+    }
+}
 
 #[dom_struct]
 pub(crate) struct GPUBindGroupLayout {
     reflector_: Reflector,
-    #[ignore_malloc_size_of = "channels are hard"]
-    #[no_trace]
-    channel: WebGPU,
     label: DomRefCell<USVString>,
-    #[no_trace]
-    bind_group_layout: WebGPUBindGroupLayout,
+    droppable: DroppableGPUBindGroupLayout,
 }
 
 impl GPUBindGroupLayout {
@@ -41,41 +61,43 @@ impl GPUBindGroupLayout {
     ) -> Self {
         Self {
             reflector_: Reflector::new(),
-            channel,
             label: DomRefCell::new(label),
-            bind_group_layout,
+            droppable: DroppableGPUBindGroupLayout {
+                channel,
+                bind_group_layout,
+            },
         }
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
         channel: WebGPU,
         bind_group_layout: WebGPUBindGroupLayout,
         label: USVString,
-        can_gc: CanGc,
     ) -> DomRoot<Self> {
-        reflect_dom_object(
+        reflect_dom_object_with_cx(
             Box::new(GPUBindGroupLayout::new_inherited(
                 channel,
                 bind_group_layout,
                 label,
             )),
             global,
-            can_gc,
+            cx,
         )
     }
 }
 
 impl GPUBindGroupLayout {
     pub(crate) fn id(&self) -> WebGPUBindGroupLayout {
-        self.bind_group_layout
+        self.droppable.bind_group_layout
     }
 
     /// <https://gpuweb.github.io/gpuweb/#GPUDevice-createBindGroupLayout>
     pub(crate) fn create(
+        cx: &mut JSContext,
         device: &GPUDevice,
         descriptor: &GPUBindGroupLayoutDescriptor,
-        can_gc: CanGc,
     ) -> Fallible<DomRoot<GPUBindGroupLayout>> {
         let entries = descriptor
             .entries
@@ -108,27 +130,12 @@ impl GPUBindGroupLayout {
         let bgl = WebGPUBindGroupLayout(bind_group_layout_id);
 
         Ok(GPUBindGroupLayout::new(
+            cx,
             &device.global(),
-            device.channel().clone(),
+            device.channel(),
             bgl,
             descriptor.parent.label.clone(),
-            can_gc,
         ))
-    }
-}
-
-impl Drop for GPUBindGroupLayout {
-    fn drop(&mut self) {
-        if let Err(e) = self
-            .channel
-            .0
-            .send(WebGPURequest::DropBindGroupLayout(self.bind_group_layout.0))
-        {
-            warn!(
-                "Failed to send WebGPURequest::DropBindGroupLayout({:?}) ({})",
-                self.bind_group_layout.0, e
-            );
-        };
     }
 }
 
@@ -139,7 +146,7 @@ impl GPUBindGroupLayoutMethods<crate::DomTypeHolder> for GPUBindGroupLayout {
     }
 
     /// <https://gpuweb.github.io/gpuweb/#dom-gpuobjectbase-label>
-    fn SetLabel(&self, value: USVString) {
-        *self.label.borrow_mut() = value;
+    fn SetLabel(&self, no_gc: &NoGC, value: USVString) {
+        *self.label.safe_borrow_mut(no_gc) = value;
     }
 }

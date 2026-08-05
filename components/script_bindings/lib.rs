@@ -3,12 +3,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 #![cfg_attr(crown, feature(register_tool))]
-// Register the linter `crown`, which is the Servo-specific linter for the script
-// crate. Issue a warning if `crown` is not being used to compile, but not when
-// building rustdoc or running clippy.
+// Register the linter `crown`, which is the Servo-specific linter for the script crate.
 #![cfg_attr(crown, register_tool(crown))]
-#![cfg_attr(any(doc, clippy), allow(unknown_lints))]
-#![deny(crown_is_not_used)]
 
 #[macro_use]
 extern crate js;
@@ -19,15 +15,20 @@ extern crate log;
 #[macro_use]
 extern crate malloc_size_of_derive;
 
+pub mod assert;
 pub mod callback;
+pub mod cell;
 mod constant;
 mod constructor;
 pub mod conversions;
+pub mod dom;
+pub mod domstring;
 pub mod error;
 mod finalize;
 mod guard;
 mod import;
 pub mod inheritance;
+mod init;
 pub mod interface;
 pub mod interfaces;
 pub mod iterable;
@@ -45,16 +46,18 @@ pub mod root;
 pub mod script_runtime;
 pub mod settings_stack;
 pub mod str;
+pub mod structuredclone;
 pub mod trace;
 pub mod utils;
 pub mod weakref;
+pub mod wrap;
 
-#[allow(non_snake_case)]
+#[allow(non_snake_case, unsafe_op_in_unsafe_fn)]
 pub mod codegen {
     pub mod Globals {
         include!(concat!(env!("OUT_DIR"), "/Globals.rs"));
     }
-    #[allow(dead_code, unused_imports, clippy::enum_variant_names)]
+    #[allow(unused_imports, clippy::enum_variant_names)]
     pub mod InheritTypes {
         include!(concat!(env!("OUT_DIR"), "/InheritTypes.rs"));
     }
@@ -66,7 +69,6 @@ pub mod codegen {
         include!(concat!(env!("OUT_DIR"), "/DomTypes.rs"));
     }
     #[allow(
-        dead_code,
         clippy::extra_unused_type_parameters,
         clippy::missing_safety_doc,
         clippy::result_unit_err

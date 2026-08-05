@@ -2,157 +2,151 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::net::TcpStream;
+use std::sync::Arc;
 
-use base::id::TEST_PIPELINE_ID;
+use atomic_refcell::AtomicRefCell;
 use devtools_traits::DevtoolScriptControlMsg::WantsLiveNotifications;
 use devtools_traits::{DevtoolScriptControlMsg, WorkerId};
-use ipc_channel::ipc::IpcSender;
+use malloc_size_of_derive::MallocSizeOf;
+use rustc_hash::FxHashSet;
 use serde::Serialize;
 use serde_json::{Map, Value};
+use servo_base::generic_channel::GenericSender;
+use servo_base::id::TEST_PIPELINE_ID;
 use servo_url::ServoUrl;
 
 use crate::StreamId;
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
-use crate::protocol::JsonPacketStream;
-use crate::resource::{ResourceAvailable, ResourceAvailableReply};
+use crate::actor::{Actor, ActorEncode, ActorError, ActorRegistry, new_actor_name};
+use crate::protocol::{ClientRequest, JsonPacketStream};
+use crate::resource::ResourceAvailable;
 
-#[derive(Clone, Copy)]
-#[allow(dead_code)]
+#[derive(Clone, Copy, MallocSizeOf)]
+#[expect(dead_code)]
 pub enum WorkerType {
     Dedicated = 0,
     Shared = 1,
     Service = 2,
 }
 
-pub(crate) struct WorkerActor {
+#[derive(MallocSizeOf)]
+pub(crate) struct WorkerTargetActor {
     pub name: String,
-    pub console: String,
-    pub thread: String,
+    pub console_name: String,
+    pub thread_name: String,
     pub worker_id: WorkerId,
     pub url: ServoUrl,
     pub type_: WorkerType,
-    pub script_chan: IpcSender<DevtoolScriptControlMsg>,
-    pub streams: RefCell<HashMap<StreamId, TcpStream>>,
+    pub script_sender: GenericSender<DevtoolScriptControlMsg>,
+    pub streams: AtomicRefCell<FxHashSet<StreamId>>,
 }
 
-impl WorkerActor {
-    pub(crate) fn encodable(&self) -> WorkerMsg {
-        WorkerMsg {
-            actor: self.name.clone(),
-            console_actor: self.console.clone(),
-            thread_actor: self.thread.clone(),
-            id: self.worker_id.0.to_string(),
-            url: self.url.to_string(),
-            traits: WorkerTraits {
-                is_parent_intercept_enabled: false,
-                supports_top_level_target_flag: false,
-            },
-            type_: self.type_ as u32,
-            target_type: "worker".to_string(),
-        }
-    }
-}
-
-impl ResourceAvailable for WorkerActor {
+impl ResourceAvailable for WorkerTargetActor {
     fn actor_name(&self) -> String {
         self.name.clone()
     }
+}
 
-    fn get_streams(&self) -> &RefCell<HashMap<StreamId, TcpStream>> {
-        &self.streams
+impl WorkerTargetActor {
+    pub fn register(
+        registry: &ActorRegistry,
+        console_name: String,
+        thread_name: String,
+        worker_id: WorkerId,
+        url: ServoUrl,
+        worker_type: WorkerType,
+        script_sender: GenericSender<DevtoolScriptControlMsg>,
+    ) -> Arc<Self> {
+        let name = new_actor_name::<Self>();
+        let actor = Self {
+            name,
+            console_name,
+            thread_name,
+            worker_id,
+            url,
+            type_: worker_type,
+            script_sender,
+            streams: Default::default(),
+        };
+        registry.register::<Self>(actor)
     }
 }
 
-impl Actor for WorkerActor {
-    fn name(&self) -> String {
-        self.name.clone()
+impl Actor for WorkerTargetActor {
+    fn name(&self) -> &str {
+        &self.name
     }
     fn handle_message(
         &self,
+        mut request: ClientRequest,
         _registry: &ActorRegistry,
         msg_type: &str,
         _msg: &Map<String, Value>,
-        stream: &mut TcpStream,
         stream_id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
-        Ok(match msg_type {
+    ) -> Result<(), ActorError> {
+        match msg_type {
             "attach" => {
                 let msg = AttachedReply {
-                    from: self.name(),
+                    from: self.name().into(),
                     type_: "attached".to_owned(),
                     url: self.url.as_str().to_owned(),
                 };
-                if stream.write_json_packet(&msg).is_err() {
-                    return Ok(ActorMessageStatus::Processed);
-                }
-                self.streams
-                    .borrow_mut()
-                    .insert(stream_id, stream.try_clone().unwrap());
+                // FIXME: we don’t send an actual reply (message without type), which seems to be a bug?
+                request.write_json_packet(&msg)?;
+                self.streams.borrow_mut().insert(stream_id);
                 // FIXME: fix messages to not require forging a pipeline for worker messages
-                self.script_chan
+                self.script_sender
                     .send(WantsLiveNotifications(TEST_PIPELINE_ID, true))
                     .unwrap();
-                ActorMessageStatus::Processed
             },
 
             "connect" => {
                 let msg = ConnectReply {
-                    from: self.name(),
+                    from: self.name().into(),
                     type_: "connected".to_owned(),
-                    thread_actor: self.thread.clone(),
-                    console_actor: self.console.clone(),
+                    thread_actor: self.thread_name.clone(),
+                    console_actor: self.console_name.clone(),
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                // FIXME: we don’t send an actual reply (message without type), which seems to be a bug?
+                request.write_json_packet(&msg)?;
             },
 
             "detach" => {
                 let msg = DetachedReply {
-                    from: self.name(),
+                    from: self.name().into(),
                     type_: "detached".to_string(),
                 };
-                let _ = stream.write_json_packet(&msg);
                 self.cleanup(stream_id);
-                ActorMessageStatus::Processed
+                // FIXME: we don’t send an actual reply (message without type), which seems to be a bug?
+                request.write_json_packet(&msg)?;
             },
 
-            _ => ActorMessageStatus::Ignored,
-        })
+            "getPushSubscription" => {
+                let msg = GetPushSubscriptionReply {
+                    from: self.name().into(),
+                    subscription: None,
+                };
+                request.reply_final(&msg)?
+            },
+
+            _ => return Err(ActorError::UnrecognizedPacketType),
+        };
+        Ok(())
     }
 
     fn cleanup(&self, stream_id: StreamId) {
         self.streams.borrow_mut().remove(&stream_id);
         if self.streams.borrow().is_empty() {
-            self.script_chan
+            self.script_sender
                 .send(WantsLiveNotifications(TEST_PIPELINE_ID, false))
                 .unwrap();
         }
     }
 }
 
-impl WorkerActor {
-    pub(crate) fn resource_available<T: Serialize>(&self, resource: T, resource_type: String) {
-        self.resources_available(vec![resource], resource_type);
-    }
-
-    pub(crate) fn resources_available<T: Serialize>(
-        &self,
-        resources: Vec<T>,
-        resource_type: String,
-    ) {
-        let msg = ResourceAvailableReply::<T> {
-            from: self.name(),
-            type_: "resources-available-array".into(),
-            array: vec![(resource_type, resources)],
-        };
-
-        for stream in self.streams.borrow_mut().values_mut() {
-            let _ = stream.write_json_packet(&msg);
-        }
-    }
+#[derive(Serialize)]
+struct GetPushSubscriptionReply {
+    from: String,
+    subscription: Option<()>,
 }
 
 #[derive(Serialize)]
@@ -189,7 +183,7 @@ struct WorkerTraits {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct WorkerMsg {
+pub(crate) struct WorkerTargetActorMsg {
     actor: String,
     console_actor: String,
     thread_actor: String,
@@ -200,4 +194,26 @@ pub(crate) struct WorkerMsg {
     type_: u32,
     #[serde(rename = "targetType")]
     target_type: String,
+}
+
+impl ActorEncode<WorkerTargetActorMsg> for WorkerTargetActor {
+    fn encode(&self, _: &ActorRegistry) -> WorkerTargetActorMsg {
+        WorkerTargetActorMsg {
+            actor: self.name().into(),
+            console_actor: self.console_name.clone(),
+            thread_actor: self.thread_name.clone(),
+            id: self.worker_id.0.to_string(),
+            url: self.url.to_string(),
+            traits: WorkerTraits {
+                is_parent_intercept_enabled: false,
+                supports_top_level_target_flag: false,
+            },
+            type_: self.type_ as u32,
+            target_type: match self.type_ {
+                WorkerType::Service => "service_worker",
+                _ => "worker",
+            }
+            .to_string(),
+        }
+    }
 }

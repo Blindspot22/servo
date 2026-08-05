@@ -50,7 +50,7 @@ interface Document : Node {
   ProcessingInstruction createProcessingInstruction(DOMString target, DOMString data);
 
   [CEReactions, NewObject, Throws]
-  Node importNode(Node node, optional boolean deep = false);
+  Node importNode(Node node, optional (boolean or ImportNodeOptions) options = false);
   [CEReactions, Throws]
   Node adoptNode(Node node);
 
@@ -84,9 +84,17 @@ dictionary ElementCreationOptions {
   DOMString is;
 };
 
+dictionary ImportNodeOptions {
+  CustomElementRegistry customElementRegistry;
+  boolean selfOnly = false;
+};
+
 // https://html.spec.whatwg.org/multipage/#the-document-object
 // [LegacyOverrideBuiltIns]
 partial /*sealed*/ interface Document {
+  [NewObject, Throws]
+  static Document parseHTMLUnsafe((TrustedHTML or DOMString) html, optional SetHTMLUnsafeOptions options = {});
+
   // resource metadata management
   [PutForwards=href, LegacyUnforgeable]
   readonly attribute Location? location;
@@ -138,13 +146,13 @@ partial /*sealed*/ interface Document {
   boolean hasFocus();
   // [CEReactions]
   // attribute DOMString designMode;
-  // [CEReactions]
-  // boolean execCommand(DOMString commandId, optional boolean showUI = false, optional DOMString value = "");
-  // boolean queryCommandEnabled(DOMString commandId);
-  // boolean queryCommandIndeterm(DOMString commandId);
-  // boolean queryCommandState(DOMString commandId);
-  boolean queryCommandSupported(DOMString commandId);
-  // DOMString queryCommandValue(DOMString commandId);
+  [CEReactions, Throws, Pref="dom_exec_command_enabled"]
+  boolean execCommand(DOMString commandId, optional boolean showUI = false, optional (TrustedHTML or DOMString) value = "");
+  [Pref="dom_exec_command_enabled"] boolean queryCommandEnabled(DOMString commandId);
+  [Pref="dom_exec_command_enabled"] boolean queryCommandIndeterm(DOMString commandId);
+  [Pref="dom_exec_command_enabled"] boolean queryCommandState(DOMString commandId);
+  [Pref="dom_exec_command_enabled"] boolean queryCommandSupported(DOMString commandId);
+  [Pref="dom_exec_command_enabled"] DOMString queryCommandValue(DOMString commandId);
   readonly attribute boolean hidden;
   readonly attribute DocumentVisibilityState visibilityState;
 
@@ -154,7 +162,6 @@ partial /*sealed*/ interface Document {
   // also has obsolete members
 };
 Document includes GlobalEventHandlers;
-Document includes DocumentAndElementEventHandlers;
 
 // https://html.spec.whatwg.org/multipage/#Document-partial
 partial interface Document {
@@ -193,7 +200,6 @@ partial interface Document {
 // https://fullscreen.spec.whatwg.org/#api
 partial interface Document {
   [LegacyLenientSetter] readonly attribute boolean fullscreenEnabled;
-  [LegacyLenientSetter] readonly attribute Element? fullscreenElement;
   [LegacyLenientSetter] readonly attribute boolean fullscreen; // historical
 
   Promise<undefined> exitFullscreen();
@@ -219,6 +225,10 @@ partial interface Document {
   Selection? getSelection();
 };
 
+// https://drafts.csswg.org/web-animations-1/#extensions-to-the-document-interface
+partial interface Document {
+    readonly attribute DocumentTimeline timeline;
+};
 
 // Servo internal API.
 partial interface Document {
@@ -228,3 +238,9 @@ partial interface Document {
 
 // https://html.spec.whatwg.org/multipage/#dom-document-nameditem-filter
 typedef (WindowProxy or Element or HTMLCollection) NamedPropertyValue;
+
+// https://wicg.github.io/sanitizer-api/#sanitizer-api
+partial interface Document {
+  [Throws]
+  static Document parseHTML(DOMString html, optional SetHTMLOptions options = {});
+};

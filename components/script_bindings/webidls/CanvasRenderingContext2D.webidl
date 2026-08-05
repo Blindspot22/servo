@@ -9,12 +9,16 @@
 typedef HTMLImageElement HTMLOrSVGImageElement;
 
 typedef (HTMLOrSVGImageElement or
-         /*HTMLVideoElement or*/
+         HTMLVideoElement or
          HTMLCanvasElement or
-         /*ImageBitmap or*/
+         ImageBitmap or
          OffscreenCanvas or
          /*VideoFrame or*/
          /*CSSImageValue*/ CSSStyleValue) CanvasImageSource;
+
+enum PredefinedColorSpace { "srgb"/*, "display-p3"*/ };
+
+enum CanvasColorType { "unorm8", "float16" };
 
 enum CanvasFillRule { "nonzero", "evenodd" };
 
@@ -60,13 +64,16 @@ interface mixin CanvasTransform {
                  unrestricted double f);
 
   [NewObject] DOMMatrix getTransform();
+  // See https://bugzilla.mozilla.org/show_bug.cgi?id=1020975
+  [Throws]
   undefined setTransform(unrestricted double a,
                     unrestricted double b,
                     unrestricted double c,
                     unrestricted double d,
                     unrestricted double e,
                     unrestricted double f);
-  // void setTransform(optional DOMMatrixInit matrix);
+  [Throws]
+  undefined setTransform(optional DOMMatrix2DInit transform = {});
   undefined resetTransform();
 };
 
@@ -142,8 +149,9 @@ interface mixin CanvasText {
   [Pref="dom_canvas_text_enabled"]
   undefined fillText(DOMString text, unrestricted double x, unrestricted double y,
                 optional unrestricted double maxWidth);
-  //void strokeText(DOMString text, unrestricted double x, unrestricted double y,
-  //                optional unrestricted double maxWidth);
+  [Pref="dom_canvas_text_enabled"]
+  undefined strokeText(DOMString text, unrestricted double x, unrestricted double y,
+                  optional unrestricted double maxWidth);
   [Pref="dom_canvas_text_enabled"]
   TextMetrics measureText(DOMString text);
 };
@@ -247,20 +255,32 @@ interface CanvasGradient {
 [Exposed=(Window, PaintWorklet, Worker)]
 interface CanvasPattern {
   // opaque object
-  //undefined setTransform(optional DOMMatrix2DInit transform = {});
+  [Throws]
+  undefined setTransform(optional DOMMatrix2DInit transform = {});
+};
+
+// TODO: Float16Array
+typedef Uint8ClampedArray ImageDataArray;
+
+enum ImageDataPixelFormat { "rgba-unorm8"/*, "rgba-float16"*/ };
+
+dictionary ImageDataSettings {
+  PredefinedColorSpace colorSpace;
+  ImageDataPixelFormat pixelFormat = "rgba-unorm8";
 };
 
 [Exposed=(Window,Worker),
  Serializable]
 interface ImageData {
-  [Throws] constructor(unsigned long sw, unsigned long sh/*, optional ImageDataSettings settings = {}*/);
-  [Throws] constructor(/* Uint8ClampedArray */ object data, unsigned long sw, optional unsigned long sh
-              /*, optional ImageDataSettings settings = {}*/);
+  [Throws] constructor(unsigned long sw, unsigned long sh, optional ImageDataSettings settings = {});
+  [Throws] constructor(ImageDataArray data, unsigned long sw,
+                       optional unsigned long sh, optional ImageDataSettings settings = {});
 
   readonly attribute unsigned long width;
   readonly attribute unsigned long height;
-  [Throws] readonly attribute Uint8ClampedArray data;
-  //readonly attribute PredefinedColorSpace colorSpace;
+  [Throws] readonly attribute ImageDataArray data;
+  readonly attribute ImageDataPixelFormat pixelFormat;
+  readonly attribute PredefinedColorSpace colorSpace;
 };
 
 [Exposed=(Window,Worker)]
@@ -268,6 +288,7 @@ interface Path2D {
   constructor();
   constructor(Path2D other);
   constructor(DOMString pathString);
-  undefined addPath(Path2D path/*, SVGMatrix? transformation*/);
+  [Throws]
+  undefined addPath(Path2D path, optional DOMMatrix2DInit transform = {});
 };
 Path2D includes CanvasPath;

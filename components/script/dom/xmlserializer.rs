@@ -3,17 +3,18 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use js::rust::HandleObject;
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 use xml5ever::serialize::{SerializeOpts, TraversalScope, serialize};
 
 use crate::dom::bindings::codegen::Bindings::XMLSerializerBinding::XMLSerializerMethods;
 use crate::dom::bindings::error::{Error, Fallible};
-use crate::dom::bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::node::Node;
+use crate::dom::servoparser::html::HtmlSerialize;
 use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct XMLSerializer {
@@ -30,43 +31,43 @@ impl XMLSerializer {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         window: &Window,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
     ) -> DomRoot<XMLSerializer> {
         reflect_dom_object_with_proto(
+            cx,
             Box::new(XMLSerializer::new_inherited(window)),
             window,
             proto,
-            can_gc,
         )
     }
 }
 
 impl XMLSerializerMethods<crate::DomTypeHolder> for XMLSerializer {
-    // https://w3c.github.io/DOM-Parsing/#dom-xmlserializer
+    /// <https://w3c.github.io/DOM-Parsing/#dom-xmlserializer>
     fn Constructor(
+        cx: &mut JSContext,
         window: &Window,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
     ) -> Fallible<DomRoot<XMLSerializer>> {
-        Ok(XMLSerializer::new(window, proto, can_gc))
+        Ok(XMLSerializer::new(cx, window, proto))
     }
 
-    // https://w3c.github.io/DOM-Parsing/#the-xmlserializer-interface
+    /// <https://w3c.github.io/DOM-Parsing/#the-xmlserializer-interface>
     fn SerializeToString(&self, root: &Node) -> Fallible<DOMString> {
         let mut writer = vec![];
         match serialize(
             &mut writer,
-            &root,
+            &HtmlSerialize::new(root),
             SerializeOpts {
                 traversal_scope: TraversalScope::IncludeNode,
             },
         ) {
             Ok(_) => Ok(DOMString::from(String::from_utf8(writer).unwrap())),
-            Err(_) => Err(Error::Type(String::from(
-                "root must be a Node or an Attr object",
-            ))),
+            Err(_) => Err(Error::Type(
+                c"root must be a Node or an Attr object".to_owned(),
+            )),
         }
     }
 }

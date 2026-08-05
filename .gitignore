@@ -5,7 +5,6 @@
 /.servobuild
 /.wpt
 /.vs
-/android-toolchains
 /target
 /tests/wpt/reftests-report/report.html
 /python/_virtualenv*
@@ -29,6 +28,10 @@ servo.pftrace
 /glfw
 webrender-captures/
 /screenshots
+/etc/notarization/
+
+# Python setuptools
+/servo.egg-info
 
 # Allow CSV files to be used as resources in tests
 !/tests/**/*.csv
@@ -38,9 +41,6 @@ webrender-captures/
 .idea
 *.iws
 *.iml
-
-## Gradle
-.gradle
 
 ## VSCode
 .vscode
@@ -57,6 +57,12 @@ webrender-captures/
 Session.vim
 Sessionx.vim
 
+# Zed
+/.zed
+
+# NeoVim
+.nvim.lua
+
 /unminified-js
 /unminified-css
 
@@ -68,3 +74,6 @@ support/macos/Brewfile.lock.json
 
 # direnv
 .envrc
+
+# Justfiles
+justfile

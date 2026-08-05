@@ -6,20 +6,20 @@
 
 use dom_struct::dom_struct;
 use indexmap::IndexSet;
+use js::context::JSContext;
 use js::rust::HandleObject;
+use script_bindings::cell::DomRefCell;
+use script_bindings::like::Setlike;
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 use wgpu_types::Features;
 
-use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::WebGPUBinding::{
     GPUFeatureName, GPUSupportedFeaturesMethods,
 };
 use crate::dom::bindings::error::Fallible;
-use crate::dom::bindings::like::Setlike;
-use crate::dom::bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct GPUSupportedFeatures {
@@ -34,12 +34,14 @@ pub(crate) struct GPUSupportedFeatures {
 
 impl GPUSupportedFeatures {
     fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
         features: Features,
-        can_gc: CanGc,
     ) -> DomRoot<GPUSupportedFeatures> {
         let mut set = IndexSet::new();
+        // everything that wgpu currently does is considered as part of "core"
+        set.insert(GPUFeatureName::Core_features_and_limits);
         if features.contains(Features::DEPTH_CLIP_CONTROL) {
             set.insert(GPUFeatureName::Depth_clip_control);
         }
@@ -82,8 +84,16 @@ impl GPUSupportedFeatures {
         if features.contains(Features::DUAL_SOURCE_BLENDING) {
             set.insert(GPUFeatureName::Dual_source_blending);
         }
+        // While this feature exists in wgpu, it's not supported by naga yet
+        // https://github.com/gfx-rs/wgpu/issues/5555
+        /*
+        if features.contains(Features::SUBGROUP) {
+            set.insert(GPUFeatureName::Subgroups);
+        }
+        */
 
         reflect_dom_object_with_proto(
+            cx,
             Box::new(GPUSupportedFeatures {
                 reflector: Reflector::new(),
                 internal: DomRefCell::new(set),
@@ -91,35 +101,36 @@ impl GPUSupportedFeatures {
             }),
             global,
             proto,
-            can_gc,
         )
     }
 
-    #[allow(non_snake_case)]
+    #[expect(non_snake_case)]
     pub(crate) fn Constructor(
+        cx: &mut JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
         features: Features,
-        can_gc: CanGc,
     ) -> Fallible<DomRoot<GPUSupportedFeatures>> {
-        Ok(GPUSupportedFeatures::new(global, proto, features, can_gc))
+        Ok(GPUSupportedFeatures::new(cx, global, proto, features))
     }
 }
 
 impl GPUSupportedFeatures {
-    pub(crate) fn wgpu_features(&self) -> Features {
-        self.features
+    pub(crate) fn wgpu_features(&self) -> &Features {
+        &self.features
     }
 }
 
 impl GPUSupportedFeaturesMethods<crate::DomTypeHolder> for GPUSupportedFeatures {
     fn Size(&self) -> u32 {
-        self.internal.size()
+        self.internal.borrow().len() as u32
     }
 }
 
 pub(crate) fn gpu_to_wgt_feature(feature: GPUFeatureName) -> Option<Features> {
     match feature {
+        // everything that wgpu currently does is considered as part of "core"
+        GPUFeatureName::Core_features_and_limits => Some(Features::empty()),
         GPUFeatureName::Depth_clip_control => Some(Features::DEPTH_CLIP_CONTROL),
         GPUFeatureName::Depth32float_stencil8 => Some(Features::DEPTH32FLOAT_STENCIL8),
         GPUFeatureName::Texture_compression_bc => Some(Features::TEXTURE_COMPRESSION_BC),
@@ -136,6 +147,9 @@ pub(crate) fn gpu_to_wgt_feature(feature: GPUFeatureName) -> Option<Features> {
         GPUFeatureName::Dual_source_blending => Some(Features::DUAL_SOURCE_BLENDING),
         GPUFeatureName::Texture_compression_bc_sliced_3d => None,
         GPUFeatureName::Clip_distances => None,
+        // While this feature exists in wgpu, it's not supported by naga yet
+        // https://github.com/gfx-rs/wgpu/issues/5555
+        GPUFeatureName::Subgroups => None,
     }
 }
 
@@ -143,33 +157,33 @@ impl Setlike for GPUSupportedFeatures {
     type Key = DOMString;
 
     #[inline(always)]
-    fn get_index(&self, index: u32) -> Option<Self::Key> {
+    fn get_index(&self, cx: &mut JSContext, index: u32) -> Option<Self::Key> {
         self.internal
-            .get_index(index)
-            .map(|k| DOMString::from_string(k.as_str().to_owned()))
+            .get_index(cx, index)
+            .map(|key| key.as_str().into())
     }
     #[inline(always)]
-    fn size(&self) -> u32 {
-        self.internal.size()
+    fn size(&self, cx: &mut JSContext) -> u32 {
+        self.internal.size(cx)
     }
     #[inline(always)]
-    fn add(&self, _key: Self::Key) {
+    fn add(&self, _cx: &mut JSContext, _key: Self::Key) {
         unreachable!("readonly");
     }
     #[inline(always)]
-    fn has(&self, key: Self::Key) -> bool {
+    fn has(&self, cx: &mut JSContext, key: Self::Key) -> bool {
         if let Ok(key) = key.parse() {
-            self.internal.has(key)
+            self.internal.has(cx, key)
         } else {
             false
         }
     }
     #[inline(always)]
-    fn clear(&self) {
+    fn clear(&self, _cx: &mut JSContext) {
         unreachable!("readonly");
     }
     #[inline(always)]
-    fn delete(&self, _key: Self::Key) -> bool {
+    fn delete(&self, _cx: &mut JSContext, _key: Self::Key) -> bool {
         unreachable!("readonly");
     }
 }

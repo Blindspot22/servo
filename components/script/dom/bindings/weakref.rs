@@ -8,9 +8,9 @@ use std::ops::{Deref, DerefMut, Drop};
 
 use js::jsapi::JSTracer;
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
+use script_bindings::cell::DomRefCell;
 pub(crate) use script_bindings::weakref::*;
 
-use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::trace::JSTraceable;
 
@@ -54,12 +54,9 @@ impl<T: WeakReferenceable> MallocSizeOf for MutableWeakRef<T> {
 unsafe impl<T: WeakReferenceable> JSTraceable for MutableWeakRef<T> {
     unsafe fn trace(&self, _: *mut JSTracer) {
         let ptr = self.cell.get();
-        let should_drop = match *ptr {
-            Some(ref value) => !value.is_alive(),
-            None => false,
-        };
-        if should_drop {
-            mem::drop((*ptr).take().unwrap());
+        let value = unsafe { &mut *ptr };
+        if value.as_ref().is_some_and(|value| !value.is_alive()) {
+            mem::drop(value.take().unwrap());
         }
     }
 }
@@ -169,7 +166,7 @@ impl<T: WeakReferenceable> DOMTracker<T> {
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 unsafe impl<T: WeakReferenceable> JSTraceable for DOMTracker<T> {
     unsafe fn trace(&self, _: *mut JSTracer) {
         self.dom_objects.borrow_mut().retain_alive();

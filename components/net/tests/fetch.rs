@@ -2,23 +2,21 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-#![cfg(not(target_os = "windows"))]
-
 use std::fs;
 use std::iter::FromIterator;
 use std::path::Path;
+use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
-use base::id::TEST_PIPELINE_ID;
 use content_security_policy as csp;
 use crossbeam_channel::{Sender, unbounded};
 use devtools_traits::{HttpRequest as DevtoolsHttpRequest, HttpResponse as DevtoolsHttpResponse};
 use headers::{
     AccessControlAllowCredentials, AccessControlAllowHeaders, AccessControlAllowMethods,
-    AccessControlAllowOrigin, AccessControlMaxAge, CacheControl, ContentLength, ContentType,
-    Expires, HeaderMapExt, LastModified, Pragma, StrictTransportSecurity, UserAgent,
+    AccessControlAllowOrigin, AccessControlMaxAge, CacheControl, ContentLength, ContentType, ETag,
+    Expires, HeaderMapExt, IfNoneMatch, LastModified, Pragma, StrictTransportSecurity, UserAgent,
 };
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, StatusCode};
@@ -26,13 +24,15 @@ use http_body_util::combinators::BoxBody;
 use hyper::body::{Bytes, Incoming};
 use hyper::{Request as HyperRequest, Response as HyperResponse};
 use mime::{self, Mime};
+use net::async_runtime::spawn_blocking_task;
+use net::connector::CACertificates;
 use net::fetch::cors_cache::CorsCache;
 use net::fetch::methods::{self, FetchContext};
 use net::filemanager_thread::FileManager;
 use net::hsts::HstsEntry;
 use net::protocols::ProtocolRegistry;
 use net::request_interceptor::RequestInterceptor;
-use net::resource_thread::CoreResourceThreadPool;
+use net_traits::blob_url_store::{BlobTokenCommunicator, UrlWithBlobClaim};
 use net_traits::filemanager_thread::FileTokenCheck;
 use net_traits::http_status::HttpStatus;
 use net_traits::request::{
@@ -41,17 +41,18 @@ use net_traits::request::{
 use net_traits::response::{CacheState, Response, ResponseBody, ResponseType};
 use net_traits::{
     FetchTaskTarget, IncludeSubdomains, NetworkError, ReferrerPolicy, ResourceFetchTiming,
-    ResourceTimingType,
+    ResourceTimingType, get_current_locale,
 };
-use servo_arc::Arc as ServoArc;
-use servo_url::ServoUrl;
+use servo_base::id::{TEST_PIPELINE_ID, TEST_WEBVIEW_ID};
+use servo_url::{ImmutableOrigin, ServoUrl};
+use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
-use crate::http_loader::{expect_devtools_http_request, expect_devtools_http_response};
+use crate::http_loader::{devtools_response_with_body, expect_devtools_http_request};
 use crate::{
-    DEFAULT_USER_AGENT, create_embedder_proxy, create_embedder_proxy_and_receiver,
+    DEFAULT_USER_AGENT, create_generic_embedder_proxy, create_generic_embedder_proxy_and_receiver,
     create_http_state, fetch, fetch_with_context, fetch_with_cors_cache, make_body, make_server,
-    make_ssl_server, new_fetch_context,
+    make_ssl_server, mock_origin, new_fetch_context,
 };
 
 // TODO write a struct that impls Handler for storing test values
@@ -66,8 +67,9 @@ fn test_fetch_response_is_not_network_error() {
         };
     let (server, url) = make_server(handler);
 
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
+        .policy_container(Default::default())
         .build();
     let fetch_response = fetch(request, None);
     let _ = server.close();
@@ -80,16 +82,18 @@ fn test_fetch_response_is_not_network_error() {
 #[test]
 fn test_fetch_on_bad_port_is_network_error() {
     let url = ServoUrl::parse("http://www.example.org:6667").unwrap();
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
-        .origin(url.origin())
-        .build();
+    let request = RequestBuilder::new(
+        Some(TEST_WEBVIEW_ID),
+        UrlWithBlobClaim::new(url.clone(), None),
+        Referrer::NoReferrer,
+    )
+    .origin(url.origin())
+    .policy_container(Default::default())
+    .build();
     let fetch_response = fetch(request, None);
     assert!(fetch_response.is_network_error());
     let fetch_error = fetch_response.get_network_error().unwrap();
-    assert_eq!(
-        fetch_error,
-        &NetworkError::Internal("Request attempted on bad port".into())
-    )
+    assert_eq!(fetch_error, &NetworkError::InvalidPort)
 }
 
 #[test]
@@ -102,8 +106,9 @@ fn test_fetch_response_body_matches_const_message() {
         };
     let (server, url) = make_server(handler);
 
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
+        .policy_container(Default::default())
         .build();
     let fetch_response = fetch(request, None);
     let _ = server.close();
@@ -111,7 +116,7 @@ fn test_fetch_response_body_matches_const_message() {
     assert!(!fetch_response.is_network_error());
     assert_eq!(fetch_response.response_type, ResponseType::Basic);
 
-    match *fetch_response.body.lock().unwrap() {
+    match *fetch_response.body.lock() {
         ResponseBody::Done(ref body) => {
             assert_eq!(&**body, MESSAGE);
         },
@@ -122,23 +127,28 @@ fn test_fetch_response_body_matches_const_message() {
 #[test]
 fn test_fetch_aboutblank() {
     let url = ServoUrl::parse("about:blank").unwrap();
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
-        .origin(url.origin())
-        .build();
+    let request = RequestBuilder::new(
+        Some(TEST_WEBVIEW_ID),
+        UrlWithBlobClaim::new(url.clone(), None),
+        Referrer::NoReferrer,
+    )
+    .origin(url.origin())
+    .policy_container(Default::default())
+    .build();
 
     let fetch_response = fetch(request, None);
     // We should see an opaque-filtered response.
     assert_eq!(fetch_response.response_type, ResponseType::Opaque);
     assert!(!fetch_response.is_network_error());
     assert_eq!(fetch_response.headers.len(), 0);
-    let resp_body = fetch_response.body.lock().unwrap();
+    let resp_body = fetch_response.body.lock();
     assert_eq!(*resp_body, ResponseBody::Empty);
 
     // The underlying response behind the filter should
     // have a 0-byte body.
     let actual_response = fetch_response.actual_response();
     assert!(!actual_response.is_network_error());
-    let resp_body = actual_response.body.lock().unwrap();
+    let resp_body = actual_response.body.lock();
     assert_eq!(*resp_body, ResponseBody::Done(vec![]));
 }
 
@@ -154,7 +164,6 @@ fn test_fetch_blob() {
 
     impl FetchTaskTarget for FetchResponseCollector {
         fn process_request_body(&mut self, _: &Request) {}
-        fn process_request_eof(&mut self, _: &Request) {}
         fn process_response(&mut self, _: &Request, _: &Response) {}
         fn process_response_chunk(&mut self, _: &Request, chunk: Vec<u8>) {
             self.buffer.extend_from_slice(chunk.as_slice());
@@ -165,13 +174,15 @@ fn test_fetch_blob() {
             let _ = self.sender.send(response.clone());
         }
         fn process_csp_violations(&mut self, _: &Request, _: Vec<csp::Violation>) {}
+
+        fn process_response_length_hint(&mut self, _: &Request, _: usize) {}
     }
 
-    let context = new_fetch_context(None, None, None);
+    let context = new_fetch_context(None, None);
 
     let bytes = b"content";
     let blob_buf = BlobBuf {
-        filename: Some("test.txt".into()),
+        filename: Some("test .txt".into()),
         type_string: "text/plain".into(),
         size: bytes.len() as u64,
         bytes: bytes.to_vec(),
@@ -180,17 +191,19 @@ fn test_fetch_blob() {
     let origin = ServoUrl::parse("http://www.example.org/").unwrap();
 
     let id = Uuid::new_v4();
-    context.filemanager.lock().unwrap().promote_memory(
-        id.clone(),
-        blob_buf,
-        true,
-        "http://www.example.org".into(),
-    );
+    context
+        .filemanager
+        .promote_memory(id.clone(), blob_buf, true, origin.origin());
     let url = ServoUrl::parse(&format!("blob:{}{}", origin.as_str(), id.simple())).unwrap();
 
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
-        .origin(origin.origin())
-        .build();
+    let request = RequestBuilder::new(
+        Some(TEST_WEBVIEW_ID),
+        UrlWithBlobClaim::from_url_without_having_claimed_blob(url.clone()),
+        Referrer::NoReferrer,
+    )
+    .origin(origin.origin())
+    .policy_container(Default::default())
+    .build();
 
     let (sender, receiver) = unbounded();
 
@@ -200,7 +213,7 @@ fn test_fetch_blob() {
         expected: bytes.to_vec(),
     };
 
-    crate::HANDLE.block_on(methods::fetch(request, &mut target, &context));
+    spawn_blocking_task::<_, Response>(methods::fetch(request, &mut target, &context));
 
     let fetch_response = receiver.recv().unwrap();
     assert!(!fetch_response.is_network_error());
@@ -217,26 +230,26 @@ fn test_fetch_blob() {
     let content_length: ContentLength = fetch_response.headers.typed_get().unwrap();
     assert_eq!(content_length.0, bytes.len() as u64);
 
-    assert_eq!(
-        *fetch_response.body.lock().unwrap(),
-        ResponseBody::Receiving(vec![])
-    );
+    assert_eq!(*fetch_response.body.lock(), ResponseBody::Receiving(vec![]));
 }
 
 #[test]
 fn test_file() {
-    let path = Path::new("../../resources/ahem.css")
+    let path = Path::new("../../components/net/tests/test.css")
         .canonicalize()
         .unwrap();
     let url = ServoUrl::from_file_path(path.clone()).unwrap();
 
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
-        .origin(url.origin())
-        .build();
+    let request = RequestBuilder::new(
+        Some(TEST_WEBVIEW_ID),
+        UrlWithBlobClaim::new(url.clone(), None),
+        Referrer::NoReferrer,
+    )
+    .origin(url.origin())
+    .policy_container(Default::default())
+    .build();
 
-    let pool = CoreResourceThreadPool::new(1, "CoreResourceTestPool".to_string());
-    let pool_handle = Arc::new(pool);
-    let mut context = new_fetch_context(None, None, Some(Arc::downgrade(&pool_handle)));
+    let mut context = new_fetch_context(None, None);
     let fetch_response = fetch_with_context(request, &mut context);
 
     // We should see an opaque-filtered response.
@@ -244,14 +257,14 @@ fn test_file() {
 
     assert!(!fetch_response.is_network_error());
     assert_eq!(fetch_response.headers.len(), 0);
-    let resp_body = fetch_response.body.lock().unwrap();
+    let resp_body = fetch_response.body.lock();
     assert_eq!(*resp_body, ResponseBody::Empty);
 
     // The underlying response behind the filter should
     // have the file's MIME type and contents.
     let actual_response = fetch_response.actual_response();
     assert!(!actual_response.is_network_error());
-    assert_eq!(actual_response.headers.len(), 1);
+    assert_eq!(actual_response.headers.len(), 2);
     let content_type: Mime = actual_response
         .headers
         .typed_get::<ContentType>()
@@ -259,8 +272,16 @@ fn test_file() {
         .into();
     assert_eq!(content_type, mime::TEXT_CSS);
 
-    let resp_body = actual_response.body.lock().unwrap();
     let file = fs::read(path).unwrap();
+
+    let content_size: u64 = actual_response
+        .headers
+        .typed_get::<ContentLength>()
+        .unwrap()
+        .0;
+    assert_eq!(content_size, file.len() as u64);
+
+    let resp_body = actual_response.body.lock();
 
     match *resp_body {
         ResponseBody::Done(ref val) => {
@@ -273,9 +294,14 @@ fn test_file() {
 #[test]
 fn test_fetch_ftp() {
     let url = ServoUrl::parse("ftp://not-supported").unwrap();
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
-        .origin(url.origin())
-        .build();
+    let request = RequestBuilder::new(
+        Some(TEST_WEBVIEW_ID),
+        UrlWithBlobClaim::new(url.clone(), None),
+        Referrer::NoReferrer,
+    )
+    .origin(url.origin())
+    .policy_container(Default::default())
+    .build();
     let fetch_response = fetch(request, None);
     assert!(fetch_response.is_network_error());
 }
@@ -283,9 +309,14 @@ fn test_fetch_ftp() {
 #[test]
 fn test_fetch_bogus_scheme() {
     let url = ServoUrl::parse("bogus://whatever").unwrap();
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
-        .origin(url.origin())
-        .build();
+    let request = RequestBuilder::new(
+        Some(TEST_WEBVIEW_ID),
+        UrlWithBlobClaim::new(url.clone(), None),
+        Referrer::NoReferrer,
+    )
+    .origin(url.origin())
+    .policy_container(Default::default())
+    .build();
     let fetch_response = fetch(request, None);
     assert!(fetch_response.is_network_error());
 }
@@ -337,8 +368,16 @@ fn test_cors_preflight_fetch() {
         };
     let (server, url) = make_server(handler);
 
+    let origin = url.origin();
     let target_url = url.clone().join("a.html").unwrap();
-    let mut request = RequestBuilder::new(None, url, Referrer::ReferrerUrl(target_url)).build();
+    let mut request = RequestBuilder::new(
+        Some(TEST_WEBVIEW_ID),
+        url,
+        Referrer::ReferrerUrl(target_url),
+    )
+    .origin(origin)
+    .policy_container(Default::default())
+    .build();
     request.referrer_policy = ReferrerPolicy::Origin;
     request.use_cors_preflight = true;
     request.mode = RequestMode::CorsMode;
@@ -346,7 +385,7 @@ fn test_cors_preflight_fetch() {
     let _ = server.close();
 
     assert!(!fetch_response.is_network_error());
-    match *fetch_response.body.lock().unwrap() {
+    match *fetch_response.body.lock() {
         ResponseBody::Done(ref body) => assert_eq!(&**body, ACK),
         _ => panic!(),
     };
@@ -395,7 +434,10 @@ fn test_cors_preflight_cache_fetch() {
         };
     let (server, url) = make_server(handler);
 
-    let mut request = RequestBuilder::new(None, url, Referrer::NoReferrer).build();
+    let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer)
+        .policy_container(Default::default())
+        .origin(mock_origin())
+        .build();
     request.use_cors_preflight = true;
     request.mode = RequestMode::CorsMode;
     let wrapped_request0 = request.clone();
@@ -416,11 +458,11 @@ fn test_cors_preflight_cache_fetch() {
     assert_eq!(true, cache.match_method(&wrapped_request2, Method::GET));
     assert_eq!(true, cache.match_method(&wrapped_request3, Method::GET));
 
-    match *fetch_response0.body.lock().unwrap() {
+    match *fetch_response0.body.lock() {
         ResponseBody::Done(ref body) => assert_eq!(&**body, ACK),
         _ => panic!(),
     };
-    match *fetch_response1.body.lock().unwrap() {
+    match *fetch_response1.body.lock() {
         ResponseBody::Done(ref body) => assert_eq!(&**body, ACK),
         _ => panic!(),
     };
@@ -464,7 +506,10 @@ fn test_cors_preflight_fetch_network_error() {
         };
     let (server, url) = make_server(handler);
 
-    let mut request = RequestBuilder::new(None, url, Referrer::NoReferrer).build();
+    let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer)
+        .policy_container(Default::default())
+        .origin(mock_origin())
+        .build();
     request.method = Method::from_bytes(b"CHICKEN").unwrap();
     request.use_cors_preflight = true;
     request.mode = RequestMode::CorsMode;
@@ -493,8 +538,9 @@ fn test_fetch_response_is_basic_filtered() {
         };
     let (server, url) = make_server(handler);
 
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
+        .policy_container(Default::default())
         .build();
     let fetch_response = fetch(request, None);
     let _ = server.close();
@@ -560,7 +606,10 @@ fn test_fetch_response_is_cors_filtered() {
     let (server, url) = make_server(handler);
 
     // an origin mis-match will stop it from defaulting to a basic filtered response
-    let mut request = RequestBuilder::new(None, url, Referrer::NoReferrer).build();
+    let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer)
+        .policy_container(Default::default())
+        .origin(mock_origin())
+        .build();
     request.mode = RequestMode::CorsMode;
     let fetch_response = fetch(request, None);
     let _ = server.close();
@@ -596,7 +645,10 @@ fn test_fetch_response_is_opaque_filtered() {
     let (server, url) = make_server(handler);
 
     // an origin mis-match will fall through to an Opaque filtered response
-    let request = RequestBuilder::new(None, url, Referrer::NoReferrer).build();
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer)
+        .policy_container(Default::default())
+        .origin(ImmutableOrigin::new_opaque())
+        .build();
     let fetch_response = fetch(request, None);
     let _ = server.close();
 
@@ -608,7 +660,7 @@ fn test_fetch_response_is_opaque_filtered() {
     // this also asserts that status message is "the empty byte sequence"
     assert!(fetch_response.status.is_error());
     assert_eq!(fetch_response.headers, HeaderMap::new());
-    match *fetch_response.body.lock().unwrap() {
+    match *fetch_response.body.lock() {
         ResponseBody::Empty => {},
         _ => panic!(),
     }
@@ -644,8 +696,9 @@ fn test_fetch_response_is_opaque_redirect_filtered() {
 
     let (server, url) = make_server(handler);
 
-    let mut request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
+        .policy_container(Default::default())
         .build();
     request.redirect_mode = RedirectMode::Manual;
     let fetch_response = fetch(request, None);
@@ -657,7 +710,7 @@ fn test_fetch_response_is_opaque_redirect_filtered() {
     // this also asserts that status message is "the empty byte sequence"
     assert!(fetch_response.status.is_error());
     assert_eq!(fetch_response.headers, HeaderMap::new());
-    match *fetch_response.body.lock().unwrap() {
+    match *fetch_response.body.lock() {
         ResponseBody::Empty => {},
         _ => panic!(),
     }
@@ -679,10 +732,12 @@ fn test_fetch_with_local_urls_only() {
         };
     let (server, server_url) = make_server(handler);
 
-    let do_fetch = |url: ServoUrl| {
-        let mut request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
-            .origin(url.origin())
-            .build();
+    let do_fetch = |url: UrlWithBlobClaim| {
+        let mut request =
+            RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
+                .origin(url.origin())
+                .policy_container(Default::default())
+                .build();
 
         // Set the flag.
         request.local_urls_only = true;
@@ -690,7 +745,7 @@ fn test_fetch_with_local_urls_only() {
         fetch(request, None)
     };
 
-    let local_url = ServoUrl::parse("about:blank").unwrap();
+    let local_url = UrlWithBlobClaim::new(ServoUrl::parse("about:blank").unwrap(), None);
     let local_response = do_fetch(local_url);
     let server_response = do_fetch(server_url);
 
@@ -717,23 +772,26 @@ fn test_fetch_with_hsts() {
 
     let (server, url) = make_ssl_server(handler);
 
-    let embedder_proxy = create_embedder_proxy();
+    let embedder_proxy = create_generic_embedder_proxy();
 
     let mut context = FetchContext {
         state: Arc::new(create_http_state(None)),
         user_agent: DEFAULT_USER_AGENT.into(),
         devtools_chan: None,
-        filemanager: Arc::new(Mutex::new(FileManager::new(
+        filemanager: FileManager::new(
             embedder_proxy.clone(),
-            Weak::new(),
-        ))),
+            BlobTokenCommunicator::stub_for_testing(),
+        ),
         file_token: FileTokenCheck::NotRequired,
-        request_interceptor: Arc::new(Mutex::new(RequestInterceptor::new(embedder_proxy))),
+        request_interceptor: Arc::new(TokioMutex::new(RequestInterceptor::new(embedder_proxy))),
         cancellation_listener: Arc::new(Default::default()),
-        timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(
-            ResourceTimingType::Navigation,
-        ))),
+        timing: ResourceFetchTiming::new(ResourceTimingType::Navigation).into(),
         protocols: Arc::new(ProtocolRegistry::default()),
+        websocket_chan: None,
+        ca_certificates: CACertificates::Default,
+        ignore_certificate_errors: false,
+        preloaded_resources: Default::default(),
+        in_flight_keep_alive_records: Default::default(),
     };
 
     // The server certificate is self-signed, so we need to add an override
@@ -743,13 +801,14 @@ fn test_fetch_with_hsts() {
     }
 
     {
-        let mut list = context.state.hsts_list.write().unwrap();
+        let mut list = context.state.hsts_list.write();
         list.push(
             HstsEntry::new("localhost".to_owned(), IncludeSubdomains::NotIncluded, None).unwrap(),
         );
     }
-    let mut request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
+        .policy_container(Default::default())
         .build();
     // Set the flag.
     request.local_urls_only = false;
@@ -777,23 +836,26 @@ fn test_load_adds_host_to_hsts_list_when_url_is_https() {
     let (server, mut url) = make_ssl_server(handler);
     url.as_mut_url().set_scheme("https").unwrap();
 
-    let embedder_proxy = create_embedder_proxy();
+    let embedder_proxy = create_generic_embedder_proxy();
 
     let mut context = FetchContext {
         state: Arc::new(create_http_state(None)),
         user_agent: DEFAULT_USER_AGENT.into(),
         devtools_chan: None,
-        filemanager: Arc::new(Mutex::new(FileManager::new(
+        filemanager: FileManager::new(
             embedder_proxy.clone(),
-            Weak::new(),
-        ))),
+            BlobTokenCommunicator::stub_for_testing(),
+        ),
         file_token: FileTokenCheck::NotRequired,
-        request_interceptor: Arc::new(Mutex::new(RequestInterceptor::new(embedder_proxy))),
+        request_interceptor: Arc::new(TokioMutex::new(RequestInterceptor::new(embedder_proxy))),
         cancellation_listener: Arc::new(Default::default()),
-        timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(
-            ResourceTimingType::Navigation,
-        ))),
+        timing: ResourceFetchTiming::new(ResourceTimingType::Navigation).into(),
         protocols: Arc::new(ProtocolRegistry::default()),
+        websocket_chan: None,
+        ca_certificates: CACertificates::Default,
+        ignore_certificate_errors: false,
+        preloaded_resources: Default::default(),
+        in_flight_keep_alive_records: Default::default(),
     };
 
     // The server certificate is self-signed, so we need to add an override
@@ -802,12 +864,13 @@ fn test_load_adds_host_to_hsts_list_when_url_is_https() {
         context.state.override_manager.add_override(certificate);
     }
 
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .method(Method::GET)
         .body(None)
         .destination(Destination::Document)
         .origin(url.clone().origin())
         .pipeline_id(Some(TEST_PIPELINE_ID))
+        .policy_container(Default::default())
         .build();
 
     let response = fetch_with_context(request, &mut context);
@@ -827,7 +890,6 @@ fn test_load_adds_host_to_hsts_list_when_url_is_https() {
             .state
             .hsts_list
             .read()
-            .unwrap()
             .is_host_secure(url.host_str().unwrap())
     );
 }
@@ -843,31 +905,35 @@ fn test_fetch_self_signed() {
     let (server, mut url) = make_ssl_server(handler);
     url.as_mut_url().set_scheme("https").unwrap();
 
-    let embedder_proxy = create_embedder_proxy();
+    let embedder_proxy = create_generic_embedder_proxy();
 
     let mut context = FetchContext {
         state: Arc::new(create_http_state(None)),
         user_agent: DEFAULT_USER_AGENT.into(),
         devtools_chan: None,
-        filemanager: Arc::new(Mutex::new(FileManager::new(
+        filemanager: FileManager::new(
             embedder_proxy.clone(),
-            Weak::new(),
-        ))),
+            BlobTokenCommunicator::stub_for_testing(),
+        ),
         file_token: FileTokenCheck::NotRequired,
-        request_interceptor: Arc::new(Mutex::new(RequestInterceptor::new(embedder_proxy))),
+        request_interceptor: Arc::new(TokioMutex::new(RequestInterceptor::new(embedder_proxy))),
         cancellation_listener: Arc::new(Default::default()),
-        timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(
-            ResourceTimingType::Navigation,
-        ))),
+        timing: ResourceFetchTiming::new(ResourceTimingType::Navigation).into(),
         protocols: Arc::new(ProtocolRegistry::default()),
+        websocket_chan: None,
+        ca_certificates: CACertificates::Default,
+        ignore_certificate_errors: false,
+        preloaded_resources: Default::default(),
+        in_flight_keep_alive_records: Default::default(),
     };
 
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .method(Method::GET)
         .body(None)
         .destination(Destination::Document)
         .origin(url.clone().origin())
         .pipeline_id(Some(TEST_PIPELINE_ID))
+        .policy_container(Default::default())
         .build();
 
     let response = fetch_with_context(request, &mut context);
@@ -883,12 +949,13 @@ fn test_fetch_self_signed() {
         context.state.override_manager.add_override(certificate);
     }
 
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .method(Method::GET)
         .body(None)
         .destination(Destination::Document)
         .origin(url.clone().origin())
         .pipeline_id(Some(TEST_PIPELINE_ID))
+        .policy_container(Default::default())
         .build();
 
     let response = fetch_with_context(request, &mut context);
@@ -908,8 +975,9 @@ fn test_fetch_with_sri_network_error() {
         };
     let (server, url) = make_server(handler);
 
-    let mut request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
+        .policy_container(Default::default())
         .build();
     // To calulate hash use :
     // echo -n "alert('Hello, Network Error');" | openssl dgst -sha384 -binary | openssl base64 -A
@@ -934,8 +1002,9 @@ fn test_fetch_with_sri_sucess() {
         };
     let (server, url) = make_server(handler);
 
-    let mut request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
+        .policy_container(Default::default())
         .build();
     // To calulate hash use :
     // echo -n "alert('Hello, Network Error');" | openssl dgst -sha384 -binary | openssl base64 -A
@@ -976,9 +1045,10 @@ fn test_fetch_blocked_nosniff() {
 
         let (server, url) = make_server(handler);
 
-        let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+        let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
             .origin(url.origin())
             .destination(destination)
+            .policy_container(Default::default())
             .build();
         let fetch_response = fetch(request, None);
         let _ = server.close();
@@ -1023,8 +1093,9 @@ fn setup_server_and_fetch(message: &'static [u8], redirect_cap: u32) -> Response
 
     let (server, url) = make_server(handler);
 
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
+        .policy_container(Default::default())
         .build();
     let fetch_response = fetch(request, None);
     let _ = server.close();
@@ -1042,7 +1113,7 @@ fn test_fetch_redirect_count_ceiling() {
     assert!(!fetch_response.is_network_error());
     assert_eq!(fetch_response.response_type, ResponseType::Basic);
 
-    match *fetch_response.body.lock().unwrap() {
+    match *fetch_response.body.lock() {
         ResponseBody::Done(ref body) => {
             assert_eq!(&**body, MESSAGE);
         },
@@ -1060,7 +1131,7 @@ fn test_fetch_redirect_count_failure() {
 
     assert!(fetch_response.is_network_error());
 
-    match *fetch_response.body.lock().unwrap() {
+    match *fetch_response.body.lock() {
         ResponseBody::Done(_) | ResponseBody::Receiving(_) => panic!(),
         _ => {},
     };
@@ -1113,9 +1184,10 @@ fn test_fetch_redirect_updates_method_runner(
 
     let (server, url) = crate::make_server(handler);
 
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
         .method(method)
+        .policy_container(Default::default())
         .build();
 
     let _ = fetch(request, None);
@@ -1173,14 +1245,14 @@ fn test_fetch_redirect_updates_method() {
 fn response_is_done(response: &Response) -> bool {
     let response_complete = match response.response_type {
         ResponseType::Default | ResponseType::Basic | ResponseType::Cors => {
-            (*response.body.lock().unwrap()).is_done()
+            (*response.body.lock()).is_done()
         },
         // if the internal response cannot have a body, it shouldn't block the "done" state
         ResponseType::Opaque | ResponseType::OpaqueRedirect | ResponseType::Error(..) => true,
     };
 
     let internal_complete = if let Some(ref res) = response.internal_response {
-        res.body.lock().unwrap().is_done()
+        res.body.lock().is_done()
     } else {
         true
     };
@@ -1198,13 +1270,91 @@ fn test_fetch_async_returns_complete_response() {
         };
     let (server, url) = make_server(handler);
 
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
+        .policy_container(Default::default())
         .build();
     let fetch_response = fetch(request, None);
 
     let _ = server.close();
     assert_eq!(response_is_done(&fetch_response), true);
+}
+
+#[test]
+fn test_response_cache_status_is_local() {
+    static MESSAGE: &'static [u8] = b"cacheable content";
+    let handler =
+        move |_: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            // Mark this response as cacheable.
+            response
+                .headers_mut()
+                .typed_insert(CacheControl::new().with_max_age(Duration::from_secs(604800)));
+            *response.body_mut() = make_body(MESSAGE.to_vec());
+        };
+    let (server, url) = make_server(handler);
+
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .policy_container(Default::default())
+        .build();
+
+    // Use the same HttpCache for both fetches.
+    let mut context = new_fetch_context(None, None);
+
+    // Cold request - response should come from the server.
+    let initial_response = fetch_with_context(request.clone(), &mut context);
+    assert!(matches!(initial_response.cache_state, CacheState::None));
+
+    // Warm request - response should come from the cache.
+    let cached_response = fetch_with_context(request.clone(), &mut context);
+    assert!(matches!(cached_response.cache_state, CacheState::Local));
+
+    let _ = server.close();
+}
+
+#[test]
+fn test_response_cache_status_is_validated() {
+    static MESSAGE: &'static [u8] = b"cacheable content";
+    let handler =
+        move |request: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            // Check for the revalidation request.
+            if let Some(_) = request.headers().typed_get::<IfNoneMatch>() {
+                *response.status_mut() = StatusCode::NOT_MODIFIED;
+                return;
+            }
+            // Mark this cacheable reponse as requiring revalidation upon refetch.
+            response
+                .headers_mut()
+                .typed_insert(CacheControl::new().with_no_cache());
+            response
+                .headers_mut()
+                .typed_insert(ETag::from_str("\"1234abcd\"").unwrap());
+            *response.body_mut() = make_body(MESSAGE.to_vec());
+        };
+    let (server, url) = make_server(handler);
+
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .policy_container(Default::default())
+        .build();
+
+    // Use the same HttpCache for both fetches.
+    let mut context = new_fetch_context(None, None);
+
+    // Cold request - response should come from the server.
+    let initial_response = fetch_with_context(request.clone(), &mut context);
+    assert!(matches!(initial_response.cache_state, CacheState::None));
+
+    // Warm request - response should come from the cache after revalidation with server.
+    let revalidated_response = fetch_with_context(request, &mut context);
+    assert!(matches!(
+        revalidated_response.cache_state,
+        CacheState::Validated
+    ));
+
+    let _ = server.close();
 }
 
 #[test]
@@ -1218,7 +1368,10 @@ fn test_opaque_filtered_fetch_async_returns_complete_response() {
     let (server, url) = make_server(handler);
 
     // an origin mis-match will fall through to an Opaque filtered response
-    let request = RequestBuilder::new(None, url, Referrer::NoReferrer).build();
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer)
+        .policy_container(Default::default())
+        .origin(ImmutableOrigin::new_opaque())
+        .build();
     let fetch_response = fetch(request, None);
 
     let _ = server.close();
@@ -1252,9 +1405,10 @@ fn test_opaque_redirect_filtered_fetch_async_returns_complete_response() {
         };
 
     let (server, url) = make_server(handler);
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
         .redirect_mode(RedirectMode::Manual)
+        .policy_container(Default::default())
         .build();
 
     let fetch_response = fetch(request, None);
@@ -1266,7 +1420,6 @@ fn test_opaque_redirect_filtered_fetch_async_returns_complete_response() {
 }
 
 #[test]
-#[cfg(not(target_os = "windows"))]
 fn test_fetch_with_devtools() {
     static MESSAGE: &'static [u8] = b"Yay!";
     let handler =
@@ -1277,10 +1430,11 @@ fn test_fetch_with_devtools() {
 
     let (server, url) = make_server(handler);
 
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
         .redirect_mode(RedirectMode::Manual)
         .pipeline_id(Some(TEST_PIPELINE_ID))
+        .policy_container(Default::default())
         .build();
 
     let (devtools_chan, devtools_port) = unbounded();
@@ -1289,24 +1443,21 @@ fn test_fetch_with_devtools() {
     let _ = server.close();
 
     // notification received from devtools
-    let devhttprequest = expect_devtools_http_request(&devtools_port);
-    let mut devhttpresponse = expect_devtools_http_response(&devtools_port);
+    let devhttprequests = expect_devtools_http_request(&devtools_port);
+    let mut devhttpresponse = devtools_response_with_body(&devtools_port);
 
-    //Creating default headers for request
+    // Creating default headers for request
     let mut headers = HeaderMap::new();
 
     headers.insert(header::ACCEPT, HeaderValue::from_static("*/*"));
 
-    headers.insert(
-        header::ACCEPT_LANGUAGE,
-        HeaderValue::from_static("en-US,en;q=0.5"),
-    );
+    headers.insert(header::ACCEPT_LANGUAGE, get_current_locale().1.clone());
 
     headers.typed_insert::<UserAgent>(DEFAULT_USER_AGENT.parse().unwrap());
 
     headers.insert(
         header::ACCEPT_ENCODING,
-        HeaderValue::from_static("gzip, deflate, br"),
+        HeaderValue::from_static("gzip, deflate, br, zstd"),
     );
 
     // Append fetch metadata headers
@@ -1324,16 +1475,18 @@ fn test_fetch_with_devtools() {
     );
 
     let httprequest = DevtoolsHttpRequest {
-        url: url,
+        url: url.url(),
         method: Method::GET,
         headers: headers,
-        body: Some(vec![]),
+        body: Some(vec![].into()),
         pipeline_id: TEST_PIPELINE_ID,
-        started_date_time: devhttprequest.started_date_time,
-        time_stamp: devhttprequest.time_stamp,
-        connect_time: devhttprequest.connect_time,
-        send_time: devhttprequest.send_time,
+        started_date_time: devhttprequests.1.started_date_time,
+        time_stamp: devhttprequests.1.time_stamp,
+        connect_time: devhttprequests.1.connect_time,
+        send_time: devhttprequests.1.send_time,
+        destination: Destination::None,
         is_xhr: true,
+        browsing_context_id: TEST_WEBVIEW_ID.into(),
     };
 
     let content = "Yay!";
@@ -1348,11 +1501,13 @@ fn test_fetch_with_devtools() {
     let httpresponse = DevtoolsHttpResponse {
         headers: Some(response_headers),
         status: HttpStatus::default(),
-        body: None,
+        body: Some(content.as_bytes().to_vec().into()),
+        from_cache: false,
         pipeline_id: TEST_PIPELINE_ID,
+        browsing_context_id: TEST_WEBVIEW_ID.into(),
     };
 
-    assert_eq!(devhttprequest, httprequest);
+    assert_eq!(devhttprequests.1, httprequest);
     assert_eq!(devhttpresponse, httpresponse);
 }
 
@@ -1365,12 +1520,12 @@ fn test_fetch_request_intercepted() {
     static HEADERVALUE: &str = "custom-value";
     static STATUS_MESSAGE: &[u8] = b"custom status message";
 
-    let (embedder_proxy, embedder_receiver) = create_embedder_proxy_and_receiver();
+    let (embedder_proxy, embedder_receiver) = create_generic_embedder_proxy_and_receiver();
 
     std::thread::spawn(move || {
         let embedder_msg = embedder_receiver.recv().unwrap();
         match embedder_msg {
-            embedder_traits::EmbedderMsg::WebResourceRequested(
+            net::embedder::NetToEmbedderMsg::WebResourceRequested(
                 _,
                 web_resource_request,
                 response_sender,
@@ -1403,35 +1558,42 @@ fn test_fetch_request_intercepted() {
         state: Arc::new(create_http_state(None)),
         user_agent: DEFAULT_USER_AGENT.into(),
         devtools_chan: None,
-        filemanager: Arc::new(Mutex::new(FileManager::new(
+        filemanager: FileManager::new(
             embedder_proxy.clone(),
-            Weak::new(),
-        ))),
+            BlobTokenCommunicator::stub_for_testing(),
+        ),
         file_token: FileTokenCheck::NotRequired,
-        request_interceptor: Arc::new(Mutex::new(RequestInterceptor::new(embedder_proxy))),
+        request_interceptor: Arc::new(TokioMutex::new(RequestInterceptor::new(embedder_proxy))),
         cancellation_listener: Arc::new(Default::default()),
-        timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(
-            ResourceTimingType::Navigation,
-        ))),
+        timing: ResourceFetchTiming::new(ResourceTimingType::Navigation).into(),
         protocols: Arc::new(ProtocolRegistry::default()),
+        websocket_chan: None,
+        ca_certificates: CACertificates::Default,
+        ignore_certificate_errors: false,
+        preloaded_resources: Default::default(),
+        in_flight_keep_alive_records: Default::default(),
     };
 
     let url = ServoUrl::parse("http://www.example.org").unwrap();
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
-        .origin(url.origin())
-        .build();
+    let request = RequestBuilder::new(
+        Some(TEST_WEBVIEW_ID),
+        UrlWithBlobClaim::new(url.clone(), None),
+        Referrer::NoReferrer,
+    )
+    .origin(url.origin())
+    .policy_container(Default::default())
+    .build();
     let response = fetch_with_context(request, &mut context);
 
     assert!(
         response
             .headers
             .get(HEADERNAME)
-            .map(|v| v == HEADERVALUE)
-            .unwrap_or(false),
+            .is_some_and(|value| value == HEADERVALUE),
         "The custom header does not exist or has an incorrect value!"
     );
 
-    let body = response.body.lock().unwrap();
+    let body = response.body.lock();
     match &*body {
         ResponseBody::Done(data) => {
             assert_eq!(data, &EXPECTED_BODY, "Body content does not match");

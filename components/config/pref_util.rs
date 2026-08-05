@@ -5,16 +5,20 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// The types of preference values in Servo.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum PrefValue {
     Float(f64),
     Int(i64),
+    UInt(u64),
     Str(String),
     Bool(bool),
     Array(Vec<PrefValue>),
 }
 
 impl PrefValue {
+    /// Parse the `input` string as a preference value. Defaults to a `PrefValue::Str` if the input
+    /// cannot be parsed as valid value of one of the other types.
     pub fn from_booleanish_str(input: &str) -> Self {
         match input {
             "false" => PrefValue::Bool(false),
@@ -85,6 +89,7 @@ macro_rules! impl_from_pref {
 impl_pref_from! {
     f64 => PrefValue::Float,
     i64 => PrefValue::Int,
+    u64 => PrefValue::UInt,
     String => PrefValue::Str,
     &str => PrefValue::Str,
     bool => PrefValue::Bool,
@@ -95,6 +100,19 @@ impl_from_pref! {
     PrefValue::Int => i64,
     PrefValue::Str => String,
     PrefValue::Bool => bool,
+}
+
+// The default generated from `impl_from_pref` would cause panic
+// when converting from PrefValue::Int.
+impl TryFrom<PrefValue> for u64 {
+    type Error = String;
+    fn try_from(other: PrefValue) -> Result<Self, Self::Error> {
+        match other {
+            PrefValue::UInt(value) => Ok(value),
+            PrefValue::Int(value) if value >= 0 => Ok(value as u64),
+            _ => Err(format!("Cannot convert {other:?} to u64")),
+        }
+    }
 }
 
 impl From<[f64; 4]> for PrefValue {
@@ -130,20 +148,25 @@ impl From<PrefValue> for [f64; 4] {
     }
 }
 
-#[test]
-fn test_pref_value_from_str() {
-    let value = PrefValue::from_booleanish_str("21");
-    assert_eq!(value, PrefValue::Int(21));
+#[cfg(test)]
+mod test {
+    use super::*;
 
-    let value = PrefValue::from_booleanish_str("12.5");
-    assert_eq!(value, PrefValue::Float(12.5));
+    #[test]
+    fn test_pref_value_from_str() {
+        let value = PrefValue::from_booleanish_str("21");
+        assert_eq!(value, PrefValue::Int(21));
 
-    let value = PrefValue::from_booleanish_str("a string");
-    assert_eq!(value, PrefValue::Str("a string".into()));
+        let value = PrefValue::from_booleanish_str("12.5");
+        assert_eq!(value, PrefValue::Float(12.5));
 
-    let value = PrefValue::from_booleanish_str("false");
-    assert_eq!(value, PrefValue::Bool(false));
+        let value = PrefValue::from_booleanish_str("a string");
+        assert_eq!(value, PrefValue::Str("a string".into()));
 
-    let value = PrefValue::from_booleanish_str("true");
-    assert_eq!(value, PrefValue::Bool(true));
+        let value = PrefValue::from_booleanish_str("false");
+        assert_eq!(value, PrefValue::Bool(false));
+
+        let value = PrefValue::from_booleanish_str("true");
+        assert_eq!(value, PrefValue::Bool(true));
+    }
 }

@@ -3,27 +3,26 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 // For compile-fail tests only.
-//pub use crate::dom::bindings::cell::DomRefCell;
+// pub use script_bindings::cell::DomRefCell;
 pub use crate::dom::bindings::refcounted::TrustedPromise;
-//pub use crate::dom::bindings::root::Dom;
+// pub use crate::dom::bindings::root::Dom;
 pub use crate::dom::bindings::str::{ByteString, DOMString};
-pub use crate::dom::headers::normalize_value;
-//pub use crate::dom::node::Node;
+// pub use crate::dom::node::Node;
 
 pub mod area {
-    pub use crate::dom::htmlareaelement::{Area, Shape};
+    pub use crate::dom::html::htmlareaelement::{Area, Shape};
 }
 
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 pub mod size_of {
     use std::mem::size_of;
 
     use crate::dom::characterdata::CharacterData;
     use crate::dom::element::Element;
     use crate::dom::eventtarget::EventTarget;
-    use crate::dom::htmldivelement::HTMLDivElement;
-    use crate::dom::htmlelement::HTMLElement;
-    use crate::dom::htmlspanelement::HTMLSpanElement;
+    use crate::dom::html::htmldivelement::HTMLDivElement;
+    use crate::dom::html::htmlelement::HTMLElement;
+    use crate::dom::html::htmlspanelement::HTMLSpanElement;
     use crate::dom::node::Node;
     use crate::dom::text::Text;
 
@@ -61,17 +60,28 @@ pub mod size_of {
 }
 
 pub mod srcset {
-    pub use crate::dom::htmlimageelement::{Descriptor, ImageSource, parse_a_srcset_attribute};
+    pub use crate::dom::html::htmlimageelement::{
+        Descriptor, ImageSource, parse_a_srcset_attribute,
+    };
 }
 
 pub mod timeranges {
     pub use crate::dom::timeranges::TimeRangesContainer;
 }
 
-pub mod textinput {
-    pub use crate::clipboard_provider::ClipboardProvider;
-    pub use crate::textinput::{
-        Direction, Lines, Selection, SelectionDirection, TextInput, TextPoint, UTF8Bytes,
-        UTF16CodeUnits,
+pub mod text_input {
+    pub use crate::dom::html::form_controls::text_input::{
+        ClipboardProvider, Direction, Lines, SelectionDirection, TextInput,
     };
+}
+
+pub mod encoding_detection {
+    pub use crate::dom::servoparser::encoding::{
+        get_xml_encoding, prescan_the_byte_stream_to_determine_the_encoding,
+    };
+}
+
+pub mod unminify {
+    pub use crate::dom::html::htmlscriptelement::substitute_with_local_script;
+    pub use crate::unminify::create_output_file;
 }

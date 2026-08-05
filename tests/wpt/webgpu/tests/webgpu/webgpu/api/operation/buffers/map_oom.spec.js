@@ -4,21 +4,16 @@
 import { kUnitCaseParamsBuilder } from '../../../../common/framework/params_builder.js';
 import { makeTestGroup } from '../../../../common/framework/test_group.js';
 import { kBufferUsages } from '../../../capability_info.js';
-import { GPUTest } from '../../../gpu_test.js';
+import { AllFeaturesMaxLimitsGPUTest } from '../../../gpu_test.js';
 import { kMaxSafeMultipleOf8 } from '../../../util/math.js';
 
 const oomAndSizeParams = kUnitCaseParamsBuilder.
 combine('oom', [false, true]).
 expand('size', ({ oom }) => {
-  return oom ?
-  [
-  kMaxSafeMultipleOf8,
-  0x20_0000_0000 // 128 GB
-  ] :
-  [16];
+  return oom ? [kMaxSafeMultipleOf8] : [16];
 });
 
-export const g = makeTestGroup(GPUTest);
+export const g = makeTestGroup(AllFeaturesMaxLimitsGPUTest);
 
 g.test('mappedAtCreation').
 desc(

@@ -6,41 +6,50 @@
 //! This actor manages the configuration flags that the devtools host can apply to the targets.
 
 use std::collections::HashMap;
-use std::net::TcpStream;
+use std::sync::Arc;
 
 use embedder_traits::Theme;
 use log::warn;
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
+use crate::actor::{Actor, ActorEncode, ActorError, ActorRegistry, new_actor_name};
 use crate::actors::browsing_context::BrowsingContextActor;
 use crate::actors::tab::TabDescriptorActor;
-use crate::protocol::JsonPacketStream;
+use crate::protocol::ClientRequest;
 use crate::{EmptyReplyMsg, RootActor, StreamId};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TargetConfigurationTraits {
+pub(crate) struct TargetConfigurationTraits {
     supported_options: HashMap<&'static str, bool>,
 }
 
 #[derive(Serialize)]
-pub struct TargetConfigurationActorMsg {
+pub(crate) struct TargetConfigurationActorMsg {
     actor: String,
     configuration: HashMap<&'static str, bool>,
     traits: TargetConfigurationTraits,
 }
 
-pub struct TargetConfigurationActor {
+#[derive(MallocSizeOf)]
+pub(crate) struct TargetConfigurationActor {
     name: String,
     configuration: HashMap<&'static str, bool>,
     supported_options: HashMap<&'static str, bool>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JavascriptEnabledReply {
+    from: String,
+    javascript_enabled: bool,
+}
+
 impl Actor for TargetConfigurationActor {
-    fn name(&self) -> String {
-        self.name.clone()
+    fn name(&self) -> &str {
+        &self.name
     }
 
     /// The target configuration actor can handle the following messages:
@@ -48,22 +57,19 @@ impl Actor for TargetConfigurationActor {
     /// - `updateConfiguration`: Receives new configuration flags from the devtools host.
     fn handle_message(
         &self,
+        request: ClientRequest,
         registry: &ActorRegistry,
         msg_type: &str,
         msg: &Map<String, Value>,
-        stream: &mut TcpStream,
         _id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
-        Ok(match msg_type {
+    ) -> Result<(), ActorError> {
+        match msg_type {
             "updateConfiguration" => {
-                let config = match msg.get("configuration").and_then(|v| v.as_object()) {
-                    Some(config) => config,
-                    None => {
-                        let msg = EmptyReplyMsg { from: self.name() };
-                        let _ = stream.write_json_packet(&msg);
-                        return Ok(ActorMessageStatus::Processed);
-                    },
-                };
+                let config = msg
+                    .get("configuration")
+                    .ok_or(ActorError::MissingParameter)?
+                    .as_object()
+                    .ok_or(ActorError::BadParameterType)?;
                 if let Some(scheme) = config.get("colorSchemeSimulation").and_then(|v| v.as_str()) {
                     let theme = match scheme {
                         "dark" => Theme::Dark,
@@ -72,27 +78,39 @@ impl Actor for TargetConfigurationActor {
                     };
                     let root_actor = registry.find::<RootActor>("root");
                     if let Some(tab_name) = root_actor.active_tab() {
-                        let tab_actor = registry.find::<TabDescriptorActor>(&tab_name);
-                        let browsing_context_name = tab_actor.browsing_context();
-                        let browsing_context_actor =
-                            registry.find::<BrowsingContextActor>(&browsing_context_name);
-                        browsing_context_actor.simulate_color_scheme(theme)?;
+                        let tab_descriptor_actor = registry.find::<TabDescriptorActor>(&tab_name);
+                        let browsing_context_actor = registry.find::<BrowsingContextActor>(
+                            &tab_descriptor_actor.browsing_context_name,
+                        );
+                        browsing_context_actor
+                            .simulate_color_scheme(theme)
+                            .map_err(|_| ActorError::Internal)?;
                     } else {
                         warn!("No active tab for updateConfiguration");
                     }
                 }
-                let msg = EmptyReplyMsg { from: self.name() };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                let msg = EmptyReplyMsg {
+                    from: self.name().into(),
+                };
+                request.reply_final(&msg)?
             },
-            _ => ActorMessageStatus::Ignored,
-        })
+            "isJavascriptEnabled" => {
+                let msg = JavascriptEnabledReply {
+                    from: self.name().into(),
+                    javascript_enabled: true,
+                };
+                request.reply_final(&msg)?
+            },
+            _ => return Err(ActorError::UnrecognizedPacketType),
+        };
+        Ok(())
     }
 }
 
 impl TargetConfigurationActor {
-    pub fn new(name: String) -> Self {
-        Self {
+    pub fn register(registry: &ActorRegistry) -> Arc<Self> {
+        let name = new_actor_name::<Self>();
+        let actor = Self {
             name,
             configuration: HashMap::new(),
             supported_options: HashMap::from([
@@ -114,12 +132,15 @@ impl TargetConfigurationActor {
                 ("tracerOptions", false),
                 ("useSimpleHighlightersForReducedMotion", false),
             ]),
-        }
+        };
+        registry.register::<Self>(actor)
     }
+}
 
-    pub fn encodable(&self) -> TargetConfigurationActorMsg {
+impl ActorEncode<TargetConfigurationActorMsg> for TargetConfigurationActor {
+    fn encode(&self, _: &ActorRegistry) -> TargetConfigurationActorMsg {
         TargetConfigurationActorMsg {
-            actor: self.name(),
+            actor: self.name().into(),
             configuration: self.configuration.clone(),
             traits: TargetConfigurationTraits {
                 supported_options: self.supported_options.clone(),

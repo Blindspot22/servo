@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use app_units::Au;
+use layout_api::{AxesOverflow, LayoutElementType, LayoutNode, LayoutNodeType};
 use malloc_size_of_derive::MallocSizeOf;
 use style::Zero;
 use style::color::AbsoluteColor;
@@ -22,21 +23,26 @@ use style::servo::selector_parser::PseudoElement;
 use style::values::CSSFloat;
 use style::values::computed::basic_shape::ClipPath;
 use style::values::computed::image::Image as ComputedImageLayer;
-use style::values::computed::{AlignItems, BorderStyle, Color, Inset, LengthPercentage, Margin};
+use style::values::computed::{
+    BorderSideWidth, BorderStyle, Color, Inset, ItemPlacement, LengthPercentage, Margin,
+    SelfAlignment,
+};
 use style::values::generics::box_::Perspective;
 use style::values::generics::position::{GenericAspectRatio, PreferredRatio};
 use style::values::generics::transform::{GenericRotate, GenericScale, GenericTranslate};
 use style::values::specified::align::AlignFlags;
 use style::values::specified::{Overflow, WillChangeBits, box_ as stylo};
+use unicode_bidi::Level;
 use webrender_api as wr;
 use webrender_api::units::LayoutTransform;
 
-use crate::dom_traversal::{Contents, NonReplacedContents};
+use crate::dom_traversal::{Contents, NodeAndStyleInfo};
 use crate::fragment_tree::FragmentFlags;
 use crate::geom::{
     AuOrAuto, LengthPercentageOrAuto, LogicalSides, LogicalSides1D, LogicalVec2, PhysicalSides,
-    PhysicalSize, Size, Sizes,
+    PhysicalSize,
 };
+use crate::sizing::{Size, Sizes};
 use crate::table::TableLayoutStyle;
 use crate::{ContainingBlock, IndefiniteContainingBlock};
 
@@ -56,12 +62,6 @@ pub(crate) enum DisplayGeneratingBox {
     /// <https://drafts.csswg.org/css-display-3/#layout-specific-display>
     LayoutInternal(DisplayLayoutInternal),
 }
-#[derive(Clone, Copy, Debug)]
-pub struct AxesOverflow {
-    pub x: Overflow,
-    pub y: Overflow,
-}
-
 impl DisplayGeneratingBox {
     pub(crate) fn display_inside(&self) -> DisplayInside {
         match *self {
@@ -72,7 +72,11 @@ impl DisplayGeneratingBox {
         }
     }
 
-    pub(crate) fn used_value_for_contents(&self, contents: &Contents) -> Self {
+    pub(crate) fn used_value_for_contents(
+        &self,
+        contents: &Contents,
+        info: &NodeAndStyleInfo,
+    ) -> Self {
         // From <https://www.w3.org/TR/css-display-3/#layout-specific-display>:
         // > When the display property of a replaced element computes to one of
         // > the layout-internal values, it is handled as having a used value of
@@ -84,13 +88,22 @@ impl DisplayGeneratingBox {
                     is_list_item: false,
                 },
             }
-        } else if matches!(
-            contents,
-            Contents::NonReplaced(NonReplacedContents::OfTextControl)
-        ) {
-            // If it's an input or textarea, make sure the display-inside is flow-root.
+        } else if matches!(contents, Contents::Widget(_)) {
             // <https://html.spec.whatwg.org/multipage/#form-controls>
-            if let DisplayGeneratingBox::OutsideInside { outside, .. } = self {
+            // Widgets should establish an independent formatting context. Therefore,
+            // replace a `flow` inner display type with `flow-root`, or just use
+            // `flow-root` unconditionally, depending on the element.
+            // Also, prevent it from being a list item, like Blink and WebKit, but
+            // unlike Gecko. See https://github.com/w3c/csswg-drafts/issues/14187
+            if let DisplayGeneratingBox::OutsideInside { outside, inside } = self &&
+                (matches!(
+                    inside,
+                    DisplayInside::Flow { .. } | DisplayInside::FlowRoot { .. }
+                ) || info.node.type_id() !=
+                    Some(LayoutNodeType::Element(
+                        LayoutElementType::HTMLButtonElement,
+                    )))
+            {
                 DisplayGeneratingBox::OutsideInside {
                     outside: *outside,
                     inside: DisplayInside::FlowRoot {
@@ -124,7 +137,7 @@ pub(crate) enum DisplayInside {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(clippy::enum_variant_names)]
+#[expect(clippy::enum_variant_names)]
 /// <https://drafts.csswg.org/css-display-3/#layout-specific-display>
 pub(crate) enum DisplayLayoutInternal {
     TableCaption,
@@ -223,7 +236,7 @@ impl AspectRatio {
         }
     }
 
-    pub(crate) fn from_content_ratio(i_over_b: CSSFloat) -> Self {
+    pub(crate) fn from_logical_content_ratio(i_over_b: CSSFloat) -> Self {
         Self {
             box_sizing_adjustment: LogicalVec2::zero(),
             i_over_b,
@@ -335,6 +348,7 @@ pub(crate) trait ComputedValuesExt {
     fn z_index_applies(&self, fragment_flags: FragmentFlags) -> bool;
     fn effective_z_index(&self, fragment_flags: FragmentFlags) -> i32;
     fn effective_overflow(&self, fragment_flags: FragmentFlags) -> AxesOverflow;
+    fn used_transform_style(&self, fragment_flags: FragmentFlags) -> ComputedTransformStyle;
     fn establishes_block_formatting_context(&self, fragment_flags: FragmentFlags) -> bool;
     fn establishes_stacking_context(&self, fragment_flags: FragmentFlags) -> bool;
     fn establishes_scroll_container(&self, fragment_flags: FragmentFlags) -> bool;
@@ -356,15 +370,17 @@ pub(crate) trait ComputedValuesExt {
     fn bidi_control_chars(&self) -> (&'static str, &'static str);
     fn resolve_align_self(
         &self,
-        resolved_auto_value: AlignItems,
-        resolved_normal_value: AlignItems,
-    ) -> AlignItems;
+        resolved_auto_value: ItemPlacement,
+        resolved_normal_value: AlignFlags,
+    ) -> SelfAlignment;
     fn depends_on_block_constraints_due_to_relative_positioning(
         &self,
         writing_mode: WritingMode,
     ) -> bool;
     fn is_inline_box(&self, fragment_flags: FragmentFlags) -> bool;
+    fn is_atomic_inline_level(&self, fragment_flags: FragmentFlags) -> bool;
     fn overflow_direction(&self) -> OverflowDirection;
+    fn to_bidi_level(&self) -> Level;
 }
 
 impl ComputedValuesExt for ComputedValues {
@@ -520,9 +536,19 @@ impl ComputedValuesExt for ComputedValues {
     }
 
     fn is_inline_box(&self, fragment_flags: FragmentFlags) -> bool {
-        self.get_box().display.is_inline_flow() &&
-            !fragment_flags
-                .intersects(FragmentFlags::IS_REPLACED | FragmentFlags::IS_TEXT_CONTROL)
+        (self.get_box().display.is_inline_flow() &&
+            !fragment_flags.intersects(
+                FragmentFlags::IS_REPLACED |
+                    FragmentFlags::IS_WIDGET |
+                    FragmentFlags::IS_FLEX_OR_GRID_ITEM,
+            )) ||
+            matches!(self.pseudo(), Some(PseudoElement::FirstLetter))
+    }
+
+    fn is_atomic_inline_level(&self, fragment_flags: FragmentFlags) -> bool {
+        self.get_box().display.outside() == stylo::DisplayOutside::Inline &&
+            !self.is_inline_box(fragment_flags) &&
+            !fragment_flags.intersects(FragmentFlags::IS_FLEX_OR_GRID_ITEM)
     }
 
     /// Returns true if this is a transformable element.
@@ -591,66 +617,112 @@ impl ComputedValuesExt for ComputedValues {
     /// flex containers, and grid containers. And some box types only accept a few values.
     /// <https://www.w3.org/TR/css-overflow-3/#overflow-control>
     fn effective_overflow(&self, fragment_flags: FragmentFlags) -> AxesOverflow {
-        let style_box = self.get_box();
-        let mut overflow_x = style_box.overflow_x;
-        let mut overflow_y = style_box.overflow_y;
+        // https://www.w3.org/TR/css-overflow-3/#overflow-propagation
+        // The element from which the value is propagated must then have a used overflow value of visible.
+        if fragment_flags.contains(FragmentFlags::PROPAGATED_OVERFLOW_TO_VIEWPORT) {
+            return AxesOverflow::default();
+        }
+
+        let mut overflow = AxesOverflow::from(self);
 
         // From <https://www.w3.org/TR/css-overflow-4/#overflow-control>:
         // "On replaced elements, the used values of all computed values other than visible is clip."
         if fragment_flags.contains(FragmentFlags::IS_REPLACED) {
-            if overflow_x != Overflow::Visible {
-                overflow_x = Overflow::Clip;
+            if overflow.x != Overflow::Visible {
+                overflow.x = Overflow::Clip;
             }
-            if overflow_y != Overflow::Visible {
-                overflow_y = Overflow::Clip;
+            if overflow.y != Overflow::Visible {
+                overflow.y = Overflow::Clip;
             }
-            return AxesOverflow {
-                x: overflow_x,
-                y: overflow_y,
-            };
+            return overflow;
         }
 
-        let ignores_overflow = match style_box.display.inside() {
+        let ignores_overflow = match self.get_box().display.inside() {
+            // <https://drafts.csswg.org/css-overflow-3/#overflow-control>
+            // `overflow` doesn't apply to inline boxes.
+            stylo::DisplayInside::Flow => self.is_inline_box(fragment_flags),
+
+            // According to <https://drafts.csswg.org/css-tables/#global-style-overrides>,
+            // - overflow applies to table-wrapper boxes and not to table grid boxes.
+            //   That's what Blink and WebKit do, however Firefox matches a CSSWG resolution that says
+            //   the opposite: <https://lists.w3.org/Archives/Public/www-style/2012Aug/0298.html>
+            //   Due to the way that we implement table-wrapper boxes, it's easier to align with Firefox.
+            // - Tables ignore overflow values different than visible, clip and hidden.
+            //   This affects both axes, to ensure they have the same scrollability.
             stylo::DisplayInside::Table => {
-                // According to <https://drafts.csswg.org/css-tables/#global-style-overrides>,
-                // - overflow applies to table-wrapper boxes and not to table grid boxes.
-                //   That's what Blink and WebKit do, however Firefox matches a CSSWG resolution that says
-                //   the opposite: <https://lists.w3.org/Archives/Public/www-style/2012Aug/0298.html>
-                //   Due to the way that we implement table-wrapper boxes, it's easier to align with Firefox.
-                // - Tables ignore overflow values different than visible, clip and hidden.
-                //   This affects both axes, to ensure they have the same scrollability.
                 !matches!(self.pseudo(), Some(PseudoElement::ServoTableGrid)) ||
-                    matches!(overflow_x, Overflow::Auto | Overflow::Scroll) ||
-                    matches!(overflow_y, Overflow::Auto | Overflow::Scroll)
+                    matches!(overflow.x, Overflow::Auto | Overflow::Scroll) ||
+                    matches!(overflow.y, Overflow::Auto | Overflow::Scroll)
             },
+
+            // <https://drafts.csswg.org/css-tables/#global-style-overrides>
+            // Table-track and table-track-group boxes ignore overflow.
             stylo::DisplayInside::TableColumn |
             stylo::DisplayInside::TableColumnGroup |
             stylo::DisplayInside::TableRow |
             stylo::DisplayInside::TableRowGroup |
             stylo::DisplayInside::TableHeaderGroup |
-            stylo::DisplayInside::TableFooterGroup => {
-                // <https://drafts.csswg.org/css-tables/#global-style-overrides>
-                // Table-track and table-track-group boxes ignore overflow.
-                true
-            },
+            stylo::DisplayInside::TableFooterGroup => true,
+
             _ => false,
         };
-
         if ignores_overflow {
-            AxesOverflow {
-                x: Overflow::Visible,
-                y: Overflow::Visible,
-            }
-        } else {
-            AxesOverflow {
-                x: overflow_x,
-                y: overflow_y,
-            }
+            return AxesOverflow::default();
         }
+
+        overflow
+    }
+
+    /// Get the used `transform-style` value according to the the rules in
+    /// <https://drafts.csswg.org/css-transforms/#grouping-property-values>.
+    fn used_transform_style(&self, fragment_flags: FragmentFlags) -> ComputedTransformStyle {
+        // The check for flat here is to avoid having to check all of the properties below when
+        // possible.
+        let box_style = self.get_box();
+        if box_style.transform_style == ComputedTransformStyle::Flat {
+            return ComputedTransformStyle::Flat;
+        }
+
+        // https://drafts.csswg.org/css-transforms-2/#grouping-property-values
+        //  * overflow: any value other than visible or clip.
+        //  * opacity: any value less than 1.
+        //  * filter: any value other than none.
+        //  * clip: any value other than auto.
+        //  * clip-path: any value other than none.
+        //  * isolation: used value of isolate.
+        //  * mask-image: any value other than none.
+        //  * mask-border-source: any value other than none.
+        //  * mix-blend-mode: any value other than normal.
+        //  * contain: paint and any other property/value combination that causes
+        //    paint containment. Note: this includes any property that affect the
+        //    used value of the contain property, such as content-visibility:
+        //    hidden.
+        //
+        // TODO: Support `mask-image`, `mask-border-source`, and `contain`.
+        let effects = self.get_effects();
+        let overflow = self.effective_overflow(fragment_flags);
+        if !matches!(overflow.x, Overflow::Visible | Overflow::Clip) ||
+            !matches!(overflow.y, Overflow::Visible | Overflow::Clip) ||
+            effects.opacity < 1.0 ||
+            !effects.filter.0.is_empty() ||
+            !effects.clip.is_auto() ||
+            self.get_svg().clip_path != ClipPath::None ||
+            self.get_box().isolation == ComputedIsolation::Isolate ||
+            effects.mix_blend_mode != ComputedMixBlendMode::Normal
+        {
+            return ComputedTransformStyle::Flat;
+        }
+
+        // Return the computed value if not overridden by the above exceptions
+        box_style.transform_style
     }
 
     /// Return true if this style is a normal block and establishes
     /// a new block formatting context.
+    ///
+    /// NOTE: This should be kept in sync with the checks in `impl
+    /// TElement::compute_layout_damage` for `ServoLayoutElement` in
+    /// `components/script/layout_dom/element.rs`.
     fn establishes_block_formatting_context(&self, fragment_flags: FragmentFlags) -> bool {
         if self.establishes_scroll_container(fragment_flags) {
             return true;
@@ -669,7 +741,7 @@ impl ComputedValuesExt for ComputedValues {
         // form an independent block formatting context. This should really only happen
         // for block containers, but we do not support subgrid containers yet which is the
         // only other case.
-        if self.get_position().align_content.0.primary() != AlignFlags::NORMAL {
+        if self.get_position().align_content.primary() != AlignFlags::NORMAL {
             return true;
         }
 
@@ -679,9 +751,8 @@ impl ComputedValuesExt for ComputedValues {
 
     /// Whether or not the `overflow` value of this style establishes a scroll container.
     fn establishes_scroll_container(&self, fragment_flags: FragmentFlags) -> bool {
-        // Checking one axis suffices, because the computed value ensures that
-        // either both axes are scrollable, or none is scrollable.
-        self.effective_overflow(fragment_flags).x.is_scrollable()
+        self.effective_overflow(fragment_flags)
+            .establishes_scroll_container()
     }
 
     /// Returns true if this fragment establishes a new stacking context and false otherwise.
@@ -730,7 +801,8 @@ impl ComputedValuesExt for ComputedValues {
         // > establishes both a stacking context and a containing block for all descendants.
         if self.is_transformable(fragment_flags) &&
             (self.has_transform_or_perspective_style() ||
-                self.get_box().transform_style == ComputedTransformStyle::Preserve3d ||
+                self.used_transform_style(fragment_flags) ==
+                    ComputedTransformStyle::Preserve3d ||
                 will_change_bits
                     .intersects(WillChangeBits::TRANSFORM | WillChangeBits::PERSPECTIVE))
         {
@@ -843,7 +915,8 @@ impl ComputedValuesExt for ComputedValues {
         // > establishes both a stacking context and a containing block for all descendants.
         if self.is_transformable(fragment_flags) &&
             (self.has_transform_or_perspective_style() ||
-                self.get_box().transform_style == ComputedTransformStyle::Preserve3d ||
+                self.used_transform_style(fragment_flags) ==
+                    ComputedTransformStyle::Preserve3d ||
                 will_change_bits
                     .intersects(WillChangeBits::TRANSFORM | WillChangeBits::PERSPECTIVE))
         {
@@ -884,6 +957,14 @@ impl ComputedValuesExt for ComputedValues {
             preferred_ratio = PreferredRatio::None;
         }
 
+        let to_logical_ratio = |physical_ratio| {
+            if self.writing_mode.is_horizontal() {
+                physical_ratio
+            } else {
+                1.0 / physical_ratio
+            }
+        };
+
         match (auto, preferred_ratio) {
             // The value `auto`. Either the ratio was not specified, or was
             // degenerate and set to PreferredRatio::None above.
@@ -892,19 +973,20 @@ impl ComputedValuesExt for ComputedValues {
             // ratio; otherwise the box has no preferred aspect ratio. Size
             // calculations involving the aspect ratio work with the content box
             // dimensions always."
-            (_, PreferredRatio::None) => natural_aspect_ratio.map(AspectRatio::from_content_ratio),
+            (_, PreferredRatio::None) => natural_aspect_ratio
+                .map(to_logical_ratio)
+                .map(AspectRatio::from_logical_content_ratio),
             // "If both auto and a <ratio> are specified together, the preferred
             // aspect ratio is the specified ratio of width / height unless it
             // is a replaced element with a natural aspect ratio, in which case
             // that aspect ratio is used instead. In all cases, size
             // calculations involving the aspect ratio work with the content box
             // dimensions always."
-            (true, PreferredRatio::Ratio(preferred_ratio)) => {
-                Some(AspectRatio::from_content_ratio(
-                    natural_aspect_ratio
-                        .unwrap_or_else(|| (preferred_ratio.0).0 / (preferred_ratio.1).0),
-                ))
-            },
+            (true, PreferredRatio::Ratio(preferred_ratio)) => Some({
+                let physical_ratio = natural_aspect_ratio
+                    .unwrap_or_else(|| (preferred_ratio.0).0 / (preferred_ratio.1).0);
+                AspectRatio::from_logical_content_ratio(to_logical_ratio(physical_ratio))
+            }),
 
             // "The box’s preferred aspect ratio is the specified ratio of width
             // / height. Size calculations involving the aspect ratio work with
@@ -917,7 +999,7 @@ impl ComputedValuesExt for ComputedValues {
                     BoxSizing::BorderBox => *padding_border_sums,
                 };
                 Some(AspectRatio {
-                    i_over_b: (preferred_ratio.0).0 / (preferred_ratio.1).0,
+                    i_over_b: to_logical_ratio((preferred_ratio.0).0 / (preferred_ratio.1).0),
                     box_sizing_adjustment,
                 })
             },
@@ -972,14 +1054,14 @@ impl ComputedValuesExt for ComputedValues {
 
     fn resolve_align_self(
         &self,
-        resolved_auto_value: AlignItems,
-        resolved_normal_value: AlignItems,
-    ) -> AlignItems {
-        match self.clone_align_self().0.0 {
-            AlignFlags::AUTO => resolved_auto_value,
+        resolved_auto_value: ItemPlacement,
+        resolved_normal_value: AlignFlags,
+    ) -> SelfAlignment {
+        SelfAlignment(match self.clone_align_self().0 {
+            AlignFlags::AUTO => resolved_auto_value.0,
             AlignFlags::NORMAL => resolved_normal_value,
-            value => AlignItems(value),
-        }
+            value => value,
+        })
     }
 
     fn depends_on_block_constraints_due_to_relative_positioning(
@@ -1017,6 +1099,17 @@ impl ComputedValuesExt for ComputedValues {
             downward,
         }
     }
+
+    /// The default bidirectional embedding level for the writing mode of this style.
+    ///
+    /// Returns bidi level 0 if the mode is LTR, or 1 otherwise.
+    fn to_bidi_level(&self) -> Level {
+        if self.writing_mode.is_bidi_ltr() {
+            Level::ltr()
+        } else {
+            Level::rtl()
+        }
+    }
 }
 
 pub(crate) enum LayoutStyle<'a> {
@@ -1049,7 +1142,7 @@ impl LayoutStyle<'_> {
         // we instead resolve indefinite percentages against zero.
         let containing_block_size_or_zero =
             containing_block.size.map(|value| value.unwrap_or_default());
-        let writing_mode = containing_block.writing_mode;
+        let writing_mode = containing_block.style.writing_mode;
         let pbm = self.padding_border_margin_with_writing_mode_and_containing_block_inline_size(
             writing_mode,
             containing_block_size_or_zero.inline,
@@ -1176,11 +1269,18 @@ impl LayoutStyle<'_> {
                 .to_physical(self.style().writing_mode),
             _ => {
                 let border = self.style().get_border();
+                let resolve = |width: &BorderSideWidth, style: BorderStyle| {
+                    if style.none_or_hidden() {
+                        Au::zero()
+                    } else {
+                        width.0
+                    }
+                };
                 PhysicalSides::new(
-                    border.border_top_width,
-                    border.border_right_width,
-                    border.border_bottom_width,
-                    border.border_left_width,
+                    resolve(&border.border_top_width, border.border_top_style),
+                    resolve(&border.border_right_width, border.border_right_style),
+                    resolve(&border.border_bottom_width, border.border_bottom_style),
+                    resolve(&border.border_left_width, border.border_left_style),
                 )
             },
         };
@@ -1228,7 +1328,7 @@ impl From<stylo::Display> for Display {
             stylo::DisplayOutside::None => return Display::None,
         };
 
-        let inside = match packed.inside() {
+        let inside = match inside {
             stylo::DisplayInside::Flow => DisplayInside::Flow {
                 is_list_item: packed.is_list_item(),
             },
@@ -1237,12 +1337,12 @@ impl From<stylo::Display> for Display {
             },
             stylo::DisplayInside::Flex => DisplayInside::Flex,
             stylo::DisplayInside::Grid => DisplayInside::Grid,
+            stylo::DisplayInside::Table => DisplayInside::Table,
 
             // These should not be values of DisplayInside, but oh well
             stylo::DisplayInside::None => return Display::None,
             stylo::DisplayInside::Contents => return Display::Contents,
 
-            stylo::DisplayInside::Table => DisplayInside::Table,
             stylo::DisplayInside::TableRowGroup |
             stylo::DisplayInside::TableColumn |
             stylo::DisplayInside::TableColumnGroup |

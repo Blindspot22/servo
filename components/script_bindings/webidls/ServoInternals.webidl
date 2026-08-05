@@ -11,6 +11,18 @@
 Func="ServoInternals::is_servo_internal"]
 interface ServoInternals {
     Promise<object> reportMemory();
+    undefined garbageCollectAllContexts();
+
+    sequence<USVString> preferenceList();
+    [Throws] USVString preferenceType(USVString name);
+    [Throws] any defaultPreferenceValue(USVString name);
+    [Throws] any getPreference(USVString name);
+    [Throws] USVString getStringPreference(USVString name);
+    [Throws] long long getIntPreference(USVString name);
+    [Throws] boolean getBoolPreference(USVString name);
+    undefined setStringPreference(USVString name, USVString value);
+    undefined setIntPreference(USVString name, long long value);
+    undefined setBoolPreference(USVString name, boolean value);
 };
 
 partial interface Navigator {

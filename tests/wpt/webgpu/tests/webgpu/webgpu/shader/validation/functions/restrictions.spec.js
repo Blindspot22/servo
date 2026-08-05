@@ -34,6 +34,10 @@ struct struct_with_array {
   a : array<constructible, 4>
 }
 
+override override_no_default : u32;
+override override_default = 4u;
+override override_expr = override_default + 2;
+
 `;
 
 const kVertexPosCases = {
@@ -157,11 +161,6 @@ g.test('function_return_types').
 specURL('https://gpuweb.github.io/gpuweb/wgsl/#function-restriction').
 desc(`Test that function return types must be constructible`).
 params((u) => u.combine('case', keysOf(kFunctionRetTypeCases))).
-beforeAllSubcases((t) => {
-  if (kFunctionRetTypeCases[t.params.case].name === 'f16') {
-    t.selectDeviceOrSkipTestCase('shader-f16');
-  }
-}).
 fn((t) => {
   const testcase = kFunctionRetTypeCases[t.params.case];
   const enable = testcase.name === 'f16' ? 'enable f16;' : '';
@@ -283,6 +282,18 @@ const kFunctionParamTypeCases = {
     name: `ptr<workgroup, array<atomic<u32>,1>>`,
     valid: 'with_unrestricted_pointer_parameters'
   },
+  ptrWorkgroupOverrideNoDefault: {
+    name: `ptr<workgroup, array<u32, override_no_default>>`,
+    valid: 'with_unrestricted_pointer_parameters'
+  },
+  ptrWorkgroupOverrideWithDefault: {
+    name: `ptr<workgroup, array<f32, override_default>>`,
+    valid: 'with_unrestricted_pointer_parameters'
+  },
+  ptrWorkgroupOverrideExpr: {
+    name: `ptr<workgroup, array<vec4f, override_expr>>`,
+    valid: 'with_unrestricted_pointer_parameters'
+  },
 
   // Invalid pointers.
   invalid_ptr1: { name: `ptr<handle, u32>`, valid: false }, // Can't spell handle address space
@@ -299,11 +310,6 @@ g.test('function_parameter_types').
 specURL('https://gpuweb.github.io/gpuweb/wgsl/#function-restriction').
 desc(`Test validation of user-declared function parameter types`).
 params((u) => u.combine('case', keysOf(kFunctionParamTypeCases))).
-beforeAllSubcases((t) => {
-  if (kFunctionParamTypeCases[t.params.case].name === 'f16') {
-    t.selectDeviceOrSkipTestCase('shader-f16');
-  }
-}).
 fn((t) => {
   const testcase = kFunctionParamTypeCases[t.params.case];
   const enable = testcase.name === 'f16' ? 'enable f16;' : '';
@@ -497,6 +503,21 @@ const kFunctionParamValueCases = {
     value: `&uniform_host_shareable`,
     matches: ['ptr12'],
     needsUnrestrictedPointerParameters: true
+  },
+  ptrWorkgroupOverrideNoDefault: {
+    value: `&wg_override_no_default`,
+    matches: ['ptrWorkgroupOverrideNoDefault'],
+    needsUnrestrictedPointerParameters: true
+  },
+  ptrWorkgroupOverrideWithDefault: {
+    value: `&wg_override_default`,
+    matches: ['ptrWorkgroupOverrideWithDefault'],
+    needsUnrestrictedPointerParameters: true
+  },
+  ptrWorkgroupOverrideExpr: {
+    value: `&wg_override_expr`,
+    matches: ['ptrWorkgroupOverrideExpr'],
+    needsUnrestrictedPointerParameters: true
   }
 };
 
@@ -523,11 +544,6 @@ filter((u) => {
 beginSubcases().
 combine('arg', keysOf(kFunctionParamValueCases))
 ).
-beforeAllSubcases((t) => {
-  if (kFunctionParamTypeCases[t.params.decl].name === 'f16') {
-    t.selectDeviceOrSkipTestCase('shader-f16');
-  }
-}).
 fn((t) => {
   const param = kFunctionParamTypeCases[t.params.decl];
   const arg = kFunctionParamValueCases[t.params.arg];
@@ -583,6 +599,10 @@ var<private> g_array4 : array<mat2x2f, 4>;
 var<private> g_array5 : array<bool, 4>;
 var<private> g_constructible : constructible;
 var<private> g_struct_with_array : struct_with_array;
+
+var<workgroup> wg_override_no_default : array<u32, override_no_default>;
+var<workgroup> wg_override_default : array<f32, override_default>;
+var<workgroup> wg_override_expr : array<vec4f, override_expr>;
 
 fn foo() {
   var f_u32 : u32;

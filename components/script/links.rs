@@ -4,31 +4,31 @@
 
 //! Defines shared hyperlink behaviour for `<link>`, `<a>`, `<area>` and `<form>` elements.
 
-use constellation_traits::{LoadData, LoadOrigin, NavigationHistoryBehavior};
-use html5ever::{local_name, ns};
+use html5ever::local_name;
+use js::context::JSContext;
 use malloc_size_of::malloc_size_of_is_0;
 use net_traits::request::Referrer;
+use servo_constellation_traits::{LoadData, LoadOrigin, NavigationHistoryBehavior};
 use style::str::HTML_SPACE_CHARACTERS;
 
-use crate::dom::bindings::codegen::Bindings::AttrBinding::Attr_Binding::AttrMethods;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::element::referrer_policy_for_element;
-use crate::dom::htmlanchorelement::HTMLAnchorElement;
-use crate::dom::htmlareaelement::HTMLAreaElement;
-use crate::dom::htmlformelement::HTMLFormElement;
-use crate::dom::htmllinkelement::HTMLLinkElement;
+use crate::dom::html::htmlanchorelement::HTMLAnchorElement;
+use crate::dom::html::htmlareaelement::HTMLAreaElement;
+use crate::dom::html::htmlformelement::HTMLFormElement;
+use crate::dom::html::htmllinkelement::HTMLLinkElement;
 use crate::dom::node::NodeTraits;
 use crate::dom::types::Element;
-use crate::script_runtime::CanGc;
+use crate::navigation::navigate;
 
 bitflags::bitflags! {
     /// Describes the different relations that can be specified on elements using the `rel`
     /// attribute.
     ///
     /// Refer to <https://html.spec.whatwg.org/multipage/#linkTypes> for more information.
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Copy, Debug, PartialEq)]
     pub(crate) struct LinkRelations: u32 {
         /// <https://html.spec.whatwg.org/multipage/#rel-alternate>
         const ALTERNATE = 1;
@@ -182,10 +182,7 @@ impl LinkRelations {
     /// [`<area>`]: https://html.spec.whatwg.org/multipage/#the-area-element
     /// [`<form>`]: https://html.spec.whatwg.org/multipage/#the-form-element
     pub(crate) fn for_element(element: &Element) -> Self {
-        let rel = element.get_attribute(&ns!(), &local_name!("rel")).map(|e| {
-            let value = e.value();
-            (**value).to_owned()
-        });
+        let rel = element.get_attribute_string_value(&local_name!("rel"));
 
         let mut relations = rel
             .map(|attribute| {
@@ -198,8 +195,8 @@ impl LinkRelations {
 
         // For historical reasons, "rev=made" is treated as if the "author" relation was specified
         let has_legacy_author_relation = element
-            .get_attribute(&ns!(), &local_name!("rev"))
-            .is_some_and(|rev| &**rev.value() == "made");
+            .get_attribute_string_value(&local_name!("rev"))
+            .is_some_and(|rev| rev == "made");
         if has_legacy_author_relation {
             relations |= Self::AUTHOR;
         }
@@ -288,7 +285,7 @@ impl LinkRelations {
         }
     }
 
-    /// <https://html.spec.whatwg.org/multipage/#get-an-element's-noopener>
+    /// <https://html.spec.whatwg.org/multipage/#get-an-element%27s-noopener>
     pub(crate) fn get_element_noopener(&self, target_attribute_value: Option<&DOMString>) -> bool {
         // Step 1. If element's link types include the noopener or noreferrer keyword, then return true.
         if self.contains(Self::NO_OPENER) || self.contains(Self::NO_REFERRER) {
@@ -310,34 +307,84 @@ impl LinkRelations {
 
 malloc_size_of_is_0!(LinkRelations);
 
-/// <https://html.spec.whatwg.org/multipage/#get-an-element's-target>
-pub(crate) fn get_element_target(subject: &Element) -> Option<DOMString> {
-    if !(subject.is::<HTMLAreaElement>() ||
-        subject.is::<HTMLAnchorElement>() ||
-        subject.is::<HTMLFormElement>())
-    {
-        return None;
+/// <https://html.spec.whatwg.org/multipage/#valid-navigable-target-name>
+fn valid_navigable_target_name(target: &DOMString) -> bool {
+    // > A valid navigable target name is any string with at least one character that does not contain both
+    // > an ASCII tab or newline and a U+003C (<), and it does not start with a U+005F (_).
+    // > (Names starting with a U+005F (_) are reserved for special keywords.)
+    if target.is_empty() {
+        return false;
     }
-    if subject.has_attribute(&local_name!("target")) {
-        return Some(subject.get_string_attribute(&local_name!("target")));
+    if target.contains_tab_or_newline() && target.contains("\u{003C}") {
+        return false;
     }
+    if target.starts_with('\u{005F}') {
+        return false;
+    }
+    true
+}
 
-    let doc = subject.owner_document().base_element();
-    match doc {
-        Some(doc) => {
-            let element = doc.upcast::<Element>();
-            if element.has_attribute(&local_name!("target")) {
-                Some(element.get_string_attribute(&local_name!("target")))
-            } else {
-                None
-            }
-        },
-        None => None,
+/// <https://html.spec.whatwg.org/multipage/#valid-navigable-target-name-or-keyword>
+pub(crate) fn valid_navigable_target_name_or_keyword(target: &DOMString) -> bool {
+    // > A valid navigable target name or keyword is any string that is either a valid navigable target name
+    // > or that is an ASCII case-insensitive match for one of: _blank, _self, _parent, or _top.
+    if valid_navigable_target_name(target) {
+        return true;
     }
+    let target = target.to_ascii_lowercase();
+    target == "_blank" || target == "_self" || target == "_parent" || target == "_top"
+}
+
+/// <https://html.spec.whatwg.org/multipage/#get-an-element%27s-target>
+pub(crate) fn get_element_target(
+    subject: &Element,
+    target: Option<DOMString>,
+) -> Option<DOMString> {
+    assert!(
+        subject.is::<HTMLAreaElement>() ||
+            subject.is::<HTMLAnchorElement>() ||
+            subject.is::<HTMLFormElement>()
+    );
+
+    // Step 1. If target is null, then:
+    let target = target.or_else(|| {
+        // Step 1.1. If element has a target attribute, then set target to that attribute's value.
+        //
+        // Note that for a target attribute to be valid, it must be a valid navigable target name
+        // or keyword
+        let element_target = subject.get_string_attribute(&local_name!("target"));
+        if valid_navigable_target_name_or_keyword(&element_target) {
+            Some(element_target)
+        } else {
+            // Step 1.2. Otherwise, if element's node document contains a base element with a target attribute,
+            // set target to the value of the target attribute of the first such base element.
+            subject
+                .owner_document()
+                .target_base_element()
+                .and_then(|base_element| {
+                    let element = base_element.upcast::<Element>();
+                    if element.has_attribute(&local_name!("target")) {
+                        Some(element.get_string_attribute(&local_name!("target")))
+                    } else {
+                        None
+                    }
+                })
+        }
+    });
+    // Step 2. If target is not null, and contains an ASCII tab or newline and a U+003C (<), then set target to "_blank".
+    if let Some(ref target) = target &&
+        target.contains_tab_or_newline() &&
+        target.contains("\u{003C}")
+    {
+        return Some("_blank".into());
+    }
+    // Step 3. Return target.
+    target
 }
 
 /// <https://html.spec.whatwg.org/multipage/#following-hyperlinks-2>
 pub(crate) fn follow_hyperlink(
+    cx: &mut JSContext,
     subject: &Element,
     relations: LinkRelations,
     hyperlink_suffix: Option<String>,
@@ -358,10 +405,13 @@ pub(crate) fn follow_hyperlink(
     let document = subject.owner_document();
     let target_attribute_value =
         if subject.is::<HTMLAreaElement>() || subject.is::<HTMLAnchorElement>() {
-            if document.alternate_action_keyboard_modifier_active() {
+            if document
+                .event_handler()
+                .alternate_action_keyboard_modifier_active()
+            {
                 Some("_blank".into())
             } else {
-                get_element_target(subject)
+                get_element_target(subject, None)
             }
         } else {
             None
@@ -383,7 +433,7 @@ pub(crate) fn follow_hyperlink(
     let source = document.browsing_context().unwrap();
     let (maybe_chosen, history_handling) = match target_attribute_value {
         Some(name) => {
-            let (maybe_chosen, new) = source.choose_browsing_context(name, noopener);
+            let (maybe_chosen, new) = source.choose_browsing_context(cx, name, noopener);
             let history_handling = if new {
                 NavigationHistoryBehavior::Replace
             } else {
@@ -405,14 +455,15 @@ pub(crate) fn follow_hyperlink(
         // Step 9: Let urlString be the result of applying the URL serializer to urlRecord.
         // TODO: Implement this.
 
-        let attribute = subject.get_attribute(&ns!(), &local_name!("href")).unwrap();
-        let mut href = attribute.Value();
+        let mut href = subject
+            .get_attribute_string_value(&local_name!("href"))
+            .unwrap();
 
         // Step 10: If hyperlinkSuffix is non-null, then append it to urlString.
         if let Some(suffix) = hyperlink_suffix {
             href.push_str(&suffix);
         }
-        let Ok(url) = document.base_url().join(&href) else {
+        let Ok(url) = document.encoding_parse_a_url(&href) else {
             return;
         };
 
@@ -430,22 +481,23 @@ pub(crate) fn follow_hyperlink(
         // Step 13: Navigate targetNavigable to urlString using subject's node document,
         //          with referrerPolicy set to referrerPolicy, userInvolvement set to
         //          userInvolvement, and sourceElement set to subject.
-        let pipeline_id = target_window.as_global_scope().pipeline_id();
         let secure = target_window.as_global_scope().is_secure_context();
         let load_data = LoadData::new(
-            LoadOrigin::Script(document.origin().immutable().clone()),
+            LoadOrigin::Script(document.origin().snapshot()),
             url,
-            Some(pipeline_id),
+            document.about_base_url(),
+            Some(window.pipeline_id()),
             referrer,
             referrer_policy,
             Some(secure),
             Some(document.insecure_requests_policy()),
             document.has_trustworthy_ancestor_origin(),
+            document.creation_sandboxing_flag_set_considering_parent_iframe(),
         );
         let target = Trusted::new(target_window);
-        let task = task!(navigate_follow_hyperlink: move || {
+        let task = task!(navigate_follow_hyperlink: move |cx| {
             debug!("following hyperlink to {}", load_data.url);
-            target.root().load_url(history_handling, false, load_data, CanGc::note());
+            navigate(cx, &target.root(), history_handling, false, load_data);
         });
         target_document
             .owner_global()

@@ -5,8 +5,8 @@
 use std::path::Path;
 use std::sync::LazyLock;
 
-use base::text::{UnicodeBlock, UnicodeBlockMethod, is_cjk};
 use log::warn;
+use servo_base::text::{UnicodeBlock, UnicodeBlockMethod, is_cjk};
 use style::Atom;
 use style::values::computed::font::GenericFontFamily;
 use style::values::computed::{
@@ -413,7 +413,7 @@ impl FontList {
 }
 
 // Functions used by SystemFontSerivce
-pub fn for_each_available_family<F>(mut callback: F)
+pub(crate) fn for_each_available_family<F>(mut callback: F)
 where
     F: FnMut(String),
 {
@@ -425,14 +425,15 @@ where
     }
 }
 
-pub fn for_each_variation<F>(family_name: &str, mut callback: F)
+pub(crate) fn for_each_variation<F>(family_name: &str, mut callback: F)
 where
     F: FnMut(FontTemplate),
 {
     let mut produce_font = |font: &Font| {
         let local_font_identifier = LocalFontIdentifier {
             path: Atom::from(FontList::font_absolute_path(&font.filename)),
-            variation_index: 0,
+            face_index: 0,
+            named_instance_index: 0,
         };
         let stretch = StyleFontStretch::NORMAL;
         let weight = font
@@ -520,6 +521,46 @@ pub fn fallback_font_families(options: FallbackFontSelectionOptions) -> Vec<&'st
                 families.push("Droid Sans Ethiopic");
             },
 
+            UnicodeBlock::Bengali => {
+                families.push("Noto Sans Bengali");
+            },
+
+            UnicodeBlock::Gujarati => {
+                families.push("Noto Sans Gujarati");
+            },
+
+            UnicodeBlock::Gurmukhi => {
+                families.push("Noto Sans Gurmukhi");
+            },
+
+            UnicodeBlock::Oriya => {
+                families.push("Noto Sans Oriya");
+            },
+
+            UnicodeBlock::Kannada => {
+                families.push("Noto Sans Kannada");
+            },
+
+            UnicodeBlock::Telugu => {
+                families.push("Noto Sans Telugu");
+            },
+
+            UnicodeBlock::Malayalam => {
+                families.push("Noto Sans Malayalam");
+            },
+
+            UnicodeBlock::Sinhala => {
+                families.push("Noto Sans Sinhala");
+            },
+
+            UnicodeBlock::Lao => {
+                families.push("Noto Sans Lao");
+            },
+
+            UnicodeBlock::Tibetan => {
+                families.push("Noto Sans Tibetan");
+            },
+
             _ => {
                 if is_cjk(options.character) {
                     families.push("MotoyaLMaru");
@@ -534,7 +575,9 @@ pub fn fallback_font_families(options: FallbackFontSelectionOptions) -> Vec<&'st
     families
 }
 
-pub fn default_system_generic_font_family(generic: GenericFontFamily) -> LowercaseFontFamilyName {
+pub(crate) fn default_system_generic_font_family(
+    generic: GenericFontFamily,
+) -> LowercaseFontFamilyName {
     match generic {
         GenericFontFamily::None | GenericFontFamily::Serif => "serif",
         GenericFontFamily::SansSerif => "sans-serif",

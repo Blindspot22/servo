@@ -5,8 +5,7 @@
 #[cfg(not(any(target_os = "android", target_env = "ohos")))]
 use std::path::{Path, PathBuf};
 
-use servo::net_traits::pub_domains::is_reg_domain;
-use servo::servo_url::ServoUrl;
+use servo::{ServoUrl, is_reg_domain};
 
 #[cfg(not(any(target_os = "android", target_env = "ohos")))]
 pub fn parse_url_or_filename(cwd: &Path, input: &str) -> Result<ServoUrl, ()> {
@@ -43,12 +42,21 @@ pub fn get_default_url(
             ("file", None, Ok(ref path)) if exists(path) => {
                 new_url = cmdline_url;
             },
+            (scheme, None, Err(_)) if is_localhost(scheme) || is_domain_like(scheme) => {
+                new_url = ServoUrl::parse(&format!("http://{}:{}", scheme, &url.path())).ok();
+            },
             _ => {},
         }
     }
 
-    if new_url.is_none() && url_opt.is_some() {
-        new_url = location_bar_input_to_url(url_opt.unwrap(), &preferences.searchpage);
+    #[allow(
+        clippy::collapsible_if,
+        reason = "let chains are not available in 1.85"
+    )]
+    if new_url.is_none() {
+        if let Some(url_opt) = url_opt {
+            new_url = location_bar_input_to_url(url_opt, &preferences.searchpage);
+        }
     }
 
     let pref_url = parse_url_or_filename(cwd.as_ref(), &preferences.homepage).ok();
@@ -63,11 +71,19 @@ pub fn get_default_url(
 /// interpret the string as a search term.
 pub(crate) fn location_bar_input_to_url(request: &str, searchpage: &str) -> Option<ServoUrl> {
     let request = request.trim();
-    ServoUrl::parse(request)
-        .ok()
-        .or_else(|| try_as_file(request))
-        .or_else(|| try_as_domain(request))
-        .or_else(|| try_as_search_page(request, searchpage))
+    let input_url = ServoUrl::parse(request).ok();
+    if let Some(url) = input_url {
+        match (url.scheme(), url.host(), url.to_file_path()) {
+            (scheme, None, Err(_)) if is_localhost(scheme) || is_domain_like(scheme) => {
+                ServoUrl::parse(&format!("http://{}:{}", scheme, &url.path())).ok()
+            },
+            _ => Some(url),
+        }
+    } else {
+        try_as_file(request)
+            .or_else(|| try_as_domain(request))
+            .or_else(|| try_as_search_page(request, searchpage))
+    }
 }
 
 fn try_as_file(request: &str) -> Option<ServoUrl> {
@@ -78,11 +94,6 @@ fn try_as_file(request: &str) -> Option<ServoUrl> {
 }
 
 fn try_as_domain(request: &str) -> Option<ServoUrl> {
-    fn is_domain_like(s: &str) -> bool {
-        !s.starts_with('/') && s.contains('/') ||
-            (!s.contains(' ') && !s.starts_with('.') && s.split('.').count() > 1)
-    }
-
     if !request.contains(' ') && is_reg_domain(request) || is_domain_like(request) {
         return ServoUrl::parse(&format!("https://{}", request)).ok();
     }
@@ -94,4 +105,13 @@ fn try_as_search_page(request: &str, searchpage: &str) -> Option<ServoUrl> {
         return None;
     }
     ServoUrl::parse(&searchpage.replace("%s", request)).ok()
+}
+
+fn is_domain_like(s: &str) -> bool {
+    !s.starts_with('/') && s.contains('/') ||
+        (!s.contains(' ') && !s.starts_with('.') && s.split('.').count() > 1)
+}
+
+fn is_localhost(s: &str) -> bool {
+    s == "localhost"
 }

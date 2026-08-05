@@ -51,14 +51,6 @@ combine('compound_assignment', [false, true]).
 beginSubcases().
 combine('op', ['<<', '>>'])
 ).
-beforeAllSubcases((t) => {
-  if (
-  scalarTypeOf(kScalarAndVectorTypes[t.params.lhs]) === Type.f16 ||
-  scalarTypeOf(kScalarAndVectorTypes[t.params.rhs]) === Type.f16)
-  {
-    t.selectDeviceOrSkipTestCase('shader-f16');
-  }
-}).
 fn((t) => {
   const lhs = kScalarAndVectorTypes[t.params.lhs];
   const rhs = kScalarAndVectorTypes[t.params.rhs];
@@ -212,11 +204,15 @@ const kLeftShiftCases = [
   lhs: `${0b0100000000000000000000000000000000000000000000000000000000000000}`,
   rhs: `1u`,
   pass: false
-}];
+},
+
+// Negative operand overflow for abstract
+{ lhs: `-1`, rhs: `63`, pass: true },
+{ lhs: `-1`, rhs: `64`, pass: false }];
 
 
 g.test('shift_left_concrete').
-desc('Tests validation of binary left shift of concrete values').
+desc('Tests validation of binary left shift (including abstract, despite the test name)').
 params((u) =>
 u.
 combine('case', kLeftShiftCases) //
@@ -253,11 +249,15 @@ const kRightShiftCases = [
 // Shift by negative is an error
 { lhs: `1`, rhs: `-1`, pass: false },
 { lhs: `1i`, rhs: `-1`, pass: false },
-{ lhs: `1u`, rhs: `-1`, pass: false }];
+{ lhs: `1u`, rhs: `-1`, pass: false },
+
+// Abstract shifts are permitted to underflow
+{ lhs: `1`, rhs: `64`, pass: true },
+{ lhs: `-1`, rhs: `64`, pass: true }];
 
 
 g.test('shift_right_concrete').
-desc('Tests validation of binary right shift of concrete values').
+desc('Tests validation of binary right shift (including abstract, despite the test name)').
 params((u) =>
 u.
 combine('case', kRightShiftCases) //
@@ -303,21 +303,25 @@ params((u) =>
 u.
 combine('op', ['<<', '>>']).
 combine('type', ['i32', 'u32']).
+combine('vectorize', [undefined, 2, 3, 4]).
 beginSubcases().
 combine('stage', ['shader', 'pipeline']).
 combine('value', [31, 32, 33, 64])
 ).
 fn((t) => {
   const u32 = Type.u32;
+  const vec_size = t.params.vectorize;
   let rhs = 'o';
   if (t.params.stage === 'shader') {
     rhs = `${u32.create(t.params.value).wgsl()}`;
   }
+
+  const vecType = vec_size ? `vec${vec_size}<${t.params.type}>` : t.params.type;
   const wgsl = `
 override o = 0u;
-fn foo() -> ${t.params.type} {
-  var v : ${t.params.type} = 0;
-  return v ${t.params.op} ${rhs};
+fn foo() -> ${vecType} {
+  var v : ${vecType} = ${vectorize('0', vec_size)};
+  return v ${t.params.op} ${vectorize(rhs, vec_size)};
 }`;
 
   const expect = t.params.value < 32;

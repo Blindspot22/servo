@@ -6,14 +6,15 @@ use std::cell::Cell;
 use std::cmp::Ordering;
 use std::time::Duration;
 
-use base::cross_process_instant::CrossProcessInstant;
 use malloc_size_of_derive::MallocSizeOf;
+use paint_api::largest_contentful_paint_candidate::LCPCandidateID;
 use profile_traits::time::{
     ProfilerCategory, ProfilerChan, TimerMetadata, TimerMetadataFrameType, TimerMetadataReflowType,
     send_profile_data,
 };
 use script_traits::ProgressiveWebMetricType;
-use servo_config::opts;
+use servo_base::cross_process_instant::CrossProcessInstant;
+use servo_config::opts::{self, DiagnosticsLoggingOption};
 use servo_url::ServoUrl;
 
 /// TODO make this configurable
@@ -52,17 +53,15 @@ fn set_metric(
         metric_time,
     );
 
-    // Print the metric to console if the print-pwm option was given.
-    if opts::get().print_pwm {
+    if opts::get()
+        .debug
+        .is_enabled(DiagnosticsLoggingOption::ProgressiveWebMetrics)
+    {
         let navigation_start = pwm
             .navigation_start()
             .unwrap_or_else(CrossProcessInstant::epoch);
-        println!(
-            "{:?} {:?} {:?}",
-            url,
-            metric_type,
-            (metric_time - navigation_start).as_seconds_f64()
-        );
+        let duration = (metric_time - navigation_start).as_seconds_f64();
+        println!("{url:?} {metric_type:?} {duration:?}s");
     }
 }
 
@@ -96,7 +95,10 @@ pub struct ProgressiveWebMetrics {
     ///
     /// See <https://w3c.github.io/paint-timing/#first-contentful-paint>
     first_contentful_paint: Cell<Option<CrossProcessInstant>>,
-    #[ignore_malloc_size_of = "can't measure channels"]
+    /// The time at which the largest contentful paint was rendered.
+    ///
+    /// See <https://www.w3.org/TR/largest-contentful-paint/>
+    largest_contentful_paint: Cell<Option<CrossProcessInstant>>,
     time_profiler_chan: ProfilerChan,
     url: ServoUrl,
 }
@@ -153,6 +155,7 @@ impl ProgressiveWebMetrics {
             time_to_interactive: Cell::new(None),
             first_paint: Cell::new(None),
             first_contentful_paint: Cell::new(None),
+            largest_contentful_paint: Cell::new(None),
             time_profiler_chan,
             url,
         }
@@ -194,11 +197,30 @@ impl ProgressiveWebMetrics {
         self.first_contentful_paint.get()
     }
 
+    pub fn largest_contentful_paint(&self) -> Option<CrossProcessInstant> {
+        self.largest_contentful_paint.get()
+    }
+
     pub fn main_thread_available(&self) -> Option<CrossProcessInstant> {
         self.main_thread_available.get()
     }
 
-    pub fn set_first_paint(&self, paint_time: CrossProcessInstant, first_reflow: bool) {
+    pub fn set_performance_paint_metric(
+        &self,
+        paint_time: CrossProcessInstant,
+        first_reflow: bool,
+        metric_type: ProgressiveWebMetricType,
+    ) {
+        match metric_type {
+            ProgressiveWebMetricType::FirstPaint => self.set_first_paint(paint_time, first_reflow),
+            ProgressiveWebMetricType::FirstContentfulPaint => {
+                self.set_first_contentful_paint(paint_time, first_reflow)
+            },
+            _ => {},
+        }
+    }
+
+    fn set_first_paint(&self, paint_time: CrossProcessInstant, first_reflow: bool) {
         set_metric(
             self,
             Some(self.make_metadata(first_reflow)),
@@ -210,13 +232,34 @@ impl ProgressiveWebMetrics {
         );
     }
 
-    pub fn set_first_contentful_paint(&self, paint_time: CrossProcessInstant, first_reflow: bool) {
+    fn set_first_contentful_paint(&self, paint_time: CrossProcessInstant, first_reflow: bool) {
         set_metric(
             self,
             Some(self.make_metadata(first_reflow)),
             ProgressiveWebMetricType::FirstContentfulPaint,
             ProfilerCategory::TimeToFirstContentfulPaint,
             &self.first_contentful_paint,
+            paint_time,
+            &self.url,
+        );
+    }
+
+    pub fn set_largest_contentful_paint(
+        &self,
+        id: LCPCandidateID,
+        paint_time: CrossProcessInstant,
+        area: usize,
+    ) {
+        set_metric(
+            self,
+            Some(self.make_metadata(false)),
+            ProgressiveWebMetricType::LargestContentfulPaint {
+                id,
+                area,
+                url: None,
+            },
+            ProfilerCategory::TimeToLargestContentfulPaint,
+            &self.largest_contentful_paint,
             paint_time,
             &self.url,
         );
@@ -277,95 +320,101 @@ impl ProgressiveWebMetrics {
 }
 
 #[cfg(test)]
-fn test_metrics() -> ProgressiveWebMetrics {
-    let (sender, _) = ipc_channel::ipc::channel().unwrap();
-    let profiler_chan = ProfilerChan(sender);
-    let mut metrics = ProgressiveWebMetrics::new(
-        profiler_chan,
-        ServoUrl::parse("about:blank").unwrap(),
-        TimerMetadataFrameType::RootWindow,
-    );
+mod test {
+    use servo_base::generic_channel;
 
-    assert!((&metrics).navigation_start().is_none());
-    assert!(metrics.get_tti().is_none());
-    assert!(metrics.first_contentful_paint().is_none());
-    assert!(metrics.first_paint().is_none());
+    use super::*;
 
-    metrics.set_navigation_start(CrossProcessInstant::now());
+    fn test_metrics() -> ProgressiveWebMetrics {
+        let (sender, _) = generic_channel::channel().unwrap();
+        let profiler_chan = ProfilerChan(Some(sender));
+        let mut metrics = ProgressiveWebMetrics::new(
+            profiler_chan,
+            ServoUrl::parse("about:blank").unwrap(),
+            TimerMetadataFrameType::RootWindow,
+        );
 
-    metrics
-}
+        assert!((&metrics).navigation_start().is_none());
+        assert!(metrics.get_tti().is_none());
+        assert!(metrics.first_contentful_paint().is_none());
+        assert!(metrics.first_paint().is_none());
 
-#[test]
-fn test_set_dcl() {
-    let metrics = test_metrics();
-    metrics.maybe_set_tti(InteractiveFlag::DOMContentLoaded);
-    let dcl = metrics.dom_content_loaded();
-    assert!(dcl.is_some());
+        metrics.set_navigation_start(CrossProcessInstant::now());
 
-    //try to overwrite
-    metrics.maybe_set_tti(InteractiveFlag::DOMContentLoaded);
-    assert_eq!(metrics.dom_content_loaded(), dcl);
-    assert_eq!(metrics.get_tti(), None);
-}
+        metrics
+    }
 
-#[test]
-fn test_set_mta() {
-    let metrics = test_metrics();
-    let now = CrossProcessInstant::now();
-    metrics.maybe_set_tti(InteractiveFlag::TimeToInteractive(now));
-    let main_thread_available_time = metrics.main_thread_available();
-    assert!(main_thread_available_time.is_some());
-    assert_eq!(main_thread_available_time, Some(now));
+    #[test]
+    fn test_set_dcl() {
+        let metrics = test_metrics();
+        metrics.maybe_set_tti(InteractiveFlag::DOMContentLoaded);
+        let dcl = metrics.dom_content_loaded();
+        assert!(dcl.is_some());
 
-    //try to overwrite
-    metrics.maybe_set_tti(InteractiveFlag::TimeToInteractive(
-        CrossProcessInstant::now(),
-    ));
-    assert_eq!(metrics.main_thread_available(), main_thread_available_time);
-    assert_eq!(metrics.get_tti(), None);
-}
+        // try to overwrite
+        metrics.maybe_set_tti(InteractiveFlag::DOMContentLoaded);
+        assert_eq!(metrics.dom_content_loaded(), dcl);
+        assert_eq!(metrics.get_tti(), None);
+    }
 
-#[test]
-fn test_set_tti_dcl() {
-    let metrics = test_metrics();
-    let now = CrossProcessInstant::now();
-    metrics.maybe_set_tti(InteractiveFlag::TimeToInteractive(now));
-    let main_thread_available_time = metrics.main_thread_available();
-    assert!(main_thread_available_time.is_some());
+    #[test]
+    fn test_set_mta() {
+        let metrics = test_metrics();
+        let now = CrossProcessInstant::now();
+        metrics.maybe_set_tti(InteractiveFlag::TimeToInteractive(now));
+        let main_thread_available_time = metrics.main_thread_available();
+        assert!(main_thread_available_time.is_some());
+        assert_eq!(main_thread_available_time, Some(now));
 
-    metrics.maybe_set_tti(InteractiveFlag::DOMContentLoaded);
-    let dom_content_loaded_time = metrics.dom_content_loaded();
-    assert!(dom_content_loaded_time.is_some());
+        // try to overwrite
+        metrics.maybe_set_tti(InteractiveFlag::TimeToInteractive(
+            CrossProcessInstant::now(),
+        ));
+        assert_eq!(metrics.main_thread_available(), main_thread_available_time);
+        assert_eq!(metrics.get_tti(), None);
+    }
 
-    assert_eq!(metrics.get_tti(), dom_content_loaded_time);
-}
+    #[test]
+    fn test_set_tti_dcl() {
+        let metrics = test_metrics();
+        let now = CrossProcessInstant::now();
+        metrics.maybe_set_tti(InteractiveFlag::TimeToInteractive(now));
+        let main_thread_available_time = metrics.main_thread_available();
+        assert!(main_thread_available_time.is_some());
 
-#[test]
-fn test_set_tti_mta() {
-    let metrics = test_metrics();
-    metrics.maybe_set_tti(InteractiveFlag::DOMContentLoaded);
-    let dcl = metrics.dom_content_loaded();
-    assert!(dcl.is_some());
+        metrics.maybe_set_tti(InteractiveFlag::DOMContentLoaded);
+        let dom_content_loaded_time = metrics.dom_content_loaded();
+        assert!(dom_content_loaded_time.is_some());
 
-    let time = CrossProcessInstant::now();
-    metrics.maybe_set_tti(InteractiveFlag::TimeToInteractive(time));
-    let mta = metrics.main_thread_available();
-    assert!(mta.is_some());
+        assert_eq!(metrics.get_tti(), dom_content_loaded_time);
+    }
 
-    assert_eq!(metrics.get_tti(), mta);
-}
+    #[test]
+    fn test_set_tti_mta() {
+        let metrics = test_metrics();
+        metrics.maybe_set_tti(InteractiveFlag::DOMContentLoaded);
+        let dcl = metrics.dom_content_loaded();
+        assert!(dcl.is_some());
 
-#[test]
-fn test_first_paint_setter() {
-    let metrics = test_metrics();
-    metrics.set_first_paint(CrossProcessInstant::now(), false);
-    assert!(metrics.first_paint().is_some());
-}
+        let time = CrossProcessInstant::now();
+        metrics.maybe_set_tti(InteractiveFlag::TimeToInteractive(time));
+        let mta = metrics.main_thread_available();
+        assert!(mta.is_some());
 
-#[test]
-fn test_first_contentful_paint_setter() {
-    let metrics = test_metrics();
-    metrics.set_first_contentful_paint(CrossProcessInstant::now(), false);
-    assert!(metrics.first_contentful_paint().is_some());
+        assert_eq!(metrics.get_tti(), mta);
+    }
+
+    #[test]
+    fn test_first_paint_setter() {
+        let metrics = test_metrics();
+        metrics.set_first_paint(CrossProcessInstant::now(), false);
+        assert!(metrics.first_paint().is_some());
+    }
+
+    #[test]
+    fn test_first_contentful_paint_setter() {
+        let metrics = test_metrics();
+        metrics.set_first_contentful_paint(CrossProcessInstant::now(), false);
+        assert!(metrics.first_contentful_paint().is_some());
+    }
 }

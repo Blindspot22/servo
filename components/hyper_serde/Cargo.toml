@@ -1,6 +1,6 @@
 [package]
-name = "hyper_serde"
-version = "0.13.2"
+name = "servo-hyper-serde"
+version.workspace = true
 edition.workspace = true
 authors = ["The Servo Project Developers"]
 description = "Serde support for hyper types."
@@ -21,8 +21,11 @@ headers = { workspace = true }
 http = { workspace = true }
 hyper = { workspace = true }
 mime = { workspace = true }
-serde = { workspace = true }
 serde_bytes = { workspace = true }
+serde_core = { workspace = true }
 
 [dev-dependencies]
-serde_test = "1.0"
+ipc-channel = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_test = { workspace = true }

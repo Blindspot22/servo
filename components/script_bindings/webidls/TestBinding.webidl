@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+// skip-unless CARGO_FEATURE_TESTBINDING
+
 // This interface is entirely internal to Servo, and should not be accessible to
 // web pages.
 
@@ -45,6 +47,10 @@ dictionary TestDictionary {
   DOMString? nonRequiredNullable2;
   SimpleCallback noCallbackImport;
   callbackWithOnlyOneOptionalArg noCallbackImport2;
+};
+
+dictionary TestDictionaryWithTypedArray {
+  Uint8Array typedArray;
 };
 
 dictionary TestDictionaryParent {
@@ -240,6 +246,7 @@ interface TestBinding {
   (unsigned long or boolean)? receiveNullableUnion5();
   (ByteString or long)? receiveNullableUnion6();
   sequence<long>? receiveNullableSequence();
+  sequence<object> receiveObjectSequence();
   TestDictionary receiveTestDictionaryWithSuccessOnKeyword();
   boolean dictMatchesPassedValues(TestDictionary arg);
 
@@ -296,6 +303,19 @@ interface TestBinding {
   // https://github.com/servo/servo/pull/26154
   DOMString passOverloadedDict(Node arg);
   DOMString passOverloadedDict(TestURLLike arg);
+
+  DOMString passOverloadedUnionOfObjectAndString((object or DOMString) arg);
+  DOMString passOverloadedUnionOfObjectAndString(boolean arg);
+  DOMString passOverloadedUnionOfObjectAndNumber((object or long) arg);
+  DOMString passOverloadedUnionOfObjectAndNumber(boolean arg);
+  DOMString passOverloadedUnionOfObjectAndBoolean((object or boolean) arg);
+  DOMString passOverloadedUnionOfObjectAndBoolean(long arg);
+  DOMString passOverloadedUnionOfStringAndNumber((DOMString or long) arg);
+  DOMString passOverloadedUnionOfStringAndNumber(boolean arg);
+  DOMString passOverloadedUnionOfStringAndBoolean((DOMString or boolean) arg);
+  DOMString passOverloadedUnionOfStringAndBoolean(long arg);
+  DOMString passOverloadedUnionOfNumberAndBoolean((long or boolean) arg);
+  DOMString passOverloadedUnionOfNumberAndBoolean(DOMString arg);
 
   undefined passNullableBoolean(boolean? arg);
   undefined passNullableByte(byte? arg);
@@ -527,8 +547,6 @@ interface TestBinding {
   static undefined prefControlledStaticMethodDisabled();
   [Pref="dom_testbinding_prefcontrolled_enabled"]
   const unsigned short prefControlledConstDisabled = 0;
-  [Pref="layout_animations_test_enabled"]
-  undefined advanceClock(long millis);
 
   [Pref="dom_testbinding_prefcontrolled2_enabled"]
   readonly attribute boolean prefControlledAttributeEnabled;
@@ -583,8 +601,6 @@ interface TestBinding {
   static Promise<any> staticInternalThrowToRejectPromise([EnforceRange] unsigned long long arg);
   Promise<any> methodInternalThrowToRejectPromise([EnforceRange] unsigned long long arg);
 
-  undefined panic();
-
   GlobalScope entryGlobal();
   GlobalScope incumbentGlobal();
 
@@ -592,6 +608,7 @@ interface TestBinding {
   readonly attribute boolean semiExposedBoolFromInterface;
 
   TestDictionaryWithParent getDictionaryWithParent(DOMString parent, DOMString child);
+  undefined getDictionaryWithTypedArray(optional TestDictionaryWithTypedArray dict = {});
 };
 
 [Exposed=(Window)]
@@ -607,15 +624,20 @@ partial interface TestBinding {
 callback SimpleCallback = undefined(any value);
 callback callbackWithOnlyOneOptionalArg = Promise<undefined> (optional any reason);
 
-partial interface TestBinding {
-  [Pref="dom_testable_crash_enabled"]
-  undefined crashHard();
-};
-
 [Exposed=(Window,Worker), Pref="dom_testbinding_enabled"]
 namespace TestNS {
     const unsigned long ONE   = 1;
     const unsigned long TWO   = 0x2;
+    [SameObject] readonly attribute TestBinding testAttribute;
 };
 
 typedef Promise<undefined> PromiseUndefined;
+
+// https://github.com/servo/servo/issues/37038
+dictionary NotUsedAnyWhereElse {};
+dictionary RecordFieldWithUnionInside {
+    record<USVString, (USVString or NotUsedAnyWhereElse)> recordWithUnionField;
+};
+
+// https://github.com/servo/servo/issues/28679
+typedef (USVString or undefined) UnionWithUndefinedVariant;

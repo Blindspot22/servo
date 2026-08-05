@@ -5,15 +5,15 @@
 //! Trait representing the concept of [serializable objects]
 //! (<https://html.spec.whatwg.org/multipage/#serializable-objects>).
 
-use std::collections::HashMap;
+use js::context::{JSContext, NoGC};
+use rustc_hash::FxHashMap;
+use script_bindings::reflector::DomObject;
+use script_bindings::structuredclone::MarkedAsSerializableInIdl;
+use servo_base::id::{Index, NamespaceIndex, PipelineNamespaceId};
 
-use base::id::{Index, NamespaceIndex, PipelineNamespaceId};
-
-use crate::dom::bindings::reflector::DomObject;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::structuredclone::StructuredData;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::CanGc;
 
 /// The key corresponding to the storage location
 /// of a serialized platform object stored in a StructuredDataHolder.
@@ -45,7 +45,7 @@ impl<T> From<StorageKey> for NamespaceIndex<T> {
 
 /// Interface for serializable platform objects.
 /// <https://html.spec.whatwg.org/multipage/#serializable>
-pub(crate) trait Serializable: DomObject
+pub(crate) trait Serializable: DomObject + MarkedAsSerializableInIdl
 where
     Self: Sized,
 {
@@ -53,12 +53,12 @@ where
     type Data;
 
     /// <https://html.spec.whatwg.org/multipage/#serialization-steps>
-    fn serialize(&self) -> Result<(NamespaceIndex<Self::Index>, Self::Data), ()>;
+    fn serialize(&self, no_gc: &NoGC) -> Result<(NamespaceIndex<Self::Index>, Self::Data), ()>;
     /// <https://html.spec.whatwg.org/multipage/#deserialization-steps>
     fn deserialize(
+        cx: &mut JSContext,
         owner: &GlobalScope,
         serialized: Self::Data,
-        can_gc: CanGc,
     ) -> Result<DomRoot<Self>, ()>
     where
         Self: Sized;
@@ -67,5 +67,7 @@ where
     /// should be used to read/store serialized instances of this type.
     fn serialized_storage<'a>(
         data: StructuredData<'a, '_>,
-    ) -> &'a mut Option<HashMap<NamespaceIndex<Self::Index>, Self::Data>>;
+    ) -> &'a mut Option<FxHashMap<NamespaceIndex<Self::Index>, Self::Data>>;
 }
+
+pub(crate) fn assert_serializable<T: Serializable>() {}

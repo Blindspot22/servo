@@ -3,12 +3,12 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
 
 use crate::dom::bindings::codegen::Bindings::BluetoothCharacteristicPropertiesBinding::BluetoothCharacteristicPropertiesMethods;
-use crate::dom::bindings::reflector::{Reflector, reflect_dom_object};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::CanGc;
 
 // https://webbluetoothcg.github.io/web-bluetooth/#characteristicproperties
 #[dom_struct]
@@ -25,9 +25,9 @@ pub(crate) struct BluetoothCharacteristicProperties {
     writable_auxiliaries: bool,
 }
 
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 impl BluetoothCharacteristicProperties {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new_inherited(
         broadcast: bool,
         read: bool,
@@ -53,8 +53,9 @@ impl BluetoothCharacteristicProperties {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
         broadcast: bool,
         read: bool,
@@ -65,9 +66,8 @@ impl BluetoothCharacteristicProperties {
         authenticatedSignedWrites: bool,
         reliableWrite: bool,
         writableAuxiliaries: bool,
-        can_gc: CanGc,
     ) -> DomRoot<BluetoothCharacteristicProperties> {
-        reflect_dom_object(
+        reflect_dom_object_with_cx(
             Box::new(BluetoothCharacteristicProperties::new_inherited(
                 broadcast,
                 read,
@@ -80,7 +80,7 @@ impl BluetoothCharacteristicProperties {
                 writableAuxiliaries,
             )),
             global,
-            can_gc,
+            cx,
         )
     }
 }
@@ -88,47 +88,47 @@ impl BluetoothCharacteristicProperties {
 impl BluetoothCharacteristicPropertiesMethods<crate::DomTypeHolder>
     for BluetoothCharacteristicProperties
 {
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothcharacteristicproperties-broadcast
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothcharacteristicproperties-broadcast>
     fn Broadcast(&self) -> bool {
         self.broadcast
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothcharacteristicproperties-read
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothcharacteristicproperties-read>
     fn Read(&self) -> bool {
         self.read
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothcharacteristicproperties-writewithoutresponse
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothcharacteristicproperties-writewithoutresponse>
     fn WriteWithoutResponse(&self) -> bool {
         self.write_without_response
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothcharacteristicproperties-write
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothcharacteristicproperties-write>
     fn Write(&self) -> bool {
         self.write
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothcharacteristicproperties-notify
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothcharacteristicproperties-notify>
     fn Notify(&self) -> bool {
         self.notify
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothcharacteristicproperties-indicate
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothcharacteristicproperties-indicate>
     fn Indicate(&self) -> bool {
         self.indicate
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothcharacteristicproperties-authenticatedsignedwrites
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothcharacteristicproperties-authenticatedsignedwrites>
     fn AuthenticatedSignedWrites(&self) -> bool {
         self.authenticated_signed_writes
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothcharacteristicproperties-reliablewrite
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothcharacteristicproperties-reliablewrite>
     fn ReliableWrite(&self) -> bool {
         self.reliable_write
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothcharacteristicproperties-writableauxiliaries
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothcharacteristicproperties-writableauxiliaries>
     fn WritableAuxiliaries(&self) -> bool {
         self.writable_auxiliaries
     }

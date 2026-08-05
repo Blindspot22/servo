@@ -9,10 +9,10 @@
 /// ```
 #[macro_export]
 macro_rules! native_fn {
-    ($call:expr, $name:expr, $nargs:expr, $flags:expr) => {{
-        let cx = $crate::dom::types::GlobalScope::get_cx();
-        let fun_obj = $crate::native_raw_obj_fn!(cx, $call, $name, $nargs, $flags);
-        #[allow(unsafe_code)]
+    ($cx:expr, $call:expr, $name:expr, $nargs:expr, $flags:expr) => {{
+        let fun_obj = $crate::native_raw_obj_fn!($cx, $call, $name, $nargs, $flags);
+        let cx = $cx;
+        #[expect(unsafe_code)]
         unsafe {
             Function::new(cx, fun_obj)
         }
@@ -27,21 +27,32 @@ macro_rules! native_fn {
 #[macro_export]
 macro_rules! native_raw_obj_fn {
     ($cx:expr, $call:expr, $name:expr, $nargs:expr, $flags:expr) => {{
-        #[allow(unsafe_code)]
+        #[expect(unsafe_code)]
         #[allow(clippy::macro_metavars_in_unsafe)]
-        unsafe extern "C" fn wrapper(cx: *mut JSContext, argc: u32, vp: *mut JSVal) -> bool {
-            $call(cx, argc, vp)
+        unsafe extern "C" fn wrapper(
+            cx: *mut js::jsapi::JSContext,
+            argc: u32,
+            vp: *mut JSVal,
+        ) -> bool {
+            let mut cx = unsafe {
+                // SAFETY: We are in SM hook
+                js::context::JSContext::from_ptr(
+                    std::ptr::NonNull::new(cx).expect("JSContext is not null in SM hook"),
+                )
+            };
+            let call_args = unsafe { CallArgs::from_vp(vp, argc) };
+            $call(&mut cx, call_args)
         }
-        #[allow(unsafe_code)]
+        #[expect(unsafe_code)]
         #[allow(clippy::macro_metavars_in_unsafe)]
         unsafe {
             let name: &std::ffi::CStr = $name;
-            let raw_fun = js::jsapi::JS_NewFunction(
-                *$cx,
+            let raw_fun = js::rust::wrappers2::JS_NewFunction(
+                $cx,
                 Some(wrapper),
                 $nargs,
                 $flags,
-                name.as_ptr() as *const std::ffi::c_char,
+                name.as_ptr(),
             );
             assert!(!raw_fun.is_null());
             js::jsapi::JS_GetFunctionObject(raw_fun)

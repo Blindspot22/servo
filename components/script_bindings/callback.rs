@@ -5,31 +5,37 @@
 //! Base classes to work with IDL callbacks.
 
 use std::default::Default;
-use std::ffi::CString;
-use std::mem::drop;
+use std::ffi::CStr;
 use std::rc::Rc;
 
-use js::jsapi::{
-    AddRawValueRoot, EnterRealm, Heap, IsCallable, JSObject, LeaveRealm, Realm, RemoveRawValueRoot,
-};
+use js::context::JSContext;
+use js::jsapi::{Heap, IsCallable, JSObject, RemoveRawValueRoot};
 use js::jsval::{JSVal, NullValue, ObjectValue, UndefinedValue};
-use js::rust::wrappers::{JS_GetProperty, JS_WrapObject};
+use js::rust::wrappers2::{AddRawValueRoot, EnterRealm, JS_GetProperty, JS_WrapObject, LeaveRealm};
 use js::rust::{HandleObject, MutableHandleValue, Runtime};
 
-use crate::DomTypes;
 use crate::codegen::GenericBindings::WindowBinding::Window_Binding::WindowMethods;
 use crate::error::{Error, Fallible};
-use crate::inheritance::Castable;
 use crate::interfaces::{DocumentHelpers, DomHelpers, GlobalScopeHelpers};
-use crate::realms::{InRealm, enter_realm};
+use crate::realms::enter_auto_realm;
 use crate::reflector::DomObject;
-use crate::root::{Dom, DomRoot};
-use crate::script_runtime::{CanGc, JSContext};
-use crate::settings_stack::{GenericAutoEntryScript, GenericAutoIncumbentScript};
-use crate::utils::AsCCharPtrPtr;
+use crate::root::Dom;
+use crate::settings_stack::{run_a_callback, run_a_script};
+use crate::{DomTypes, cformat};
 
 pub trait ThisReflector {
     fn jsobject(&self) -> *mut JSObject;
+}
+
+/// Try to obtain a Window object from a callback target.
+/// This Window may be different than the callback's associated global if the
+/// owner has been adopted into a different realm than it was created in.
+/// As such, the default implementation should be used for any callback target
+/// that cannot be adopted (i.e. is not a descendant of Node).
+pub trait OwnerWindow<D: DomTypes> {
+    fn owner_window(&self) -> Option<crate::root::DomRoot<D::Window>> {
+        None
+    }
 }
 
 impl<T: DomObject> ThisReflector for T {
@@ -44,6 +50,8 @@ impl ThisReflector for HandleObject<'_> {
     }
 }
 
+impl<D: DomTypes> OwnerWindow<D> for HandleObject<'_> {}
+
 /// The exception handling used for a call.
 #[derive(Clone, Copy, PartialEq)]
 pub enum ExceptionHandling {
@@ -55,11 +63,13 @@ pub enum ExceptionHandling {
 
 /// A common base class for representing IDL callback function and
 /// callback interface types.
-#[derive(JSTraceable)]
+#[derive(JSTraceable, MallocSizeOf)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 pub struct CallbackObject<D: DomTypes> {
     /// The underlying `JSObject`.
+    #[ignore_malloc_size_of = "measured by mozjs"]
     callback: Heap<*mut JSObject>,
+    #[ignore_malloc_size_of = "measured by mozjs"]
     permanent_js_root: Heap<JSVal>,
 
     /// The ["callback context"], that is, the global to use as incumbent
@@ -77,7 +87,6 @@ pub struct CallbackObject<D: DomTypes> {
 }
 
 impl<D: DomTypes> CallbackObject<D> {
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     // These are used by the bindings and do not need `default()` functions.
     #[allow(clippy::new_without_default)]
     fn new() -> Self {
@@ -92,20 +101,22 @@ impl<D: DomTypes> CallbackObject<D> {
         self.callback.get()
     }
 
-    #[allow(unsafe_code)]
-    unsafe fn init(&mut self, cx: JSContext, callback: *mut JSObject) {
+    #[expect(unsafe_code)]
+    unsafe fn init(&mut self, cx: &JSContext, callback: *mut JSObject) {
         self.callback.set(callback);
         self.permanent_js_root.set(ObjectValue(callback));
-        assert!(AddRawValueRoot(
-            *cx,
-            self.permanent_js_root.get_unsafe(),
-            b"CallbackObject::root\n".as_c_char_ptr()
-        ));
+        unsafe {
+            assert!(AddRawValueRoot(
+                cx,
+                self.permanent_js_root.get_unsafe(),
+                c"CallbackObject::root".as_ptr()
+            ));
+        }
     }
 }
 
 impl<D: DomTypes> Drop for CallbackObject<D> {
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn drop(&mut self) {
         unsafe {
             if let Some(cx) = Runtime::get() {
@@ -128,7 +139,7 @@ pub trait CallbackContainer<D: DomTypes> {
     ///
     /// # Safety
     /// `callback` must point to a valid, non-null JSObject.
-    unsafe fn new(cx: JSContext, callback: *mut JSObject) -> Rc<Self>;
+    unsafe fn new(cx: &JSContext, callback: *mut JSObject) -> Rc<Self>;
     /// Returns the underlying `CallbackObject`.
     fn callback_holder(&self) -> &CallbackObject<D>;
     /// Returns the underlying `JSObject`.
@@ -145,7 +156,7 @@ pub trait CallbackContainer<D: DomTypes> {
 }
 
 /// A common base class for representing IDL callback function types.
-#[derive(JSTraceable, PartialEq)]
+#[derive(JSTraceable, MallocSizeOf, PartialEq)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 pub struct CallbackFunction<D: DomTypes> {
     object: CallbackObject<D>,
@@ -153,9 +164,8 @@ pub struct CallbackFunction<D: DomTypes> {
 
 impl<D: DomTypes> CallbackFunction<D> {
     /// Create a new `CallbackFunction` for this object.
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     // These are used by the bindings and do not need `default()` functions.
-    #[allow(clippy::new_without_default)]
+    #[expect(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
             object: CallbackObject::new(),
@@ -172,13 +182,13 @@ impl<D: DomTypes> CallbackFunction<D> {
     ///
     /// # Safety
     /// `callback` must point to a valid, non-null JSObject.
-    pub unsafe fn init(&mut self, cx: JSContext, callback: *mut JSObject) {
-        self.object.init(cx, callback);
+    pub unsafe fn init(&mut self, cx: &JSContext, callback: *mut JSObject) {
+        unsafe { self.object.init(cx, callback) };
     }
 }
 
 /// A common base class for representing IDL callback interface types.
-#[derive(JSTraceable, PartialEq)]
+#[derive(JSTraceable, MallocSizeOf, PartialEq)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 pub struct CallbackInterface<D: DomTypes> {
     object: CallbackObject<D>,
@@ -187,7 +197,7 @@ pub struct CallbackInterface<D: DomTypes> {
 impl<D: DomTypes> CallbackInterface<D> {
     /// Create a new CallbackInterface object for the given `JSObject`.
     // These are used by the bindings and do not need `default()` functions.
-    #[allow(clippy::new_without_default)]
+    #[expect(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
             object: CallbackObject::new(),
@@ -204,25 +214,24 @@ impl<D: DomTypes> CallbackInterface<D> {
     ///
     /// # Safety
     /// `callback` must point to a valid, non-null JSObject.
-    pub unsafe fn init(&mut self, cx: JSContext, callback: *mut JSObject) {
-        self.object.init(cx, callback);
+    pub unsafe fn init(&mut self, cx: &JSContext, callback: *mut JSObject) {
+        unsafe { self.object.init(cx, callback) };
     }
 
     /// Returns the property with the given `name`, if it is a callable object,
     /// or an error otherwise.
-    pub fn get_callable_property(&self, cx: JSContext, name: &str) -> Fallible<JSVal> {
-        rooted!(in(*cx) let mut callable = UndefinedValue());
-        rooted!(in(*cx) let obj = self.callback_holder().get());
+    pub fn get_callable_property(&self, cx: &mut JSContext, name: &CStr) -> Fallible<JSVal> {
+        rooted!(&in(cx) let mut callable = UndefinedValue());
+        rooted!(&in(cx) let obj = self.callback_holder().get());
         unsafe {
-            let c_name = CString::new(name).unwrap();
-            if !JS_GetProperty(*cx, obj.handle(), c_name.as_ptr(), callable.handle_mut()) {
+            if !JS_GetProperty(cx, obj.handle(), name.as_ptr(), callable.handle_mut()) {
                 return Err(Error::JSFailed);
             }
 
             if !callable.is_object() || !IsCallable(callable.to_object()) {
-                return Err(Error::Type(format!(
+                return Err(Error::Type(cformat!(
                     "The value of the {} property is not callable",
-                    name
+                    name.to_string_lossy()
                 )));
             }
         }
@@ -232,11 +241,11 @@ impl<D: DomTypes> CallbackInterface<D> {
 
 /// Wraps the reflector for `p` into the realm of `cx`.
 pub(crate) fn wrap_call_this_value<T: ThisReflector>(
-    cx: JSContext,
+    cx: &mut JSContext,
     p: &T,
     mut rval: MutableHandleValue,
 ) -> bool {
-    rooted!(in(*cx) let mut obj = p.jsobject());
+    rooted!(&in(cx) let mut obj = p.jsobject());
 
     if obj.is_null() {
         rval.set(NullValue());
@@ -244,7 +253,7 @@ pub(crate) fn wrap_call_this_value<T: ThisReflector>(
     }
 
     unsafe {
-        if !JS_WrapObject(*cx, obj.handle_mut()) {
+        if !JS_WrapObject(cx, obj.handle_mut()) {
             return false;
         }
     }
@@ -253,69 +262,45 @@ pub(crate) fn wrap_call_this_value<T: ThisReflector>(
     true
 }
 
-/// A class that performs whatever setup we need to safely make a call while
-/// this class is on the stack. After `new` returns, the call is safe to make.
-pub struct CallSetup<D: DomTypes> {
-    /// The global for reporting exceptions. This is the global object of the
-    /// (possibly wrapped) callback object.
-    exception_global: DomRoot<D::GlobalScope>,
-    /// The `JSContext` used for the call.
-    cx: JSContext,
-    /// The realm we were in before the call.
-    old_realm: *mut Realm,
-    /// The exception handling used for the call.
+/// A function wrapper that performs whatever setup we need to safely make a call.
+///
+/// <https://webidl.spec.whatwg.org/#es-invoking-callback-functions>
+pub(crate) fn call_setup<D: DomTypes, T: CallbackContainer<D>, R>(
+    cx: &mut JSContext,
+    callback: &T,
+    owner_window: Option<&D::Window>,
     handling: ExceptionHandling,
-    /// <https://heycam.github.io/webidl/#es-invoking-callback-functions>
-    /// steps 8 and 18.2.
-    entry_script: Option<GenericAutoEntryScript<D>>,
-    /// <https://heycam.github.io/webidl/#es-invoking-callback-functions>
-    /// steps 9 and 18.1.
-    incumbent_script: Option<GenericAutoIncumbentScript<D>>,
-}
-
-impl<D: DomTypes> CallSetup<D> {
-    /// Performs the setup needed to make a call.
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
-    pub fn new<T: CallbackContainer<D>>(callback: &T, handling: ExceptionHandling) -> Self {
-        let global = unsafe { D::GlobalScope::from_object(callback.callback()) };
-        if let Some(window) = global.downcast::<D::Window>() {
-            window.Document().ensure_safe_to_run_script_or_layout();
-        }
-        let cx = D::GlobalScope::get_cx();
-
-        let aes = GenericAutoEntryScript::<D>::new(&global);
-        let ais = callback.incumbent().map(GenericAutoIncumbentScript::new);
-        CallSetup {
-            exception_global: global,
-            cx,
-            old_realm: unsafe { EnterRealm(*cx, callback.callback()) },
-            handling,
-            entry_script: Some(aes),
-            incumbent_script: ais,
-        }
+    f: impl FnOnce(&mut JSContext) -> R,
+) -> R {
+    if let Some(window) = owner_window {
+        window.Document().ensure_safe_to_run_script_or_layout();
     }
 
-    /// Returns the `JSContext` used for the call.
-    pub fn get_context(&self) -> JSContext {
-        self.cx
-    }
-}
+    // The global for reporting exceptions. This is the global object of the
+    // (possibly wrapped) callback object.
+    let global = unsafe { D::GlobalScope::from_object(callback.callback()) };
+    let global = &global;
 
-impl<D: DomTypes> Drop for CallSetup<D> {
-    fn drop(&mut self) {
-        unsafe {
-            LeaveRealm(*self.cx, self.old_realm);
+    // Step 8: Prepare to run script with relevant settings.
+    run_a_script::<D, R, _>(cx, global, move |cx| {
+        let actual_callback = || {
+            let old_realm = unsafe { EnterRealm(cx, callback.callback()) };
+            let result = f(cx);
+            unsafe {
+                LeaveRealm(cx, old_realm);
+            }
+            if handling == ExceptionHandling::Report {
+                let mut realm = enter_auto_realm::<D>(cx, &**global);
+                let cx = &mut realm.current_realm();
+                <D as DomHelpers<D>>::report_pending_exception(cx);
+            }
+            result
+        };
+        if let Some(incumbent_global) = callback.incumbent() {
+            // Step 9: Prepare to run a callback with stored settings.
+            run_a_callback::<D, R>(incumbent_global, actual_callback)
+        } else {
+            actual_callback()
         }
-        if self.handling == ExceptionHandling::Report {
-            let ar = enter_realm::<D>(&*self.exception_global);
-            <D as DomHelpers<D>>::report_pending_exception(
-                self.cx,
-                true,
-                InRealm::Entered(&ar),
-                CanGc::note(),
-            );
-        }
-        drop(self.incumbent_script.take());
-        drop(self.entry_script.take().unwrap());
-    }
+    }) // Step 14.2: Clean up after running script with relevant settings.
 }

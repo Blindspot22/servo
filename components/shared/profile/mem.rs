@@ -12,11 +12,12 @@ use std::ffi::c_void;
 use std::marker::Send;
 
 use crossbeam_channel::Sender;
-use ipc_channel::ipc::{self, IpcSender};
-use ipc_channel::router::ROUTER;
+use ipc_channel::ipc::IpcSender;
 use log::warn;
 use malloc_size_of::MallocSizeOfOps;
+use malloc_size_of_derive::MallocSizeOf;
 use serde::{Deserialize, Serialize};
+use servo_base::generic_channel::{GenericCallback, GenericSender};
 
 /// A trait to abstract away the various kinds of message senders we use.
 pub trait OpaqueSender<T> {
@@ -49,10 +50,24 @@ where
     }
 }
 
+impl<T> OpaqueSender<T> for GenericSender<T>
+where
+    T: serde::Serialize,
+{
+    fn send(&self, message: T) {
+        if let Err(e) = GenericSender::send(self, message) {
+            warn!(
+                "Error communicating with the target thread from the profiler: {}",
+                e
+            );
+        }
+    }
+}
+
 /// Front-end representation of the profiler used to communicate with the
 /// profiler.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ProfilerChan(pub IpcSender<ProfilerMsg>);
+#[derive(Clone, Debug, Deserialize, Serialize, MallocSizeOf)]
+pub struct ProfilerChan(pub GenericSender<ProfilerMsg>);
 
 /// A handle that encompasses a registration with the memory profiler.
 /// The registration is tied to the lifetime of this type; the memory
@@ -93,18 +108,15 @@ impl ProfilerChan {
         C: OpaqueSender<T> + Send + 'static,
     {
         // Register the memory reporter.
-        let (reporter_sender, reporter_receiver) = ipc::channel().unwrap();
-        ROUTER.add_typed_route(
-            reporter_receiver,
-            Box::new(move |message| {
-                // Just injects an appropriate event into the paint thread's queue.
-                let request: ReporterRequest = message.unwrap();
-                channel_for_reporter.send(msg(request.reports_channel));
-            }),
-        );
+        let callback = GenericCallback::new(move |message| {
+            // Just injects an appropriate event into the paint thread's queue.
+            let request: ReporterRequest = message.unwrap();
+            channel_for_reporter.send(msg(request.reports_channel));
+        })
+        .expect("Could not create memory reporting callback");
         self.send(ProfilerMsg::RegisterReporter(
             reporter_name.clone(),
-            Reporter(reporter_sender),
+            Reporter(callback),
         ));
 
         ProfilerRegistration {
@@ -199,8 +211,8 @@ impl ProcessReports {
 }
 
 /// A channel through which memory reports can be sent.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ReportsChan(pub IpcSender<ProcessReports>);
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct ReportsChan(pub GenericSender<ProcessReports>);
 
 impl ReportsChan {
     /// Send `report` on this `IpcSender`.
@@ -226,7 +238,7 @@ pub struct ReporterRequest {
 /// registering the receiving end with the router so that messages from the memory profiler end up
 /// injected into the client's event loop.
 #[derive(Debug, Deserialize, Serialize)]
-pub struct Reporter(pub IpcSender<ReporterRequest>);
+pub struct Reporter(pub GenericCallback<ReporterRequest>);
 
 impl Reporter {
     /// Collect one or more memory reports. Returns true on success, and false on failure.
@@ -247,8 +259,20 @@ macro_rules! path {
 /// The results produced by the memory reporter.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct MemoryReportResult {
-    /// The stringified output.
-    pub content: String,
+    /// All the results from the MemoryReports
+    pub results: Vec<MemoryReport>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+/// A simple memory report
+pub struct MemoryReport {
+    /// The pid of the report
+    pub pid: u32,
+    /// Is this the main process
+    #[serde(rename = "isMainProcess")]
+    pub is_main_process: bool,
+    /// All the reports for this pid
+    pub reports: Vec<Report>,
 }
 
 /// Messages that can be sent to the memory profiler thread.
@@ -268,7 +292,7 @@ pub enum ProfilerMsg {
     Exit,
 
     /// Triggers sending back the memory profiling metrics,
-    Report(IpcSender<MemoryReportResult>),
+    Report(GenericCallback<MemoryReportResult>),
 }
 
 thread_local!(static SEEN_POINTERS: LazyCell<RefCell<HashSet<*const c_void>>> = const {
@@ -282,7 +306,7 @@ pub fn perform_memory_report<F: FnOnce(&mut MallocSizeOfOps)>(f: F) {
     let seen_pointer = move |ptr| SEEN_POINTERS.with(|pointers| !pointers.borrow_mut().insert(ptr));
     let mut ops = MallocSizeOfOps::new(
         servo_allocator::usable_size,
-        None,
+        servo_allocator::enclosing_size,
         Some(Box::new(seen_pointer)),
     );
     f(&mut ops);

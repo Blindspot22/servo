@@ -2,25 +2,36 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use euclid::{Point2D, RigidTransform3D};
+use profile_traits::generic_callback::GenericCallback as ProfileGenericCallback;
+use servo_base::generic_channel::GenericReceiver;
 use surfman::chains::SwapChains;
 use webxr_api::util::{self, ClipPlanes, HitTestList};
 use webxr_api::{
-    ApiSpace, BaseSpace, ContextId, DeviceAPI, DiscoveryAPI, Error, Event, EventBuffer, Floor,
-    Frame, FrameUpdateEvent, HitTestId, HitTestResult, HitTestSource, Input, InputFrame, InputId,
-    InputSource, LayerGrandManager, LayerId, LayerInit, LayerManager, MockButton, MockDeviceInit,
-    MockDeviceMsg, MockDiscoveryAPI, MockInputMsg, MockViewInit, MockViewsInit, MockWorld, Native,
-    Quitter, Ray, SelectEvent, SelectKind, Session, SessionBuilder, SessionInit, SessionMode,
-    Space, SubImages, View, Viewer, ViewerPose, Viewports, Views, WebXrReceiver, WebXrSender,
+    ApiSpace, BaseSpace, ContextId, DeviceAPI, DiscoveryAPI, EnvironmentBlendMode, Error, Event,
+    EventBuffer, Floor, Frame, FrameUpdateEvent, HitTestId, HitTestResult, HitTestSource, Input,
+    InputFrame, InputId, InputSource, LayerGrandManager, LayerId, LayerInit, LayerManager,
+    MockButton, MockDeviceInit, MockDeviceMsg, MockDiscoveryAPI, MockInputMsg, MockViewInit,
+    MockViewsInit, MockWorld, Native, Quitter, Ray, SelectEvent, SelectKind, Session,
+    SessionBuilder, SessionInit, SessionMode, Space, SubImages, View, Viewer, ViewerPose,
+    Viewports, Views,
 };
 
 use crate::{SurfmanGL, SurfmanLayerManager};
 
-#[derive(Default)]
-pub struct HeadlessMockDiscovery {}
+pub struct HeadlessMockDiscovery {
+    enabled: Arc<AtomicBool>,
+}
+
+impl HeadlessMockDiscovery {
+    pub fn new(enabled: Arc<AtomicBool>) -> Self {
+        Self { enabled }
+    }
+}
 
 struct HeadlessDiscovery {
     data: Arc<Mutex<HeadlessDeviceData>>,
@@ -74,8 +85,12 @@ impl MockDiscoveryAPI<SurfmanGL> for HeadlessMockDiscovery {
     fn simulate_device_connection(
         &mut self,
         init: MockDeviceInit,
-        receiver: WebXrReceiver<MockDeviceMsg>,
+        receiver: GenericReceiver<MockDeviceMsg>,
     ) -> Result<Box<dyn DiscoveryAPI<SurfmanGL>>, Error> {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return Err(Error::NoMatchingDevice);
+        }
+
         let viewer_origin = init.viewer_origin;
         let floor_transform = init.floor_origin.map(|f| f.inverse());
         let views = init.views.clone();
@@ -107,7 +122,7 @@ impl MockDiscoveryAPI<SurfmanGL> for HeadlessMockDiscovery {
     }
 }
 
-fn run_loop(receiver: WebXrReceiver<MockDeviceMsg>, data: Arc<Mutex<HeadlessDeviceData>>) {
+fn run_loop(receiver: GenericReceiver<MockDeviceMsg>, data: Arc<Mutex<HeadlessDeviceData>>) {
     while let Ok(msg) = receiver.recv() {
         if !data.lock().expect("Mutex poisoned").handle_msg(msg) {
             break;
@@ -201,9 +216,9 @@ impl HeadlessDevice {
         }
         let swap_chains = SwapChains::new();
         let viewports = self.viewports();
-        let layer_manager = self.grand_manager.create_layer_manager(move |_, _| {
-            Ok(SurfmanLayerManager::new(viewports, swap_chains))
-        })?;
+        let layer_manager = self
+            .grand_manager
+            .create_layer_manager(move |_| Ok(SurfmanLayerManager::new(viewports, swap_chains)))?;
         self.layer_manager = Some(layer_manager);
         Ok(self.layer_manager.as_mut().unwrap())
     }
@@ -283,7 +298,7 @@ impl DeviceAPI for HeadlessDevice {
         vec![]
     }
 
-    fn set_event_dest(&mut self, dest: WebXrSender<Event>) {
+    fn set_event_dest(&mut self, dest: ProfileGenericCallback<Event>) {
         self.with_per_session(|s| s.events.upgrade(dest))
     }
 
@@ -314,6 +329,21 @@ impl DeviceAPI for HeadlessDevice {
     fn reference_space_bounds(&self) -> Option<Vec<Point2D<f32, Floor>>> {
         let bounds = self.data.lock().unwrap().bounds_geometry.clone();
         Some(bounds)
+    }
+
+    fn environment_blend_mode(&self) -> EnvironmentBlendMode {
+        let data = self.data.lock().unwrap();
+        let session = data
+            .sessions
+            .iter()
+            .find(|s| s.id == self.id)
+            .expect("Failed to find session for this device");
+
+        if session.mode == SessionMode::ImmersiveAR {
+            EnvironmentBlendMode::AlphaBlend
+        } else {
+            EnvironmentBlendMode::Opaque
+        }
     }
 }
 

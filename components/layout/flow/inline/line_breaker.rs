@@ -4,7 +4,7 @@
 
 use std::ops::Range;
 
-use icu_segmenter::LineSegmenter;
+use icu_segmenter::{LineBreakOptions, LineSegmenter};
 
 pub(crate) struct LineBreaker {
     linebreaks: Vec<usize>,
@@ -12,8 +12,8 @@ pub(crate) struct LineBreaker {
 }
 
 impl LineBreaker {
-    pub(crate) fn new(string: &str) -> Self {
-        let line_segmenter = LineSegmenter::new_auto();
+    pub(crate) fn new(string: &str, options: LineBreakOptions) -> Self {
+        let line_segmenter = LineSegmenter::new_auto_with_options(options);
         Self {
             // From https://docs.rs/icu_segmenter/1.5.0/icu_segmenter/struct.LineSegmenter.html
             // > For consistency with the grapheme, word, and sentence segmenters, there is always a
@@ -54,67 +54,72 @@ impl LineBreaker {
     }
 }
 
-#[test]
-fn test_linebreaker_ranges() {
-    let linebreaker = LineBreaker::new("abc def");
-    assert_eq!(linebreaker.linebreaks, [4, 7]);
-    assert_eq!(
-        linebreaker.linebreaks_in_range_after_current_offset(0..5),
-        0..1
-    );
-    // The last linebreak should not be included for the text range we are interested in.
-    assert_eq!(
-        linebreaker.linebreaks_in_range_after_current_offset(0..7),
-        0..1
-    );
+#[cfg(test)]
+mod test {
+    use super::*;
 
-    let linebreaker = LineBreaker::new("abc d def");
-    assert_eq!(linebreaker.linebreaks, [4, 6, 9]);
-    assert_eq!(
-        linebreaker.linebreaks_in_range_after_current_offset(0..5),
-        0..1
-    );
-    assert_eq!(
-        linebreaker.linebreaks_in_range_after_current_offset(0..7),
-        0..2
-    );
-    assert_eq!(
-        linebreaker.linebreaks_in_range_after_current_offset(0..9),
-        0..2
-    );
+    #[test]
+    fn test_linebreaker_ranges() {
+        let linebreaker = LineBreaker::new("abc def", LineBreakOptions::default());
+        assert_eq!(linebreaker.linebreaks, [4, 7]);
+        assert_eq!(
+            linebreaker.linebreaks_in_range_after_current_offset(0..5),
+            0..1
+        );
+        // The last linebreak should not be included for the text range we are interested in.
+        assert_eq!(
+            linebreaker.linebreaks_in_range_after_current_offset(0..7),
+            0..1
+        );
 
-    assert_eq!(
-        linebreaker.linebreaks_in_range_after_current_offset(4..9),
-        0..2
-    );
+        let linebreaker = LineBreaker::new("abc d def", LineBreakOptions::default());
+        assert_eq!(linebreaker.linebreaks, [4, 6, 9]);
+        assert_eq!(
+            linebreaker.linebreaks_in_range_after_current_offset(0..5),
+            0..1
+        );
+        assert_eq!(
+            linebreaker.linebreaks_in_range_after_current_offset(0..7),
+            0..2
+        );
+        assert_eq!(
+            linebreaker.linebreaks_in_range_after_current_offset(0..9),
+            0..2
+        );
 
-    std::panic::catch_unwind(|| {
-        let linebreaker = LineBreaker::new("abc def");
-        linebreaker.linebreaks_in_range_after_current_offset(5..2);
-    })
-    .expect_err("Reversed range should cause an assertion failure.");
-}
+        assert_eq!(
+            linebreaker.linebreaks_in_range_after_current_offset(4..9),
+            0..2
+        );
 
-#[test]
-fn test_linebreaker_stateful_advance() {
-    let mut linebreaker = LineBreaker::new("abc d def");
-    assert_eq!(linebreaker.linebreaks, [4, 6, 9]);
-    assert!(linebreaker.advance_to_linebreaks_in_range(0..7) == &[4, 6]);
-    assert!(linebreaker.advance_to_linebreaks_in_range(8..9).is_empty());
+        std::panic::catch_unwind(|| {
+            let linebreaker = LineBreaker::new("abc def", LineBreakOptions::default());
+            linebreaker.linebreaks_in_range_after_current_offset(5..2);
+        })
+        .expect_err("Reversed range should cause an assertion failure.");
+    }
 
-    // We've already advanced, so a range from the beginning shouldn't affect things.
-    assert!(linebreaker.advance_to_linebreaks_in_range(0..9).is_empty());
+    #[test]
+    fn test_linebreaker_stateful_advance() {
+        let mut linebreaker = LineBreaker::new("abc d def", LineBreakOptions::default());
+        assert_eq!(linebreaker.linebreaks, [4, 6, 9]);
+        assert!(linebreaker.advance_to_linebreaks_in_range(0..7) == &[4, 6]);
+        assert!(linebreaker.advance_to_linebreaks_in_range(8..9).is_empty());
 
-    linebreaker.current_offset = 0;
+        // We've already advanced, so a range from the beginning shouldn't affect things.
+        assert!(linebreaker.advance_to_linebreaks_in_range(0..9).is_empty());
 
-    // Sending a value out of range shoudn't break things.
-    assert!(linebreaker.advance_to_linebreaks_in_range(0..999) == &[4, 6]);
+        linebreaker.current_offset = 0;
 
-    linebreaker.current_offset = 0;
+        // Sending a value out of range shouldn't break things.
+        assert!(linebreaker.advance_to_linebreaks_in_range(0..999) == &[4, 6]);
 
-    std::panic::catch_unwind(|| {
-        let mut linebreaker = LineBreaker::new("abc d def");
-        linebreaker.advance_to_linebreaks_in_range(2..0);
-    })
-    .expect_err("Reversed range should cause an assertion failure.");
+        linebreaker.current_offset = 0;
+
+        std::panic::catch_unwind(|| {
+            let mut linebreaker = LineBreaker::new("abc d def", LineBreakOptions::default());
+            linebreaker.advance_to_linebreaks_in_range(2..0);
+        })
+        .expect_err("Reversed range should cause an assertion failure.");
+    }
 }

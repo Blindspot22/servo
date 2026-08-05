@@ -26,10 +26,11 @@
 //! Use the serde attributes `deserialize_with` and `serialize_with`.
 //!
 //! ```
+//! #[derive(serde::Deserialize, serde::Serialize)]
 //! struct MyStruct {
-//! #[serde(deserialize_with = "hyper_serde::deserialize",
-//! serialize_with = "hyper_serde::serialize")]
-//! headers: HeaderMap,
+//!     #[serde(deserialize_with = "servo_hyper_serde::deserialize",
+//!             serialize_with = "servo_hyper_serde::serialize")]
+//!     headers: http::header::HeaderMap,
 //! }
 //! ```
 //!
@@ -38,15 +39,19 @@
 //! Use the `Ser` wrapper.
 //!
 //! ```
-//! serde_json::to_string(&Ser::new(&headers))
+//! use servo_hyper_serde::Ser;
+//! let headers = http::header::HeaderMap::new();
+//! serde_json::to_string(&Ser::new(&headers));
 //! ```
 //!
-//! # How do I decode a `Method` value with `serde_json::parse`?
+//! # How do I decode a `Method` value with `serde_json::from_str`?
 //!
 //! Use the `De` wrapper.
 //!
 //! ```
-//! serde_json::parse::<De<Method>>("\"PUT\"").map(De::into_inner)
+//! use servo_hyper_serde::De;
+//! use hyper::Method;
+//! serde_json::from_str::<De<Method>>("\"PUT\"").map(De::into_inner);
 //! ```
 //!
 //! # How do I send `Cookie` values as part of an IPC channel?
@@ -55,7 +60,9 @@
 //! convenience.
 //!
 //! ```
-//! ipc::channel::<Serde<Cookie>>()
+//! use servo_hyper_serde::Serde;
+//! use cookie::Cookie;
+//! ipc_channel::ipc::channel::<Serde<Cookie>>();
 //! ```
 //!
 //!
@@ -73,10 +80,10 @@ use http::HeaderMap;
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::{Method, StatusCode, Uri};
 use mime::Mime;
-use serde::de::{self, Error, MapAccess, SeqAccess, Visitor};
-use serde::ser::{SerializeMap, SerializeSeq};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_bytes::{ByteBuf, Bytes};
+use serde_core::de::{self, Error, MapAccess, SeqAccess, Visitor};
+use serde_core::ser::{SerializeMap, SerializeSeq};
+use serde_core::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Deserialises a `T` value with a given deserializer.
 ///
@@ -164,7 +171,7 @@ pub struct Ser<'a, T: 'a> {
 
 impl<'a, T> Ser<'a, T>
 where
-    Ser<'a, T>: serde::Serialize,
+    Ser<'a, T>: serde_core::Serialize,
 {
     /// Returns a new `Ser` wrapper.
     #[inline(always)]
@@ -431,6 +438,10 @@ impl Serialize for Ser<'_, HeaderMap> {
             {
                 let mut serializer = serializer.serialize_seq(Some(self.0.len()))?;
                 for v in self.0 {
+                    #[expect(
+                        clippy::collapsible_if,
+                        reason = "let chains are not available in 1.85"
+                    )]
                     if self.1 {
                         if let Ok(v) = str::from_utf8(v) {
                             serializer.serialize_element(v)?;

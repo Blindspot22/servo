@@ -10,7 +10,8 @@
  */
 
 // http://dev.w3.org/fxtf/geometry/Overview.html#dompointreadonly
-[Exposed=(Window,Worker,PaintWorklet)]
+[Exposed=(Window,Worker,PaintWorklet),
+ Serializable]
 interface DOMPointReadOnly {
     [Throws] constructor(optional unrestricted double x = 0, optional unrestricted double y = 0,
                 optional unrestricted double z = 0, optional unrestricted double w = 1);
@@ -20,6 +21,8 @@ interface DOMPointReadOnly {
     readonly attribute unrestricted double y;
     readonly attribute unrestricted double z;
     readonly attribute unrestricted double w;
+
+    [Throws, NewObject] DOMPoint matrixTransform(optional DOMMatrixInit matrix = {});
 
     [Default] object toJSON();
 };

@@ -7,12 +7,12 @@ T is f32 or vecN<f32>
 fn fwidthFine(e:T) ->T
 Returns abs(dpdxFine(e)) + abs(dpdyFine(e)).
 `;import { makeTestGroup } from '../../../../../../common/framework/test_group.js';
-import { GPUTest } from '../../../../../gpu_test.js';
+import { AllFeaturesMaxLimitsGPUTest } from '../../../../../gpu_test.js';
 
 import { d } from './fwidth.cache.js';
 import { runFWidthTest } from './fwidth.js';
 
-export const g = makeTestGroup(GPUTest);
+export const g = makeTestGroup(AllFeaturesMaxLimitsGPUTest);
 
 const builtin = 'fwidthFine';
 
@@ -24,6 +24,7 @@ combine('vectorize', [undefined, 2, 3, 4]).
 combine('non_uniform_discard', [false, true])
 ).
 fn(async (t) => {
+  t.skipIf(t.isCompatibility, `${builtin} not supported in compatibility mode`);
   const cases = await d.get('scalar');
   runFWidthTest(t, cases, builtin, t.params.non_uniform_discard, t.params.vectorize);
 });

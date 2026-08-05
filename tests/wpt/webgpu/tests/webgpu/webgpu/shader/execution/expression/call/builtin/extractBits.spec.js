@@ -32,13 +32,13 @@ Otherwise, bits 0..c-1 of the result are copied from bits o..o+c-1 of e.
 Other bits of the result are the same as bit c-1 of the result.
 Component-wise when T is a vector.
 `;import { makeTestGroup } from '../../../../../../common/framework/test_group.js';
-import { GPUTest } from '../../../../../gpu_test.js';
+import { AllFeaturesMaxLimitsGPUTest } from '../../../../../gpu_test.js';
 import { i32Bits, Type, u32, u32Bits, vec2, vec3, vec4 } from '../../../../../util/conversion.js';
 import { allInputSources, run } from '../../expression.js';
 
 import { builtin } from './builtin.js';
 
-export const g = makeTestGroup(GPUTest);
+export const g = makeTestGroup(AllFeaturesMaxLimitsGPUTest);
 
 g.test('u32').
 specURL('https://www.w3.org/TR/WGSL/#integer-builtin-functions').
@@ -178,6 +178,11 @@ fn(async (t) => {
           0b00000000000000000000000101010101,
           0b00000000000000000000000010101010
         )
+      },
+      // Difficult edge case involving a MAX_UINT 'count'.
+      {
+        input: [V(5), u32(1), u32(4294967295)],
+        expected: V(2)
       }]
 
     );
@@ -318,6 +323,11 @@ fn(async (t) => {
           0b00000000000000000000000101010101,
           0b00000000000000000000000010101010
         )
+      },
+      // Difficult edge case involving a MAX_UINT 'count'.
+      {
+        input: [V(5), u32(1), u32(4294967295)],
+        expected: V(2)
       }]
 
     );

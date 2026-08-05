@@ -3,13 +3,14 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
+use itertools::Itertools;
+use js::context::JSContext;
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
 
 use crate::dom::bindings::codegen::Bindings::DOMStringListBinding::DOMStringListMethods;
-use crate::dom::bindings::reflector::{Reflector, reflect_dom_object};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
-use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
+use crate::dom::globalscope::GlobalScope;
 
 #[dom_struct]
 pub(crate) struct DOMStringList {
@@ -18,7 +19,6 @@ pub(crate) struct DOMStringList {
 }
 
 impl DOMStringList {
-    #[allow(unused)]
     pub(crate) fn new_inherited(strings: Vec<DOMString>) -> DOMStringList {
         DOMStringList {
             reflector_: Reflector::new(),
@@ -26,33 +26,47 @@ impl DOMStringList {
         }
     }
 
-    #[allow(unused)]
     pub(crate) fn new(
-        window: &Window,
+        cx: &mut JSContext,
+        global: &GlobalScope,
         strings: Vec<DOMString>,
-        can_gc: CanGc,
     ) -> DomRoot<DOMStringList> {
-        reflect_dom_object(
-            Box::new(DOMStringList::new_inherited(strings)),
-            window,
-            can_gc,
-        )
+        reflect_dom_object_with_cx(Box::new(DOMStringList::new_inherited(strings)), global, cx)
+    }
+
+    /// <https://www.w3.org/TR/IndexedDB-3/#sorted-name-list>
+    pub(crate) fn new_sorted<'a>(
+        cx: &mut JSContext,
+        global: &GlobalScope,
+        strings: impl IntoIterator<Item = &'a DOMString>,
+    ) -> DomRoot<DOMStringList> {
+        let sorted = strings
+            .into_iter()
+            .map(|dom_string| dom_string.str().encode_utf16().collect::<Vec<u16>>())
+            .sorted_unstable()
+            .map(|utf16_str| {
+                String::from_utf16(utf16_str.as_slice())
+                    .expect("can't convert object store name from utf16 back to utf8")
+                    .into()
+            })
+            .collect();
+        Self::new(cx, global, sorted)
     }
 }
 
 // https://html.spec.whatwg.org/multipage/#domstringlist
 impl DOMStringListMethods<crate::DomTypeHolder> for DOMStringList {
-    // https://html.spec.whatwg.org/multipage/#dom-domstringlist-length
+    /// <https://html.spec.whatwg.org/multipage/#dom-domstringlist-length>
     fn Length(&self) -> u32 {
         self.strings.len() as u32
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-domstringlist-item
+    /// <https://html.spec.whatwg.org/multipage/#dom-domstringlist-item>
     fn Item(&self, index: u32) -> Option<DOMString> {
         self.strings.get(index as usize).cloned()
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-domstringlist-contains
+    /// <https://html.spec.whatwg.org/multipage/#dom-domstringlist-contains>
     fn Contains(&self, string: DOMString) -> bool {
         self.strings.contains(&string)
     }

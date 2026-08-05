@@ -4,10 +4,13 @@
 
 // https://html.spec.whatwg.org/multipage/#dedicatedworkerglobalscope
 [Global=(Worker,DedicatedWorker), Exposed=DedicatedWorker]
-/*sealed*/ interface DedicatedWorkerGlobalScope : WorkerGlobalScope {
+interface DedicatedWorkerGlobalScope : WorkerGlobalScope {
+  [Replaceable] readonly attribute DOMString name;
+
   [Throws] undefined postMessage(any message, sequence<object> transfer);
   [Throws] undefined postMessage(any message, optional StructuredSerializeOptions options = {});
   attribute EventHandler onmessage;
+  attribute EventHandler onmessageerror;
 
   undefined close();
 };

@@ -6,12 +6,10 @@ use std::future::Future;
 use std::pin::Pin;
 
 use headers::{ContentType, HeaderMapExt};
-use net::fetch::methods::{DoneChannel, FetchContext};
-use net::protocols::ProtocolHandler;
-use net_traits::ResourceFetchTiming;
-use net_traits::http_status::HttpStatus;
-use net_traits::request::Request;
-use net_traits::response::{Response, ResponseBody};
+use servo::protocol_handler::{
+    DoneChannel, FetchContext, HttpStatus, ProtocolHandler, Request, ResourceFetchTiming, Response,
+    ResponseBody,
+};
 
 #[derive(Default)]
 pub struct UrlInfoProtocolHander {}
@@ -36,7 +34,7 @@ impl ProtocolHandler for UrlInfoProtocolHander {
             url.query()
         );
         let mut response = Response::new(url, ResourceFetchTiming::new(request.timing_type()));
-        *response.body.lock().unwrap() = ResponseBody::Done(content.as_bytes().to_vec());
+        *response.body.lock() = ResponseBody::Done(content.as_bytes().to_vec());
         response.headers.typed_insert(ContentType::text());
         response.status = HttpStatus::default();
 

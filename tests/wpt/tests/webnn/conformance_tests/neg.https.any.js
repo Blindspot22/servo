@@ -604,14 +604,36 @@ const negTests = [
         }
       }
     }
+  },
+
+  // int64 tests
+  {
+    'name': 'neg int64 4D tensor',
+    'graph': {
+      'inputs': {
+        'negInput': {
+          'data': [
+            // int64 range: [/* -(2**63) */ –9223372036854775808,
+            //               /* 2**63 - 1 */ 92233720368547758087]
+            BigInt(-(2**63)) + 1n, -100n, 0n, 100n, BigInt(2**63) - 1n
+          ],
+          'descriptor': {shape: [1, 1, 1, 5], dataType: 'int64'}
+        }
+      },
+      'operators': [{
+        'name': 'neg',
+        'arguments': [{'input': 'negInput'}],
+        'outputs': 'negOutput'
+      }],
+      'expectedOutputs': {
+        'negOutput': {
+          'data': [BigInt(2**63) - 1n, 100n, 0, -100n, BigInt(-(2**63)) + 1n],
+          'descriptor': {shape: [1, 1, 1, 5], dataType: 'int64'}
+        }
+      }
+    }
   }
 ];
 
-if (navigator.ml) {
-  negTests.forEach((test) => {
-    webnn_conformance_test(
-        buildAndExecuteGraph, getNegPrecisionTolerance, test);
-  });
-} else {
-  test(() => assert_implements(navigator.ml, 'missing navigator.ml'));
-}
+webnn_conformance_test(
+    negTests, buildAndExecuteGraph, getNegPrecisionTolerance, test);

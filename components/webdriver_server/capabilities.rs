@@ -6,28 +6,28 @@ use serde_json::{Map, Value};
 use webdriver::capabilities::{BrowserCapabilities, Capabilities};
 use webdriver::error::{ErrorStatus, WebDriverError, WebDriverResult};
 
-pub struct ServoCapabilities {
-    pub browser_name: String,
-    pub browser_version: String,
-    pub platform_name: Option<String>,
-    pub accept_insecure_certs: bool,
-    pub set_window_rect: bool,
-    pub strict_file_interactability: bool,
-    pub accept_proxy: bool,
-    pub accept_custom: bool,
+pub(crate) struct ServoCapabilities {
+    pub(crate) browser_name: String,
+    pub(crate) browser_version: String,
+    pub(crate) platform_name: Option<String>,
+    pub(crate) set_window_rect: bool,
+    accept_insecure_certs: bool,
+    strict_file_interactability: bool,
+    accept_proxy: bool,
+    accept_custom: bool,
 }
 
 impl ServoCapabilities {
-    pub fn new() -> ServoCapabilities {
+    pub(crate) fn new() -> ServoCapabilities {
         ServoCapabilities {
             browser_name: "servo".to_string(),
             browser_version: "0.0.1".to_string(),
             platform_name: get_platform_name(),
-            accept_insecure_certs: false,
             set_window_rect: true,
+            accept_insecure_certs: false,
             strict_file_interactability: false,
             accept_proxy: false,
-            accept_custom: false,
+            accept_custom: true,
         }
     }
 }
@@ -59,7 +59,13 @@ impl BrowserCapabilities for ServoCapabilities {
         Ok(self.set_window_rect)
     }
 
-    fn strict_file_interactability(&mut self, _: &Capabilities) -> WebDriverResult<bool> {
+    fn strict_file_interactability(&mut self, value: &Capabilities) -> WebDriverResult<bool> {
+        if let Some(Value::Bool(strict_file_interactability)) =
+            value.get("strictFileInteractability")
+        {
+            self.strict_file_interactability = *strict_file_interactability;
+        }
+
         Ok(self.strict_file_interactability)
     }
 
@@ -118,6 +124,7 @@ impl BrowserCapabilities for ServoCapabilities {
     }
 }
 
+/// <https://w3c.github.io/webdriver/#dfn-platform-name>
 fn get_platform_name() -> Option<String> {
     if cfg!(target_os = "windows") {
         Some("windows".to_string())

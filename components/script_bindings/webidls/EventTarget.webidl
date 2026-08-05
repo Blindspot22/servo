@@ -5,7 +5,7 @@
  * https://dom.spec.whatwg.org/#interface-eventtarget
  */
 
-[Exposed=(Window,Worker,Worklet,DissimilarOriginWindow)]
+[Exposed=(Window,Worker,Worklet,DissimilarOriginWindow,DebuggerGlobalScope)]
 interface EventTarget {
   [Throws] constructor();
   undefined addEventListener(
@@ -24,11 +24,14 @@ interface EventTarget {
   boolean dispatchEvent(Event event);
 };
 
+// https://dom.spec.whatwg.org/#dictdef-eventlisteneroptions
 dictionary EventListenerOptions {
   boolean capture = false;
 };
 
+// https://dom.spec.whatwg.org/#dictdef-addeventlisteneroptions
 dictionary AddEventListenerOptions : EventListenerOptions {
   boolean passive;
   boolean once = false;
+  AbortSignal signal;
 };

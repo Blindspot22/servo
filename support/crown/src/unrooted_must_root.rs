@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use rustc_hir::{self as hir, intravisit as visit, ExprKind};
+use rustc_hir::{self as hir, intravisit as visit, AmbigArg, ExprKind};
 use rustc_lint::{LateContext, LateLintPass, Lint, LintContext, LintPass, LintStore};
 use rustc_middle::ty;
 use rustc_session::declare_tool_lint;
@@ -32,7 +32,7 @@ pub fn register(lint_store: &mut LintStore) {
 /// "Incorrect" usage includes:
 ///
 ///  - Not being used in a struct/enum field which is not `#[crown::unrooted_must_root_lint::must_root]` itself
-///  - Not being used as an argument to a function (Except onces named `new` and `new_inherited`)
+///  - Being used as a function argument.
 ///  - Not being bound locally in a `let` statement, assignment, `for` loop, or `match` statement.
 ///
 /// This helps catch most situations where pointers like `JS<T>` are used in a way that they can be invalidated by a
@@ -61,7 +61,7 @@ fn associated_type_has_attr<'tcx>(
 ) -> bool {
     let mut walker = ty.walk();
     while let Some(generic_arg) = walker.next() {
-        let t = match generic_arg.unpack() {
+        let t = match generic_arg.kind() {
             rustc_middle::ty::GenericArgKind::Type(t) => t,
             _ => {
                 walker.skip_current_subtree();
@@ -76,7 +76,7 @@ fn associated_type_has_attr<'tcx>(
                 );
             },
             ty::Alias(
-                ty::AliasTyKind::Projection | ty::AliasTyKind::Inherent | ty::AliasTyKind::Weak,
+                ty::AliasTyKind::Projection | ty::AliasTyKind::Inherent | ty::AliasTyKind::Free,
                 ty,
             ) => {
                 return cx.tcx.has_attrs_with_path(
@@ -100,7 +100,7 @@ fn is_unrooted_ty<'tcx>(
     let mut ret = false;
     let mut walker = ty.walk();
     while let Some(generic_arg) = walker.next() {
-        let t = match generic_arg.unpack() {
+        let t = match generic_arg.kind() {
             rustc_middle::ty::GenericArgKind::Type(t) => t,
             _ => {
                 walker.skip_current_subtree();
@@ -126,7 +126,7 @@ fn is_unrooted_ty<'tcx>(
                         ty::Alias(
                             ty::AliasTyKind::Projection |
                             ty::AliasTyKind::Inherent |
-                            ty::AliasTyKind::Weak,
+                            ty::AliasTyKind::Free,
                             ty,
                         ) => !has_attr(ty.def_id, sym.allow_unrooted_in_rc),
                         _ => true,
@@ -139,8 +139,6 @@ fn is_unrooted_ty<'tcx>(
                         did.did(),
                         &[sym::core, sym::slice, sym::iter, sym.IterMut],
                     ) ||
-                    match_def_path(cx, did.did(), &[sym.accountable_refcell, sym.Ref]) ||
-                    match_def_path(cx, did.did(), &[sym.accountable_refcell, sym.RefMut]) ||
                     match_def_path(
                         cx,
                         did.did(),
@@ -176,6 +174,11 @@ fn is_unrooted_ty<'tcx>(
                     match_def_path(
                         cx,
                         did.did(),
+                        &[sym::std, sym.collections, sym.hash, sym.map, sym.Values],
+                    ) ||
+                    match_def_path(
+                        cx,
+                        did.did(),
                         &[sym::std, sym.collections, sym.hash, sym.set, sym.Iter],
                     )
                 {
@@ -194,7 +197,7 @@ fn is_unrooted_ty<'tcx>(
             ty::Alias(
                 kind @ ty::AliasTyKind::Projection |
                 kind @ ty::AliasTyKind::Inherent |
-                kind @ ty::AliasTyKind::Weak,
+                kind @ ty::AliasTyKind::Free,
                 ty,
             ) => {
                 if has_attr(ty.def_id, sym.must_root) {
@@ -242,8 +245,8 @@ impl<'tcx> LateLintPass<'tcx> for UnrootedPass {
         if has_attr(sym.must_root) || has_attr(sym.allow_unrooted_interior) {
             return;
         }
-        if let hir::ItemKind::Struct(def, ..) = &item.kind {
-            for field in def.fields() {
+        if let hir::ItemKind::Struct(_, _, variant_data) = &item.kind {
+            for field in variant_data.fields() {
                 let field_type = cx.tcx.type_of(field.def_id);
                 if is_unrooted_ty(&self.symbols, cx, field_type.skip_binder(), false) {
                     cx.lint(UNROOTED_MUST_ROOT, |lint| {
@@ -261,14 +264,14 @@ impl<'tcx> LateLintPass<'tcx> for UnrootedPass {
     /// All enums containing #[crown::unrooted_must_root_lint::must_root] types
     /// must be #[crown::unrooted_must_root_lint::must_root] themselves
     fn check_variant(&mut self, cx: &LateContext, var: &hir::Variant) {
-        let map = &cx.tcx.hir();
-        let parent_item = map.expect_item(map.get_parent_item(var.hir_id).def_id);
+        let parent = cx.tcx.hir_get_parent_item(var.hir_id).def_id;
+        let parent_item = cx.tcx.hir_expect_item(parent);
         let sym = &self.symbols;
         if !cx.tcx.has_attrs_with_path(
             parent_item.hir_id().expect_owner(),
             &[sym.crown, sym.unrooted_must_root_lint, sym.must_root],
         ) {
-            #[allow(clippy::single_match)]
+            #[expect(clippy::single_match)]
             match var.data {
                 hir::VariantData::Tuple(fields, ..) => {
                     for field in fields {
@@ -315,7 +318,7 @@ impl<'tcx> LateLintPass<'tcx> for UnrootedPass {
 
         let trait_id = cx
             .tcx
-            .trait_of_item(trait_item.hir_id().expect_owner().to_def_id())
+            .trait_of_assoc(trait_item.hir_id().expect_owner().to_def_id())
             .unwrap();
         // we need to make sure that each impl has same crown attrs
         let impls = cx.tcx.trait_impls_of(trait_id);
@@ -323,8 +326,8 @@ impl<'tcx> LateLintPass<'tcx> for UnrootedPass {
             for impl_def_id in impl_def_ids {
                 let type_impl = cx
                     .tcx
-                    .associated_items(impl_def_id)
-                    .find_by_name_and_kind(cx.tcx, trait_item.ident, ty::AssocKind::Type, trait_id)
+                    .associated_items(*impl_def_id)
+                    .find_by_ident_and_kind(cx.tcx, trait_item.ident, ty::AssocTag::Type, trait_id)
                     .unwrap();
 
                 let mir_ty = cx.tcx.type_of(type_impl.def_id).skip_binder();
@@ -399,10 +402,10 @@ impl<'tcx> LateLintPass<'tcx> for UnrootedPass {
                     n.as_str() == "default" ||
                     n.as_str() == "Wrap"
             },
-            visit::FnKind::Closure => return,
+            visit::FnKind::Closure => false,
         };
 
-        if !in_derive_expn(span) {
+        if !in_derive_expn(span) && !matches!(kind, visit::FnKind::Closure) {
             let sig = cx.tcx.type_of(def_id).skip_binder().fn_sig(cx.tcx);
 
             for (arg, ty) in decl.inputs.iter().zip(sig.inputs().skip_binder().iter()) {
@@ -412,15 +415,6 @@ impl<'tcx> LateLintPass<'tcx> for UnrootedPass {
                         lint.span(arg.span);
                     })
                 }
-            }
-
-            if !in_new_function &&
-                is_unrooted_ty(&self.symbols, cx, sig.output().skip_binder(), false)
-            {
-                cx.lint(UNROOTED_MUST_ROOT, |lint| {
-                    lint.primary_message("Type must be rooted.");
-                    lint.span(decl.output.span());
-                })
             }
         }
 
@@ -440,7 +434,14 @@ struct FnDefVisitor<'a, 'tcx: 'a> {
 }
 
 impl<'a, 'tcx> visit::Visitor<'tcx> for FnDefVisitor<'a, 'tcx> {
-    type Map = rustc_middle::hir::map::Map<'tcx>;
+    // TODO: https://github.com/servo/servo/issues/37330
+    /*
+    type NestedFilter = rustc_middle::hir::nested_filter::OnlyBodies;
+
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.cx.tcx
+    }
+    */
 
     fn visit_expr(&mut self, expr: &'tcx hir::Expr) {
         let cx = self.cx;
@@ -504,11 +505,7 @@ impl<'a, 'tcx> visit::Visitor<'tcx> for FnDefVisitor<'a, 'tcx> {
         visit::walk_pat(self, pat);
     }
 
-    fn visit_ty(&mut self, _: &'tcx hir::Ty) {}
-
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.cx.tcx.hir()
-    }
+    fn visit_ty(&mut self, _: &'tcx rustc_hir::Ty<'tcx, AmbigArg>) {}
 }
 
 symbols! {
@@ -521,11 +518,11 @@ symbols! {
     rc
     Rc
     cell
-    accountable_refcell
     Ref
     RefMut
     Iter
     IterMut
+    Values
     collections
     hash
     map

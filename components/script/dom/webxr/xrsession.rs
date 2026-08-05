@@ -8,20 +8,25 @@ use std::f64::consts::{FRAC_PI_2, PI};
 use std::rc::Rc;
 use std::{mem, ptr};
 
-use base::cross_process_instant::CrossProcessInstant;
+use script_bindings::reflector::reflect_weak_referenceable_dom_object;
+use servo_base::cross_process_instant::CrossProcessInstant;
 use dom_struct::dom_struct;
+use js::context::JSContext;
+use js::realm::CurrentRealm;
 use euclid::{RigidTransform3D, Transform3D, Vector3D};
 use ipc_channel::ipc::IpcReceiver;
 use ipc_channel::router::ROUTER;
 use js::jsapi::JSObject;
 use js::rust::MutableHandleValue;
-use js::typedarray::Float32Array;
-use profile_traits::ipc;
+use js::typedarray::HeapFloat32Array;
+use profile_traits::generic_callback::GenericCallback as ProfileGenericCallback;
+use rustc_hash::FxBuildHasher;
+use script_bindings::trace::RootedTraceableBox;
 use stylo_atoms::Atom;
 use webxr_api::{
-    self, util, ApiSpace, ContextId as WebXRContextId, Display, EntityTypes, EnvironmentBlendMode,
+    self, ApiSpace, ContextId as WebXRContextId, Display, EntityTypes, EnvironmentBlendMode,
     Event as XREvent, Frame, FrameUpdateEvent, HitTestId, HitTestSource, InputFrame, InputId, Ray,
-    SelectEvent, SelectKind, Session, SessionId, View, Viewer, Visibility,
+    SelectEvent, SelectKind, Session, SessionId, View, Viewer, Visibility, util,
 };
 
 use crate::conversions::Convert;
@@ -29,7 +34,7 @@ use crate::canvas_context::CanvasContext;
 use crate::dom::bindings::trace::HashMapTracedValues;
 use crate::dom::bindings::buffer_source::create_buffer_source;
 use crate::dom::bindings::callback::ExceptionHandling;
-use crate::dom::bindings::cell::DomRefCell;
+use script_bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::NavigatorBinding::Navigator_Binding::NavigatorMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::Window_Binding::WindowMethods;
 use crate::dom::bindings::codegen::Bindings::XRHitTestSourceBinding::{
@@ -49,7 +54,7 @@ use crate::dom::bindings::error::{Error, ErrorResult};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::refcounted::Trusted;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomGlobal};
+use crate::dom::bindings::reflector::{DomGlobal};
 use crate::dom::bindings::root::{Dom, DomRoot, MutDom, MutNullableDom};
 use crate::dom::bindings::utils::to_frozen_array;
 use crate::dom::event::Event;
@@ -67,9 +72,6 @@ use crate::dom::xrrenderstate::XRRenderState;
 use crate::dom::xrrigidtransform::XRRigidTransform;
 use crate::dom::xrsessionevent::XRSessionEvent;
 use crate::dom::xrspace::XRSpace;
-use crate::realms::InRealm;
-use crate::script_runtime::JSContext;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct XRSession {
@@ -78,7 +80,6 @@ pub(crate) struct XRSession {
     mode: XRSessionMode,
     visibility_state: Cell<XRVisibilityState>,
     viewer_space: MutNullableDom<XRSpace>,
-    #[ignore_malloc_size_of = "defined in webxr"]
     #[no_trace]
     session: DomRefCell<Session>,
     frame_requested: Cell<bool>,
@@ -95,23 +96,22 @@ pub(crate) struct XRSession {
     current_raf_callback_list: DomRefCell<Vec<(i32, Option<Rc<XRFrameRequestCallback>>)>>,
     input_sources: Dom<XRInputSourceArray>,
     // Any promises from calling end()
-    #[ignore_malloc_size_of = "promises are hard"]
+    #[conditional_malloc_size_of]
     end_promises: DomRefCell<Vec<Rc<Promise>>>,
     /// <https://immersive-web.github.io/webxr/#ended>
     ended: Cell<bool>,
-    #[ignore_malloc_size_of = "defined in webxr"]
     #[no_trace]
     next_hit_test_id: Cell<HitTestId>,
-    #[ignore_malloc_size_of = "defined in webxr"]
-    pending_hit_test_promises: DomRefCell<HashMapTracedValues<HitTestId, Rc<Promise>>>,
+    #[ignore_malloc_size_of = "Promise"]
+    pending_hit_test_promises:
+        DomRefCell<HashMapTracedValues<HitTestId, Rc<Promise>, FxBuildHasher>>,
     /// Opaque framebuffers need to know the session is "outside of a requestAnimationFrame"
     /// <https://immersive-web.github.io/webxr/#opaque-framebuffer>
     outside_raf: Cell<bool>,
-    #[ignore_malloc_size_of = "defined in webxr"]
     #[no_trace]
     input_frames: DomRefCell<HashMap<InputId, InputFrame>>,
     framerate: Cell<f32>,
-    #[ignore_malloc_size_of = "promises are hard"]
+    #[conditional_malloc_size_of]
     update_framerate_promise: DomRefCell<Option<Rc<Promise>>>,
     reference_spaces: DomRefCell<Vec<Dom<XRReferenceSpace>>>,
 }
@@ -142,7 +142,7 @@ impl XRSession {
             end_promises: DomRefCell::new(vec![]),
             ended: Cell::new(false),
             next_hit_test_id: Cell::new(HitTestId(0)),
-            pending_hit_test_promises: DomRefCell::new(HashMapTracedValues::new()),
+            pending_hit_test_promises: DomRefCell::new(HashMapTracedValues::new_fx()),
             outside_raf: Cell::new(true),
             input_frames: DomRefCell::new(HashMap::new()),
             framerate: Cell::new(0.0),
@@ -152,28 +152,28 @@ impl XRSession {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         window: &Window,
         session: Session,
         mode: XRSessionMode,
         frame_receiver: IpcReceiver<Frame>,
-        can_gc: CanGc,
     ) -> DomRoot<XRSession> {
         let ivfov = if mode == XRSessionMode::Inline {
             Some(FRAC_PI_2)
         } else {
             None
         };
-        let render_state = XRRenderState::new(window, 0.1, 1000.0, ivfov, None, Vec::new(), can_gc);
-        let input_sources = XRInputSourceArray::new(window, can_gc);
-        let ret = reflect_dom_object(
-            Box::new(XRSession::new_inherited(
+        let render_state = XRRenderState::new(cx, window, 0.1, 1000.0, ivfov, None, Vec::new());
+        let input_sources = XRInputSourceArray::new(cx, window);
+        let ret = reflect_weak_referenceable_dom_object(
+            cx,
+            Rc::new(XRSession::new_inherited(
                 session,
                 &render_state,
                 &input_sources,
                 mode,
             )),
             window,
-            can_gc,
         );
         ret.attach_event_handler();
         ret.setup_raf_loop(frame_receiver);
@@ -213,8 +213,8 @@ impl XRSession {
                 let frame: Frame = message.unwrap();
                 let time = CrossProcessInstant::now();
                 let this = this.clone();
-                task_source.queue(task!(xr_raf_callback: move || {
-                    this.root().raf_callback(frame, time, CanGc::note());
+                task_source.queue(task!(xr_raf_callback: move |cx| {
+                    this.root().raf_callback(cx, frame, time);
                 }));
             }),
         );
@@ -233,20 +233,17 @@ impl XRSession {
             .task_manager()
             .dom_manipulation_task_source()
             .to_sendable();
-        let (sender, receiver) = ipc::channel(global.time_profiler_chan().clone()).unwrap();
-
-        ROUTER.add_typed_route(
-            receiver.to_ipc_receiver(),
-            Box::new(move |message| {
+        let callback =
+            ProfileGenericCallback::new(global.time_profiler_chan().clone(), move |message| {
                 let this = this.clone();
-                task_source.queue(task!(xr_event_callback: move || {
-                    this.root().event_callback(message.unwrap(), CanGc::note());
-                }));
-            }),
-        );
+                task_source.queue(task!(xr_event_callback: move |cx| {
+                    this.root().event_callback(cx, message.unwrap());
+                }))
+            })
+            .expect("Could not create callback");
 
         // request animation frame
-        self.session.borrow_mut().set_event_dest(sender);
+        self.session.borrow_mut().set_event_dest(callback);
     }
 
     // Must be called after the promise for session creation is resolved
@@ -268,36 +265,41 @@ impl XRSession {
         self.global()
             .task_manager()
             .dom_manipulation_task_source()
-            .queue(task!(session_initial_inputs: move || {
+            .queue(task!(session_initial_inputs: move |cx| {
                 let this = this.root();
-                this.input_sources.add_input_sources(&this, &initial_inputs, CanGc::note());
+                this.input_sources.add_input_sources(cx, &this, &initial_inputs);
             }));
     }
 
-    fn event_callback(&self, event: XREvent, can_gc: CanGc) {
+    fn event_callback(&self, cx: &mut JSContext, event: XREvent) {
         match event {
             XREvent::SessionEnd => {
                 // https://immersive-web.github.io/webxr/#shut-down-the-session
                 // Step 2
                 self.ended.set(true);
                 // Step 3-4
-                self.global().as_window().Navigator().Xr().end_session(self);
+                self.global()
+                    .as_window()
+                    .Navigator(cx)
+                    .Xr(cx)
+                    .end_session(self);
                 // Step 5: We currently do not have any such promises
                 // Step 6 is happening n the XR session
                 // https://immersive-web.github.io/webxr/#dom-xrsession-end step 3
-                for promise in self.end_promises.borrow_mut().drain(..) {
-                    promise.resolve_native(&(), can_gc);
+                for promise in self.end_promises.borrow().iter() {
+                    promise.resolve_native(cx, &());
                 }
+                self.end_promises.safe_borrow_mut(cx.no_gc()).clear();
                 // Step 7
                 let event = XRSessionEvent::new(
+                    cx,
                     self.global().as_window(),
                     atom!("end"),
                     false,
                     false,
                     self,
-                    can_gc,
                 );
-                event.upcast::<Event>().fire(self.upcast(), can_gc);
+                event.upcast::<Event>().fire(cx, self.upcast());
             },
             XREvent::Select(input, kind, ty, frame) => {
                 use stylo_atoms::Atom;
@@ -309,42 +311,42 @@ impl XRSession {
                 let source = self.input_sources.find(input);
                 let atom_index = if kind == SelectKind::Squeeze { 1 } else { 0 };
                 if let Some(source) = source {
-                    let frame = XRFrame::new(self.global().as_window(), self, frame, can_gc);
+                    let frame = XRFrame::new(cx, self.global().as_window(), self, frame);
                     frame.set_active(true);
                     if ty == SelectEvent::Start {
                         let event = XRInputSourceEvent::new(
+                            cx,
                             self.global().as_window(),
                             START_ATOMS[atom_index].clone(),
                             false,
                             false,
                             &frame,
                             &source,
-                            can_gc,
                         );
-                        event.upcast::<Event>().fire(self.upcast(), can_gc);
+                        event.upcast::<Event>().fire(cx, self.upcast());
                     } else {
                         if ty == SelectEvent::Select {
                             let event = XRInputSourceEvent::new(
+                                cx,
                                 self.global().as_window(),
                                 EVENT_ATOMS[atom_index].clone(),
                                 false,
                                 false,
                                 &frame,
                                 &source,
-                                can_gc,
                             );
-                            event.upcast::<Event>().fire(self.upcast(), can_gc);
+                            event.upcast::<Event>().fire(cx, self.upcast());
                         }
                         let event = XRInputSourceEvent::new(
+                            cx,
                             self.global().as_window(),
                             END_ATOMS[atom_index].clone(),
                             false,
                             false,
                             &frame,
                             &source,
-                            can_gc,
                         );
-                        event.upcast::<Event>().fire(self.upcast(), can_gc);
+                        event.upcast::<Event>().fire(cx, self.upcast());
                     }
                     frame.set_active(false);
                 }
@@ -357,27 +359,27 @@ impl XRSession {
                 };
                 self.visibility_state.set(v);
                 let event = XRSessionEvent::new(
+                    cx,
                     self.global().as_window(),
                     atom!("visibilitychange"),
                     false,
                     false,
                     self,
-                    can_gc,
                 );
-                event.upcast::<Event>().fire(self.upcast(), can_gc);
+                event.upcast::<Event>().fire(cx, self.upcast());
                 // The page may be visible again, dirty the layers
                 // This also wakes up the event loop if necessary
                 self.dirty_layers();
             },
             XREvent::AddInput(info) => {
-                self.input_sources.add_input_sources(self, &[info], can_gc);
+                self.input_sources.add_input_sources(cx, self, &[info]);
             },
             XREvent::RemoveInput(id) => {
-                self.input_sources.remove_input_source(self, id, can_gc);
+                self.input_sources.remove_input_source(cx, self, id);
             },
             XREvent::UpdateInput(id, source) => {
                 self.input_sources
-                    .add_remove_input_source(self, id, source, can_gc);
+                    .add_remove_input_source(cx, self, id, source);
             },
             XREvent::InputChanged(id, frame) => {
                 self.input_frames.borrow_mut().insert(id, frame);
@@ -400,24 +402,24 @@ impl XRSession {
                     })
                     .for_each(|space| {
                         let offset =
-                            XRRigidTransform::new(self.global().as_window(), transform, can_gc);
+                            XRRigidTransform::new(cx, self.global().as_window(), transform);
                         let event = XRReferenceSpaceEvent::new(
+                            cx,
                             self.global().as_window(),
                             atom!("reset"),
                             false,
                             false,
                             space,
                             Some(&*offset),
-                            can_gc,
                         );
-                        event.upcast::<Event>().fire(space.upcast(), can_gc);
+                        event.upcast::<Event>().fire(cx, space.upcast());
                     });
             },
         }
     }
 
     /// <https://immersive-web.github.io/webxr/#xr-animation-frame>
-    fn raf_callback(&self, mut frame: Frame, time: CrossProcessInstant, can_gc: CanGc) {
+    fn raf_callback(&self, cx: &mut JSContext, mut frame: Frame, time: CrossProcessInstant) {
         debug!("WebXR RAF callback {:?}", frame);
 
         // Step 1-2 happen in the xebxr device thread
@@ -437,7 +439,7 @@ impl XRSession {
 
         // TODO: how does this fit the webxr spec?
         for event in frame.events.drain(..) {
-            self.handle_frame_event(event, can_gc);
+            self.handle_frame_event(cx, event);
         }
 
         // Step 4
@@ -468,8 +470,11 @@ impl XRSession {
             mem::swap(&mut *self.raf_callback_list.borrow_mut(), &mut current);
         }
 
-        let time = self.global().performance().to_dom_high_res_time_stamp(time);
-        let frame = XRFrame::new(self.global().as_window(), self, frame, CanGc::note());
+        let time = self
+            .global()
+            .performance(cx)
+            .to_dom_high_res_time_stamp(time);
+        let frame = XRFrame::new(cx, self.global().as_window(), self, frame);
 
         // Step 8-9
         frame.set_active(true);
@@ -479,7 +484,7 @@ impl XRSession {
         self.apply_frame_updates(&frame);
 
         // TODO: how does this fit with the webxr and xr layers specs?
-        self.layers_begin_frame(&frame);
+        self.layers_begin_frame(cx, &frame);
 
         // Step 11-12
         self.outside_raf.set(false);
@@ -487,7 +492,7 @@ impl XRSession {
         for i in 0..len {
             let callback = self.current_raf_callback_list.borrow()[i].1.clone();
             if let Some(callback) = callback {
-                let _ = callback.Call__(time, &frame, ExceptionHandling::Report, can_gc);
+                let _ = callback.Call__(cx, time, &frame, ExceptionHandling::Report);
             }
         }
         self.outside_raf.set(true);
@@ -548,13 +553,13 @@ impl XRSession {
     }
 
     // TODO: how does this align with the layers spec?
-    fn layers_begin_frame(&self, frame: &XRFrame) {
+    fn layers_begin_frame(&self, cx: &mut JSContext, frame: &XRFrame) {
         if let Some(layer) = self.active_render_state.get().GetBaseLayer() {
-            layer.begin_frame(frame);
+            layer.begin_frame(cx, frame);
         }
         self.active_render_state.get().with_layers(|layers| {
             for layer in layers {
-                layer.begin_frame(frame);
+                layer.begin_frame(cx, frame);
             }
         });
     }
@@ -582,14 +587,13 @@ impl XRSession {
         }
     }
 
-    fn handle_frame_event(&self, event: FrameUpdateEvent, can_gc: CanGc) {
+    fn handle_frame_event(&self, cx: &mut JSContext, event: FrameUpdateEvent) {
         match event {
             FrameUpdateEvent::HitTestSourceAdded(id) => {
                 if let Some(promise) = self.pending_hit_test_promises.borrow_mut().remove(&id) {
-                    promise.resolve_native(
-                        &XRHitTestSource::new(self.global().as_window(), id, self, can_gc),
-                        can_gc,
-                    );
+                    let hit_test_source =
+                        XRHitTestSource::new(cx, self.global().as_window(), id, self);
+                    promise.resolve_native(cx, &hit_test_source);
                 } else {
                     warn!(
                         "received hit test add request for unknown hit test {:?}",
@@ -602,7 +606,7 @@ impl XRSession {
     }
 
     /// <https://www.w3.org/TR/webxr/#apply-the-nominal-frame-rate>
-    fn apply_nominal_framerate(&self, rate: f32, can_gc: CanGc) {
+    fn apply_nominal_framerate(&self, cx: &mut JSContext, rate: f32) {
         if self.framerate.get() == rate || self.ended.get() {
             return;
         }
@@ -610,14 +614,14 @@ impl XRSession {
         self.framerate.set(rate);
 
         let event = XRSessionEvent::new(
+            cx,
             self.global().as_window(),
             Atom::from("frameratechange"),
             false,
             false,
             self,
-            can_gc,
         );
-        event.upcast::<Event>().fire(self.upcast(), can_gc);
+        event.upcast::<Event>().fire(cx, self.upcast());
     }
 }
 
@@ -660,33 +664,33 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
     // https://www.w3.org/TR/webxr/#dom-xrsession-onframeratechange
     event_handler!(frameratechange, GetOnframeratechange, SetOnframeratechange);
 
-    // https://immersive-web.github.io/webxr/#dom-xrsession-renderstate
+    /// <https://immersive-web.github.io/webxr/#dom-xrsession-renderstate>
     fn RenderState(&self) -> DomRoot<XRRenderState> {
         self.active_render_state.get()
     }
 
     /// <https://immersive-web.github.io/webxr/#dom-xrsession-updaterenderstate>
-    fn UpdateRenderState(&self, init: &XRRenderStateInit, _: InRealm) -> ErrorResult {
+    fn UpdateRenderState(&self, cx: &mut JSContext, init: &XRRenderStateInit) -> ErrorResult {
         // Step 2
         if self.ended.get() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
         // Step 3:
-        if let Some(Some(ref layer)) = init.baseLayer {
-            if Dom::from_ref(layer.session()) != Dom::from_ref(self) {
-                return Err(Error::InvalidState);
-            }
+        if let Some(Some(ref layer)) = init.baseLayer &&
+            Dom::from_ref(layer.session()) != Dom::from_ref(self)
+        {
+            return Err(Error::InvalidState(None));
         }
 
         // Step 4:
         if init.inlineVerticalFieldOfView.is_some() && self.is_immersive() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         // https://immersive-web.github.io/layers/#updaterenderstatechanges
         // Step 1.
         if init.baseLayer.is_some() && (self.has_layers_feature() || init.layers.is_some()) {
-            return Err(Error::NotSupported);
+            return Err(Error::NotSupported(None));
         }
 
         if let Some(Some(ref layers)) = init.layers {
@@ -697,16 +701,16 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
                     .filter(|other| other.layer_id() == layer.layer_id())
                     .count();
                 if count > 1 {
-                    return Err(Error::Type(String::from("Duplicate entry in WebXR layers")));
+                    return Err(Error::Type(c"Duplicate entry in WebXR layers".to_owned()));
                 }
             }
 
             // Step 3
             for layer in layers {
                 if layer.session() != self {
-                    return Err(Error::Type(String::from(
-                        "Layer from different session in WebXR layers",
-                    )));
+                    return Err(Error::Type(
+                        c"Layer from different session in WebXR layers".to_owned(),
+                    ));
                 }
             }
         }
@@ -714,7 +718,7 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
         // Step 4-5
         let pending = self
             .pending_render_state
-            .or_init(|| self.active_render_state.get().clone_object());
+            .or_init(|| self.active_render_state.get().clone_object(cx));
 
         // Step 6
         if let Some(ref layers) = init.layers {
@@ -829,11 +833,10 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
     /// <https://immersive-web.github.io/webxr/#dom-xrsession-requestreferencespace>
     fn RequestReferenceSpace(
         &self,
+        cx: &mut CurrentRealm,
         ty: XRReferenceSpaceType,
-        comp: InRealm,
-        can_gc: CanGc,
     ) -> Rc<Promise> {
-        let p = Promise::new_in_current_realm(comp, can_gc);
+        let p = Promise::new_in_realm(cx);
 
         // https://immersive-web.github.io/webxr/#create-a-reference-space
 
@@ -843,14 +846,14 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
         if !self.is_immersive() &&
             (ty == XRReferenceSpaceType::Bounded_floor || ty == XRReferenceSpaceType::Unbounded)
         {
-            p.reject_error(Error::NotSupported, can_gc);
+            p.reject_error(cx, Error::NotSupported(None));
             return p;
         }
 
         match ty {
             XRReferenceSpaceType::Unbounded => {
                 // XXXmsub2 figure out how to support this
-                p.reject_error(Error::NotSupported, can_gc)
+                p.reject_error(cx, Error::NotSupported(None))
             },
             ty => {
                 if ty != XRReferenceSpaceType::Viewer &&
@@ -864,23 +867,22 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
                         .iter()
                         .any(|f| *f == s)
                     {
-                        p.reject_error(Error::NotSupported, can_gc);
+                        p.reject_error(cx, Error::NotSupported(None));
                         return p;
                     }
                 }
                 if ty == XRReferenceSpaceType::Bounded_floor {
-                    let space =
-                        XRBoundedReferenceSpace::new(self.global().as_window(), self, can_gc);
+                    let space = XRBoundedReferenceSpace::new(cx, self.global().as_window(), self);
                     self.reference_spaces
                         .borrow_mut()
                         .push(Dom::from_ref(space.reference_space()));
-                    p.resolve_native(&space, can_gc);
+                    p.resolve_native(cx, &space);
                 } else {
-                    let space = XRReferenceSpace::new(self.global().as_window(), self, ty, can_gc);
+                    let space = XRReferenceSpace::new(cx, self.global().as_window(), self, ty);
                     self.reference_spaces
                         .borrow_mut()
                         .push(Dom::from_ref(&*space));
-                    p.resolve_native(&space, can_gc);
+                    p.resolve_native(cx, &space);
                 }
             },
         }
@@ -893,9 +895,8 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
     }
 
     /// <https://immersive-web.github.io/webxr/#dom-xrsession-end>
-    fn End(&self, can_gc: CanGc) -> Rc<Promise> {
-        let global = self.global();
-        let p = Promise::new(&global, can_gc);
+    fn End(&self, cx: &mut CurrentRealm) -> Rc<Promise> {
+        let p = Promise::new_in_realm(cx);
         if self.ended.get() && self.end_promises.borrow().is_empty() {
             // If the session has completely ended and all end promises have been resolved,
             // don't queue up more end promises
@@ -906,7 +907,7 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
             //
             // However, if end_promises is empty, then all end() promises have already resolved,
             // so the session has completely shut down and we should not queue up more promises
-            p.resolve_native(&(), can_gc);
+            p.resolve_native(cx, &());
             return p;
         }
         self.end_promises.borrow_mut().push(p.clone());
@@ -914,19 +915,27 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
         // happen ASAP for end() but can happen later if the device
         // shuts itself down
         self.ended.set(true);
-        global.as_window().Navigator().Xr().end_session(self);
+        self.global()
+            .as_window()
+            .Navigator(cx)
+            .Xr(cx)
+            .end_session(self);
         self.session.borrow_mut().end_session();
         // Disconnect any still-attached XRInputSources
         for source in 0..self.input_sources.Length() {
             self.input_sources
-                .remove_input_source(self, InputId(source), can_gc);
+                .remove_input_source(cx, self, InputId(source));
         }
         p
     }
 
-    // https://immersive-web.github.io/hit-test/#dom-xrsession-requesthittestsource
-    fn RequestHitTestSource(&self, options: &XRHitTestOptionsInit, can_gc: CanGc) -> Rc<Promise> {
-        let p = Promise::new(&self.global(), can_gc);
+    /// <https://immersive-web.github.io/hit-test/#dom-xrsession-requesthittestsource>
+    fn RequestHitTestSource(
+        &self,
+        cx: &mut CurrentRealm,
+        options: &XRHitTestOptionsInit,
+    ) -> Rc<Promise> {
+        let p = Promise::new_in_realm(cx);
 
         if !self
             .session
@@ -935,7 +944,7 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
             .iter()
             .any(|f| f == "hit-test")
         {
-            p.reject_error(Error::NotSupported, can_gc);
+            p.reject_error(cx, Error::NotSupported(None));
             return p;
         }
 
@@ -999,25 +1008,28 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
     }
 
     /// <https://www.w3.org/TR/webxr/#dom-xrsession-supportedframerates>
-    fn GetSupportedFrameRates(&self, cx: JSContext, can_gc: CanGc) -> Option<Float32Array> {
+    fn GetSupportedFrameRates(
+        &self,
+        cx: &mut JSContext,
+    ) -> Option<RootedTraceableBox<HeapFloat32Array>> {
         let session = self.session.borrow();
         if self.mode == XRSessionMode::Inline || session.supported_frame_rates().is_empty() {
             None
         } else {
             let framerates = session.supported_frame_rates();
-            rooted!(in (*cx) let mut array = ptr::null_mut::<JSObject>());
+            rooted!(&in(cx) let mut array = ptr::null_mut::<JSObject>());
             Some(
-                create_buffer_source(cx, framerates, array.handle_mut(), can_gc)
+                create_buffer_source(cx, framerates, array.handle_mut())
                     .expect("Failed to construct supported frame rates array"),
             )
         }
     }
 
     /// <https://www.w3.org/TR/webxr/#dom-xrsession-enabledfeatures>
-    fn EnabledFeatures(&self, cx: JSContext, can_gc: CanGc, retval: MutableHandleValue) {
+    fn EnabledFeatures(&self, cx: &mut JSContext, retval: MutableHandleValue) {
         let session = self.session.borrow();
         let features = session.granted_features();
-        to_frozen_array(features, cx, retval, can_gc)
+        to_frozen_array(cx, features, retval)
     }
 
     /// <https://www.w3.org/TR/webxr/#dom-xrsession-issystemkeyboardsupported>
@@ -1028,13 +1040,8 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
     }
 
     /// <https://www.w3.org/TR/webxr/#dom-xrsession-updatetargetframerate>
-    fn UpdateTargetFrameRate(
-        &self,
-        rate: Finite<f32>,
-        comp: InRealm,
-        can_gc: CanGc,
-    ) -> Rc<Promise> {
-        let promise = Promise::new_in_current_realm(comp, can_gc);
+    fn UpdateTargetFrameRate(&self, cx: &mut CurrentRealm, rate: Finite<f32>) -> Rc<Promise> {
+        let promise = Promise::new_in_realm(cx);
         {
             let session = self.session.borrow();
             let supported_frame_rates = session.supported_frame_rates();
@@ -1043,15 +1050,12 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
                 supported_frame_rates.is_empty() ||
                 self.ended.get()
             {
-                promise.reject_error(Error::InvalidState, can_gc);
+                promise.reject_error(cx, Error::InvalidState(None));
                 return promise;
             }
 
             if !supported_frame_rates.contains(&*rate) {
-                promise.reject_error(
-                    Error::Type("Provided framerate not supported".into()),
-                    can_gc,
-                );
+                promise.reject_error(cx, Error::Type(c"Provided framerate not supported".into()));
                 return promise;
             }
         }
@@ -1064,23 +1068,21 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
             .task_manager()
             .dom_manipulation_task_source()
             .to_sendable();
-        let (sender, receiver) = ipc::channel(global.time_profiler_chan().clone()).unwrap();
 
-        ROUTER.add_typed_route(
-            receiver.to_ipc_receiver(),
-            Box::new(move |message| {
+        let callback =
+            ProfileGenericCallback::new(global.time_profiler_chan().clone(), move |message| {
                 let this = this.clone();
-                task_source.queue(task!(update_session_framerate: move || {
+                task_source.queue(task!(update_session_framerate: move |cx| {
                     let session = this.root();
-                    session.apply_nominal_framerate(message.unwrap(), CanGc::note());
+                    session.apply_nominal_framerate(cx, message.unwrap());
                     if let Some(promise) = session.update_framerate_promise.borrow_mut().take() {
-                        promise.resolve_native(&(), CanGc::note());
+                        promise.resolve_native(cx, &());
                     };
                 }));
-            }),
-        );
+            })
+            .expect("Could not create callback");
 
-        self.session.borrow_mut().update_frame_rate(*rate, sender);
+        self.session.borrow_mut().update_frame_rate(*rate, callback);
 
         promise
     }
@@ -1096,7 +1098,7 @@ pub(crate) struct BaseSpace;
 
 pub(crate) type BaseTransform = RigidTransform3D<f32, webxr_api::Native, BaseSpace>;
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 pub(crate) fn cast_transform<T, U, V, W>(
     transform: RigidTransform3D<f32, T, U>,
 ) -> RigidTransform3D<f32, V, W> {

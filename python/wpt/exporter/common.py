@@ -12,17 +12,11 @@
 UPSTREAMABLE_PATH = "tests/wpt/tests/"
 NO_SYNC_SIGNAL = "[no-wpt-sync]"
 
-OPENED_NEW_UPSTREAM_PR = (
-    "🤖 Opened new upstream WPT pull request ({upstream_pr}) "
-    "with upstreamable changes."
-)
+OPENED_NEW_UPSTREAM_PR = "🤖 Opened new upstream WPT pull request ({upstream_pr}) with upstreamable changes."
 UPDATED_EXISTING_UPSTREAM_PR = (
-    "📝 Transplanted new upstreamable changes to existing "
-    "upstream WPT pull request ({upstream_pr})."
+    "📝 Transplanted new upstreamable changes to existing upstream WPT pull request ({upstream_pr})."
 )
-UPDATED_TITLE_IN_EXISTING_UPSTREAM_PR = (
-    "✍ Updated existing upstream WPT pull request ({upstream_pr}) title and body."
-)
+UPDATED_TITLE_IN_EXISTING_UPSTREAM_PR = "✍ Updated existing upstream WPT pull request ({upstream_pr}) title and body."
 CLOSING_EXISTING_UPSTREAM_PR = (
     "🤖 This change no longer contains upstreamable changes to WPT; closed existing "
     "upstream pull request ({upstream_pr})."
@@ -49,5 +43,5 @@ COULD_NOT_MERGE_CHANGES_UPSTREAM_COMMENT = (
 )
 
 
-def wpt_branch_name_from_servo_pr_number(servo_pr_number):
+def wpt_branch_name_from_servo_pr_number(servo_pr_number: str) -> str:
     return f"servo_export_{servo_pr_number}"

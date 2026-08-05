@@ -33,7 +33,8 @@ promise_test(async t => {
     ru: 'Это пример предложения.',
     sr: 'Ово је пример реченице.',
     tr: 'Bu bir örnek cümledir.',
-    zh: '这是一个例句。',
+    'zh-Hans': '这是一个例句。',
+    'zh-Hant': '這是一個例句。',
     zu: 'Lona umusho oyisibonelo.',
   }
 
@@ -52,3 +53,15 @@ promise_test(async () => {
   assert_array_equals(detector.expectedInputLanguages, expectedInputLanguages);
   assert_true(Object.isFrozen(detector.expectedInputLanguages));
 }, 'Creating LanguageDetector with expectedInputLanguages');
+
+
+promise_test(async () => {
+  const detector = await createLanguageDetector();
+
+  const results = await detector.detect('');
+  assert_equals(results.length, 1);
+
+  const [result] = results;
+  assert_equals(result.detectedLanguage, 'und');
+  assert_equals(result.confidence, 1);
+}, 'LanguageDetector.detect() detects empty string');

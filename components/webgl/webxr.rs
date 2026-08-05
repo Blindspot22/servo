@@ -2,13 +2,13 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::collections::HashMap;
 use std::num::NonZeroU32;
+use std::rc::Rc;
 
-use canvas_traits::webgl::{
-    WebGLContextId, WebGLMsg, WebGLSender, WebXRCommand, WebXRLayerManagerId, webgl_channel,
+use rustc_hash::FxHashMap;
+use servo_canvas_traits::webgl::{
+    GenericSender, WebGLMsg, WebXRCommand, WebXRLayerManagerId, webgl_channel,
 };
-use fnv::FnvHashMap;
 use surfman::{Context, Device};
 use webxr::SurfmanGL as WebXRSurfman;
 use webxr_api::{
@@ -20,12 +20,12 @@ use webxr_api::{
     SubImages as WebXRSubImages,
 };
 
-use crate::webgl_thread::{GLContextData, WebGLThread};
+use crate::webgl_thread::WebGLThread;
 
 /// Bridge between WebGL and WebXR
 pub(crate) struct WebXRBridge {
     factory_receiver: crossbeam_channel::Receiver<WebXRLayerManagerFactory<WebXRSurfman>>,
-    managers: HashMap<WebXRLayerManagerId, Box<dyn WebXRLayerManagerAPI<WebXRSurfman>>>,
+    managers: FxHashMap<WebXRLayerManagerId, Box<dyn WebXRLayerManagerAPI<WebXRSurfman>>>,
     next_manager_id: NonZeroU32,
 }
 
@@ -34,7 +34,7 @@ impl WebXRBridge {
         let WebXRBridgeInit {
             factory_receiver, ..
         } = init;
-        let managers = HashMap::new();
+        let managers = FxHashMap::default();
         let next_manager_id = NonZeroU32::MIN;
         WebXRBridge {
             factory_receiver,
@@ -45,17 +45,15 @@ impl WebXRBridge {
 }
 
 impl WebXRBridge {
-    #[allow(unsafe_code)]
     pub(crate) fn create_layer_manager(
         &mut self,
-        device: &mut Device,
         contexts: &mut dyn WebXRContexts<WebXRSurfman>,
     ) -> Result<WebXRLayerManagerId, WebXRError> {
         let factory = self
             .factory_receiver
             .recv()
             .map_err(|_| WebXRError::CommunicationError)?;
-        let manager = factory.build(device, contexts)?;
+        let manager = factory.build(contexts)?;
         let manager_id = WebXRLayerManagerId::new(self.next_manager_id);
         self.next_manager_id = self
             .next_manager_id
@@ -72,7 +70,6 @@ impl WebXRBridge {
     pub(crate) fn create_layer(
         &mut self,
         manager_id: WebXRLayerManagerId,
-        device: &mut Device,
         contexts: &mut dyn WebXRContexts<WebXRSurfman>,
         context_id: WebXRContextId,
         layer_init: WebXRLayerInit,
@@ -81,33 +78,30 @@ impl WebXRBridge {
             .managers
             .get_mut(&manager_id)
             .ok_or(WebXRError::NoMatchingDevice)?;
-        manager.create_layer(device, contexts, context_id, layer_init)
+        manager.create_layer(contexts, context_id, layer_init)
     }
 
     pub(crate) fn destroy_layer(
         &mut self,
         manager_id: WebXRLayerManagerId,
-        device: &mut Device,
         contexts: &mut dyn WebXRContexts<WebXRSurfman>,
         context_id: WebXRContextId,
         layer_id: WebXRLayerId,
     ) {
         if let Some(manager) = self.managers.get_mut(&manager_id) {
-            manager.destroy_layer(device, contexts, context_id, layer_id);
+            manager.destroy_layer(contexts, context_id, layer_id);
         }
     }
 
     pub(crate) fn destroy_all_layers(
         &mut self,
-        device: &mut Device,
         contexts: &mut dyn WebXRContexts<WebXRSurfman>,
         context_id: WebXRContextId,
     ) {
         for manager in self.managers.values_mut() {
-            #[allow(clippy::unnecessary_to_owned)] // Needs mutable borrow later in destroy
             for (other_id, layer_id) in manager.layers().to_vec() {
                 if other_id == context_id {
-                    manager.destroy_layer(device, contexts, context_id, layer_id);
+                    manager.destroy_layer(contexts, context_id, layer_id);
                 }
             }
         }
@@ -116,7 +110,6 @@ impl WebXRBridge {
     pub(crate) fn begin_frame(
         &mut self,
         manager_id: WebXRLayerManagerId,
-        device: &mut Device,
         contexts: &mut dyn WebXRContexts<WebXRSurfman>,
         layers: &[(WebXRContextId, WebXRLayerId)],
     ) -> Result<Vec<WebXRSubImages>, WebXRError> {
@@ -124,13 +117,12 @@ impl WebXRBridge {
             .managers
             .get_mut(&manager_id)
             .ok_or(WebXRError::NoMatchingDevice)?;
-        manager.begin_frame(device, contexts, layers)
+        manager.begin_frame(contexts, layers)
     }
 
     pub(crate) fn end_frame(
         &mut self,
         manager_id: WebXRLayerManagerId,
-        device: &mut Device,
         contexts: &mut dyn WebXRContexts<WebXRSurfman>,
         layers: &[(WebXRContextId, WebXRLayerId)],
     ) -> Result<(), WebXRError> {
@@ -138,18 +130,18 @@ impl WebXRBridge {
             .managers
             .get_mut(&manager_id)
             .ok_or(WebXRError::NoMatchingDevice)?;
-        manager.end_frame(device, contexts, layers)
+        manager.end_frame(contexts, layers)
     }
 }
 
 pub(crate) struct WebXRBridgeInit {
-    sender: WebGLSender<WebGLMsg>,
+    sender: GenericSender<WebGLMsg>,
     factory_receiver: crossbeam_channel::Receiver<WebXRLayerManagerFactory<WebXRSurfman>>,
     factory_sender: crossbeam_channel::Sender<WebXRLayerManagerFactory<WebXRSurfman>>,
 }
 
 impl WebXRBridgeInit {
-    pub(crate) fn new(sender: WebGLSender<WebGLMsg>) -> WebXRBridgeInit {
+    pub(crate) fn new(sender: GenericSender<WebGLMsg>) -> WebXRBridgeInit {
         let (factory_sender, factory_receiver) = crossbeam_channel::unbounded();
         WebXRBridgeInit {
             sender,
@@ -167,7 +159,7 @@ impl WebXRBridgeInit {
 }
 
 struct WebXRBridgeGrandManager {
-    sender: WebGLSender<WebGLMsg>,
+    sender: GenericSender<WebGLMsg>,
     // WebXR layer manager factories use generic trait objects under the
     // hood, which aren't deserializable (even using typetag)
     // so we can't send them over the regular webgl channel.
@@ -210,7 +202,7 @@ impl WebXRLayerGrandManagerAPI<WebXRSurfman> for WebXRBridgeGrandManager {
 }
 
 struct WebXRBridgeManager {
-    sender: WebGLSender<WebGLMsg>,
+    sender: GenericSender<WebGLMsg>,
     manager_id: WebXRLayerManagerId,
     layers: Vec<(WebXRContextId, WebXRLayerId)>,
 }
@@ -218,7 +210,6 @@ struct WebXRBridgeManager {
 impl<GL: WebXRTypes> WebXRLayerManagerAPI<GL> for WebXRBridgeManager {
     fn create_layer(
         &mut self,
-        _: &mut GL::Device,
         _: &mut dyn WebXRContexts<GL>,
         context_id: WebXRContextId,
         init: WebXRLayerInit,
@@ -241,7 +232,6 @@ impl<GL: WebXRTypes> WebXRLayerManagerAPI<GL> for WebXRBridgeManager {
 
     fn destroy_layer(
         &mut self,
-        _: &mut GL::Device,
         _: &mut dyn WebXRContexts<GL>,
         context_id: WebXRContextId,
         layer_id: WebXRLayerId,
@@ -262,7 +252,6 @@ impl<GL: WebXRTypes> WebXRLayerManagerAPI<GL> for WebXRBridgeManager {
 
     fn begin_frame(
         &mut self,
-        _: &mut GL::Device,
         _: &mut dyn WebXRContexts<GL>,
         layers: &[(WebXRContextId, WebXRLayerId)],
     ) -> Result<Vec<WebXRSubImages>, WebXRError> {
@@ -281,7 +270,6 @@ impl<GL: WebXRTypes> WebXRLayerManagerAPI<GL> for WebXRBridgeManager {
 
     fn end_frame(
         &mut self,
-        _: &mut GL::Device,
         _: &mut dyn WebXRContexts<GL>,
         layers: &[(WebXRContextId, WebXRLayerId)],
     ) -> Result<(), WebXRError> {
@@ -309,29 +297,18 @@ impl Drop for WebXRBridgeManager {
     }
 }
 
-pub(crate) struct WebXRBridgeContexts<'a> {
-    pub(crate) contexts: &'a mut FnvHashMap<WebGLContextId, GLContextData>,
-    pub(crate) bound_context_id: &'a mut Option<WebGLContextId>,
-}
+impl WebXRContexts<WebXRSurfman> for WebGLThread {
+    fn device(&self, context_id: WebXRContextId) -> Option<Rc<Device>> {
+        self.maybe_device_for_context(context_id.into())
+    }
 
-impl WebXRContexts<WebXRSurfman> for WebXRBridgeContexts<'_> {
-    fn context(&mut self, device: &Device, context_id: WebXRContextId) -> Option<&mut Context> {
-        let data = WebGLThread::make_current_if_needed_mut(
-            device,
-            WebGLContextId::from(context_id),
-            self.contexts,
-            self.bound_context_id,
-        )?;
+    fn context(&mut self, context_id: WebXRContextId) -> Option<&mut Context> {
+        let data = self.make_current_if_needed_mut(context_id.into())?;
         Some(&mut data.ctx)
     }
 
-    fn bindings(&mut self, device: &Device, context_id: WebXRContextId) -> Option<&glow::Context> {
-        let data = WebGLThread::make_current_if_needed(
-            device,
-            WebGLContextId::from(context_id),
-            self.contexts,
-            self.bound_context_id,
-        )?;
+    fn bindings(&mut self, context_id: WebXRContextId) -> Option<&glow::Context> {
+        let data = self.make_current_if_needed(context_id.into())?;
         Some(&data.gl)
     }
 }

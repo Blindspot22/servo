@@ -15,13 +15,15 @@ import argparse
 import json
 import os
 import re
-import requests
+import urllib.request
 
 def get_IdnaTestV2_lines():
     IdnaTestV2 = os.path.join(os.path.dirname(__file__), "IdnaTestV2.txt")
     if not os.path.exists(IdnaTestV2):
         # Download IdnaTestV2.txt if it doesn't exist yet
-        open(IdnaTestV2, "w", encoding="utf-8").write(requests.get("https://unicode.org/Public/idna/latest/IdnaTestV2.txt").text)
+        url = "https://unicode.org/Public/idna/latest/IdnaTestV2.txt"
+        content = urllib.request.urlopen(url).read()
+        open(IdnaTestV2, "wb").write(content)
     return open(IdnaTestV2, "r", encoding="utf-8").readlines()
 
 def remove_escapes(input):
@@ -55,6 +57,15 @@ def contains_bidi_status(statuses):
         if status in ["B1", "B2", "B3", "B4", "B5", "B6"]:
             return True
     return False
+
+FORBIDDEN_DOMAIN_CODE_POINTS = (
+    set(range(0x00, 0x20))
+    | {0x20, 0x23, 0x25, 0x2F, 0x3A, 0x3C, 0x3E, 0x3F, 0x40,
+       0x5B, 0x5C, 0x5D, 0x5E, 0x7C, 0x7F}
+)
+
+def contains_forbidden_domain_code_point(s):
+    return any(ord(c) in FORBIDDEN_DOMAIN_CODE_POINTS for c in s)
 
 def parse(lines, exclude_ipv4_like, exclude_std3, exclude_bidi):
     # Main quest.
@@ -133,7 +144,10 @@ def parse(lines, exclude_ipv4_like, exclude_std3, exclude_bidi):
             continue
 
         if len(statuses) > 0:
-            to_ascii = None
+            if source.isascii() and not contains_forbidden_domain_code_point(source):
+                to_ascii = source.lower()
+            else:
+                to_ascii = None
 
         test = { "input": source, "output": to_ascii }
         comment = ""

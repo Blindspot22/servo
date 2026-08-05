@@ -3,7 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use js::rust::HandleObject;
+use script_bindings::reflector::reflect_dom_object_with_proto;
 use stylo_atoms::Atom;
 
 use crate::dom::bindings::codegen::Bindings::BluetoothAdvertisingEventBinding::{
@@ -12,14 +14,12 @@ use crate::dom::bindings::codegen::Bindings::BluetoothAdvertisingEventBinding::{
 use crate::dom::bindings::codegen::Bindings::EventBinding::Event_Binding::EventMethods;
 use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::reflect_dom_object_with_proto;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bluetoothdevice::BluetoothDevice;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
 
 // https://webbluetoothcg.github.io/web-bluetooth/#bluetoothadvertisingevent
 #[dom_struct]
@@ -32,7 +32,7 @@ pub(crate) struct BluetoothAdvertisingEvent {
     rssi: Option<i8>,
 }
 
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 impl BluetoothAdvertisingEvent {
     pub(crate) fn new_inherited(
         device: &BluetoothDevice,
@@ -51,8 +51,9 @@ impl BluetoothAdvertisingEvent {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
         type_: Atom,
@@ -63,15 +64,14 @@ impl BluetoothAdvertisingEvent {
         appearance: Option<u16>,
         txPower: Option<i8>,
         rssi: Option<i8>,
-        can_gc: CanGc,
     ) -> DomRoot<BluetoothAdvertisingEvent> {
         let ev = reflect_dom_object_with_proto(
+            cx,
             Box::new(BluetoothAdvertisingEvent::new_inherited(
                 device, name, appearance, txPower, rssi,
             )),
             global,
             proto,
-            can_gc,
         );
         {
             let event = ev.upcast::<Event>();
@@ -83,11 +83,11 @@ impl BluetoothAdvertisingEvent {
 
 impl BluetoothAdvertisingEventMethods<crate::DomTypeHolder> for BluetoothAdvertisingEvent {
     // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothadvertisingevent-bluetoothadvertisingevent
-    #[allow(non_snake_case)]
+    #[expect(non_snake_case)]
     fn Constructor(
+        cx: &mut JSContext,
         window: &Window,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
         type_: DOMString,
         init: &BluetoothAdvertisingEventInit,
     ) -> Fallible<DomRoot<BluetoothAdvertisingEvent>> {
@@ -98,6 +98,7 @@ impl BluetoothAdvertisingEventMethods<crate::DomTypeHolder> for BluetoothAdverti
         let bubbles = EventBubbles::from(init.parent.bubbles);
         let cancelable = EventCancelable::from(init.parent.cancelable);
         Ok(BluetoothAdvertisingEvent::new(
+            cx,
             window.as_global_scope(),
             proto,
             Atom::from(type_),
@@ -108,36 +109,35 @@ impl BluetoothAdvertisingEventMethods<crate::DomTypeHolder> for BluetoothAdverti
             appearance,
             txPower,
             rssi,
-            can_gc,
         ))
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothadvertisingevent-device
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothadvertisingevent-device>
     fn Device(&self) -> DomRoot<BluetoothDevice> {
         DomRoot::from_ref(&*self.device)
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothadvertisingevent-name
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothadvertisingevent-name>
     fn GetName(&self) -> Option<DOMString> {
         self.name.clone()
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothadvertisingevent-appearance
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothadvertisingevent-appearance>
     fn GetAppearance(&self) -> Option<u16> {
         self.appearance
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothadvertisingevent-txpower
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothadvertisingevent-txpower>
     fn GetTxPower(&self) -> Option<i8> {
         self.tx_power
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothadvertisingevent-rssi
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothadvertisingevent-rssi>
     fn GetRssi(&self) -> Option<i8> {
         self.rssi
     }
 
-    // https://dom.spec.whatwg.org/#dom-event-istrusted
+    /// <https://dom.spec.whatwg.org/#dom-event-istrusted>
     fn IsTrusted(&self) -> bool {
         self.event.IsTrusted()
     }

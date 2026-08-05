@@ -8,16 +8,22 @@
 //! be passed through the Constellation.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::path::PathBuf;
 
-use base::id::{BlobId, DomExceptionId, DomPointId};
+use euclid::default::Transform3D;
 use malloc_size_of_derive::MallocSizeOf;
 use net_traits::filemanager_thread::RelativePos;
+use pixels::SharedSnapshot;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use servo_base::id::{
+    BlobId, CryptoKeyId, DomExceptionId, DomMatrixId, DomPointId, DomQuadId, DomRectId, FileId,
+    FileListId, ImageBitmapId, ImageDataId, QuotaExceededErrorId,
+};
 use servo_url::ImmutableOrigin;
 use strum::EnumIter;
 use uuid::Uuid;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::StructuredSerializedData;
 
@@ -31,22 +37,47 @@ where
     /// Only return None if cloning is impossible.
     fn clone_for_broadcast(&self) -> Option<Self>;
     /// The field from which to clone values.
-    fn source(data: &StructuredSerializedData) -> &Option<HashMap<Self::Id, Self>>;
+    fn source(data: &StructuredSerializedData) -> &Option<FxHashMap<Self::Id, Self>>;
     /// The field into which to place cloned values.
-    fn destination(data: &mut StructuredSerializedData) -> &mut Option<HashMap<Self::Id, Self>>;
+    fn destination(data: &mut StructuredSerializedData) -> &mut Option<FxHashMap<Self::Id, Self>>;
 }
 
 /// All the DOM interfaces that can be serialized.
+///
+/// NOTE: Variants which are derived from other serializable interfaces must come before their
+/// parents because serialization is attempted in order of the variants.
 #[derive(Clone, Copy, Debug, EnumIter)]
 pub enum Serializable {
+    /// The `File` interface.
+    File,
+    /// The `FileList` interface.
+    FileList,
     /// The `Blob` interface.
     Blob,
     /// The `DOMPoint` interface.
     DomPoint,
     /// The `DOMPointReadOnly` interface.
     DomPointReadOnly,
+    /// The `DOMRect` interface.
+    DomRect,
+    /// The `DOMRectReadOnly` interface.
+    DomRectReadOnly,
+    /// The `DOMQuad` interface.
+    DomQuad,
+    /// The `DOMMatrix` interface.
+    DomMatrix,
+    /// The `DOMMatrixReadOnly` interface.
+    DomMatrixReadOnly,
+    /// The `QuotaExceededError` interface.
+    QuotaExceededError,
     /// The `DOMException` interface.
     DomException,
+    /// The `ImageBitmap` interface.
+    ImageBitmap,
+    /// The `ImageData` interface.
+    ImageData,
+    /// The `CryptoKey` interface.
+    CryptoKey,
 }
 
 impl Serializable {
@@ -54,13 +85,36 @@ impl Serializable {
         &self,
     ) -> fn(&StructuredSerializedData, &mut StructuredSerializedData) {
         match self {
+            Serializable::File => StructuredSerializedData::clone_all_of_type::<SerializableFile>,
+            Serializable::FileList => {
+                StructuredSerializedData::clone_all_of_type::<SerializableFileList>
+            },
             Serializable::Blob => StructuredSerializedData::clone_all_of_type::<BlobImpl>,
+            Serializable::DomPoint => StructuredSerializedData::clone_all_of_type::<DomPoint>,
             Serializable::DomPointReadOnly => {
                 StructuredSerializedData::clone_all_of_type::<DomPoint>
             },
-            Serializable::DomPoint => StructuredSerializedData::clone_all_of_type::<DomPoint>,
+            Serializable::DomRect => StructuredSerializedData::clone_all_of_type::<DomRect>,
+            Serializable::DomRectReadOnly => StructuredSerializedData::clone_all_of_type::<DomRect>,
+            Serializable::DomQuad => StructuredSerializedData::clone_all_of_type::<DomQuad>,
+            Serializable::DomMatrix => StructuredSerializedData::clone_all_of_type::<DomMatrix>,
+            Serializable::DomMatrixReadOnly => {
+                StructuredSerializedData::clone_all_of_type::<DomMatrix>
+            },
             Serializable::DomException => {
                 StructuredSerializedData::clone_all_of_type::<DomException>
+            },
+            Serializable::ImageBitmap => {
+                StructuredSerializedData::clone_all_of_type::<SerializableImageBitmap>
+            },
+            Serializable::QuotaExceededError => {
+                StructuredSerializedData::clone_all_of_type::<SerializableQuotaExceededError>
+            },
+            Serializable::ImageData => {
+                StructuredSerializedData::clone_all_of_type::<SerializableImageData>
+            },
+            Serializable::CryptoKey => {
+                StructuredSerializedData::clone_all_of_type::<SerializableCryptoKey>
             },
         }
     }
@@ -68,7 +122,7 @@ impl Serializable {
 
 /// Message for communication between the constellation and a global managing broadcast channels.
 #[derive(Debug, Deserialize, Serialize)]
-pub struct BroadcastMsg {
+pub struct BroadcastChannelMsg {
     /// The origin of this message.
     pub origin: ImmutableOrigin,
     /// The name of the channel.
@@ -77,9 +131,9 @@ pub struct BroadcastMsg {
     pub data: StructuredSerializedData,
 }
 
-impl Clone for BroadcastMsg {
-    fn clone(&self) -> BroadcastMsg {
-        BroadcastMsg {
+impl Clone for BroadcastChannelMsg {
+    fn clone(&self) -> BroadcastChannelMsg {
+        BroadcastChannelMsg {
             data: self.data.clone_for_broadcast(),
             origin: self.origin.clone(),
             channel_name: self.channel_name.clone(),
@@ -87,12 +141,66 @@ impl Clone for BroadcastMsg {
     }
 }
 
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct SerializableFile {
+    pub blob_impl: BlobImpl,
+    pub name: String,
+    pub modified: i64,
+    pub webkit_relative_path: String,
+}
+
+impl BroadcastClone for SerializableFile {
+    type Id = FileId;
+
+    fn source(data: &StructuredSerializedData) -> &Option<FxHashMap<Self::Id, Self>> {
+        &data.files
+    }
+
+    fn destination(data: &mut StructuredSerializedData) -> &mut Option<FxHashMap<Self::Id, Self>> {
+        &mut data.files
+    }
+
+    fn clone_for_broadcast(&self) -> Option<Self> {
+        let blob_impl = self.blob_impl.clone_for_broadcast()?;
+        Some(SerializableFile {
+            blob_impl,
+            name: self.name.clone(),
+            modified: self.modified,
+            webkit_relative_path: self.webkit_relative_path.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct SerializableFileList {
+    pub files: Vec<SerializableFile>,
+}
+
+impl BroadcastClone for SerializableFileList {
+    type Id = FileListId;
+
+    fn source(data: &StructuredSerializedData) -> &Option<FxHashMap<Self::Id, Self>> {
+        &data.file_lists
+    }
+
+    fn destination(data: &mut StructuredSerializedData) -> &mut Option<FxHashMap<Self::Id, Self>> {
+        &mut data.file_lists
+    }
+
+    fn clone_for_broadcast(&self) -> Option<Self> {
+        let files = self
+            .files
+            .iter()
+            .map(|file| file.clone_for_broadcast())
+            .collect::<Option<Vec<_>>>()?;
+        Some(SerializableFileList { files })
+    }
+}
+
 /// File-based blob
 #[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct FileBlob {
-    #[ignore_malloc_size_of = "Uuid are hard(not really)"]
     id: Uuid,
-    #[ignore_malloc_size_of = "PathBuf are hard"]
     name: Option<PathBuf>,
     cache: RefCell<Option<Vec<u8>>>,
     size: u64,
@@ -133,15 +241,11 @@ impl FileBlob {
 impl BroadcastClone for BlobImpl {
     type Id = BlobId;
 
-    fn source(
-        data: &StructuredSerializedData,
-    ) -> &Option<std::collections::HashMap<Self::Id, Self>> {
+    fn source(data: &StructuredSerializedData) -> &Option<FxHashMap<Self::Id, Self>> {
         &data.blobs
     }
 
-    fn destination(
-        data: &mut StructuredSerializedData,
-    ) -> &mut Option<std::collections::HashMap<Self::Id, Self>> {
+    fn destination(data: &mut StructuredSerializedData) -> &mut Option<FxHashMap<Self::Id, Self>> {
         &mut data.blobs
     }
 
@@ -269,16 +373,95 @@ pub struct DomPoint {
 impl BroadcastClone for DomPoint {
     type Id = DomPointId;
 
-    fn source(
-        data: &StructuredSerializedData,
-    ) -> &Option<std::collections::HashMap<Self::Id, Self>> {
+    fn source(data: &StructuredSerializedData) -> &Option<FxHashMap<Self::Id, Self>> {
         &data.points
     }
 
-    fn destination(
-        data: &mut StructuredSerializedData,
-    ) -> &mut Option<std::collections::HashMap<Self::Id, Self>> {
+    fn destination(data: &mut StructuredSerializedData) -> &mut Option<FxHashMap<Self::Id, Self>> {
         &mut data.points
+    }
+
+    fn clone_for_broadcast(&self) -> Option<Self> {
+        Some(self.clone())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+/// A serializable version of the DOMRect/DOMRectReadOnly interface.
+pub struct DomRect {
+    /// The x coordinate.
+    pub x: f64,
+    /// The y coordinate.
+    pub y: f64,
+    /// The width.
+    pub width: f64,
+    /// The height.
+    pub height: f64,
+}
+
+impl BroadcastClone for DomRect {
+    type Id = DomRectId;
+
+    fn source(data: &StructuredSerializedData) -> &Option<FxHashMap<Self::Id, Self>> {
+        &data.rects
+    }
+
+    fn destination(data: &mut StructuredSerializedData) -> &mut Option<FxHashMap<Self::Id, Self>> {
+        &mut data.rects
+    }
+
+    fn clone_for_broadcast(&self) -> Option<Self> {
+        Some(self.clone())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+/// A serializable version of the DOMQuad interface.
+pub struct DomQuad {
+    /// The first point.
+    pub p1: DomPoint,
+    /// The second point.
+    pub p2: DomPoint,
+    /// The third point.
+    pub p3: DomPoint,
+    /// The fourth point.
+    pub p4: DomPoint,
+}
+
+impl BroadcastClone for DomQuad {
+    type Id = DomQuadId;
+
+    fn source(data: &StructuredSerializedData) -> &Option<FxHashMap<Self::Id, Self>> {
+        &data.quads
+    }
+
+    fn destination(data: &mut StructuredSerializedData) -> &mut Option<FxHashMap<Self::Id, Self>> {
+        &mut data.quads
+    }
+
+    fn clone_for_broadcast(&self) -> Option<Self> {
+        Some(self.clone())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+/// A serializable version of the DOMMatrix/DOMMatrixReadOnly interface.
+pub struct DomMatrix {
+    /// The matrix.
+    pub matrix: Transform3D<f64>,
+    /// Whether this matrix represents a 2D transformation.
+    pub is_2d: bool,
+}
+
+impl BroadcastClone for DomMatrix {
+    type Id = DomMatrixId;
+
+    fn source(data: &StructuredSerializedData) -> &Option<FxHashMap<Self::Id, Self>> {
+        &data.matrices
+    }
+
+    fn destination(data: &mut StructuredSerializedData) -> &mut Option<FxHashMap<Self::Id, Self>> {
+        &mut data.matrices
     }
 
     fn clone_for_broadcast(&self) -> Option<Self> {
@@ -296,16 +479,249 @@ pub struct DomException {
 impl BroadcastClone for DomException {
     type Id = DomExceptionId;
 
-    fn source(
-        data: &StructuredSerializedData,
-    ) -> &Option<std::collections::HashMap<Self::Id, Self>> {
+    fn source(data: &StructuredSerializedData) -> &Option<FxHashMap<Self::Id, Self>> {
         &data.exceptions
     }
 
-    fn destination(
-        data: &mut StructuredSerializedData,
-    ) -> &mut Option<std::collections::HashMap<Self::Id, Self>> {
+    fn destination(data: &mut StructuredSerializedData) -> &mut Option<FxHashMap<Self::Id, Self>> {
         &mut data.exceptions
+    }
+
+    fn clone_for_broadcast(&self) -> Option<Self> {
+        Some(self.clone())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+/// A serializable version of the QuotaExceededError interface.
+pub struct SerializableQuotaExceededError {
+    pub dom_exception: DomException,
+    pub quota: Option<f64>,
+    pub requested: Option<f64>,
+}
+
+impl BroadcastClone for SerializableQuotaExceededError {
+    type Id = QuotaExceededErrorId;
+
+    fn source(data: &StructuredSerializedData) -> &Option<FxHashMap<Self::Id, Self>> {
+        &data.quota_exceeded_errors
+    }
+
+    fn destination(data: &mut StructuredSerializedData) -> &mut Option<FxHashMap<Self::Id, Self>> {
+        &mut data.quota_exceeded_errors
+    }
+
+    fn clone_for_broadcast(&self) -> Option<Self> {
+        Some(self.clone())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+/// A serializable version of the ImageBitmap interface.
+pub struct SerializableImageBitmap {
+    pub bitmap_data: SharedSnapshot,
+}
+
+impl BroadcastClone for SerializableImageBitmap {
+    type Id = ImageBitmapId;
+
+    fn source(data: &StructuredSerializedData) -> &Option<FxHashMap<Self::Id, Self>> {
+        &data.image_bitmaps
+    }
+
+    fn destination(data: &mut StructuredSerializedData) -> &mut Option<FxHashMap<Self::Id, Self>> {
+        &mut data.image_bitmaps
+    }
+
+    fn clone_for_broadcast(&self) -> Option<Self> {
+        Some(self.clone())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct SerializableImageData {
+    pub data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl BroadcastClone for SerializableImageData {
+    type Id = ImageDataId;
+
+    fn source(data: &StructuredSerializedData) -> &Option<FxHashMap<Self::Id, Self>> {
+        &data.image_data
+    }
+
+    fn destination(data: &mut StructuredSerializedData) -> &mut Option<FxHashMap<Self::Id, Self>> {
+        &mut data.image_data
+    }
+
+    fn clone_for_broadcast(&self) -> Option<Self> {
+        Some(self.clone())
+    }
+}
+
+/// A serializable version of the `Algorithm` dictionary, used by the `SubtleCrypto` interface.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct SerializableAlgorithm {
+    pub name: String,
+}
+
+/// A serializable version of the `CShakeParams` dictionary, used by the `SubtleCrypto` interface.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct SerializableCShakeParams {
+    pub name: String,
+    pub output_length: u32,
+    pub function_name: Option<Vec<u8>>,
+    pub customization: Option<Vec<u8>>,
+}
+
+/// A serializable version of the `TurboShakeParams` dictionary, used by the `SubtleCrypto`
+/// interface.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct SerializableTurboShakeParams {
+    pub name: String,
+    pub output_length: u32,
+    pub domain_separation: Option<u8>,
+}
+
+/// A serializable version of the `KangarooTwelvelParams` dictionary, used by the `SubtleCrypto`
+/// interface.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct SerializableKangarooTwelveParams {
+    pub name: String,
+    pub output_length: u32,
+    pub customization: Option<Vec<u8>>,
+}
+
+/// A serializable version of the `DigestAlgorithm` type, used the `SubtleCrypto` interface.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub enum SerializableDigestAlgorithm {
+    Sha(SerializableAlgorithm),
+    Sha3(SerializableAlgorithm),
+    CShake(SerializableCShakeParams),
+    TurboShake(SerializableTurboShakeParams),
+    KangarooTwelve(SerializableKangarooTwelveParams),
+}
+
+/// A serializable version of the `KeyAlgorithm` dictionary, used the `SubtleCrypto` interface.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct SerializableKeyAlgorithm {
+    pub name: String,
+}
+
+/// A serializable version of the `RsaHashedKeyAlgorithm` dictionary, used the `SubtleCrypto`
+/// interface.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct SerializableRsaHashedKeyAlgorithm {
+    pub name: String,
+    pub modulus_length: u32,
+    pub public_exponent: Vec<u8>,
+    pub hash: SerializableDigestAlgorithm,
+}
+
+/// A serializable version of the `EcKeyAlgorithm` dictionary, used the `SubtleCrypto` interface.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct SerializableEcKeyAlgorithm {
+    pub name: String,
+    pub named_curve: String,
+}
+
+/// A serializable version of the `AesKeyAlgorithm` dictionary, used the `SubtleCrypto` interface.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct SerializableAesKeyAlgorithm {
+    pub name: String,
+    pub length: u16,
+}
+
+/// A serializable version of the `HmacKeyAlgorithm` dictionary, used the `SubtleCrypto` interface.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct SerializableHmacKeyAlgorithm {
+    pub name: String,
+    pub hash: SerializableDigestAlgorithm,
+    pub length: u32,
+}
+
+/// A serializable version of the `KmacKeyAlgorithm` dictionary, used the `SubtleCrypto` interface.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct SerializableKmacKeyAlgorithm {
+    pub name: String,
+    pub length: u32,
+}
+
+/// A serializable version of the `KeyAlgorithmAndDerivatives` type, used by the `SubtleCrypto`
+/// interface.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub enum SerializableKeyAlgorithmAndDerivatives {
+    KeyAlgorithm(SerializableKeyAlgorithm),
+    RsaHashedKeyAlgorithm(SerializableRsaHashedKeyAlgorithm),
+    EcKeyAlgorithm(SerializableEcKeyAlgorithm),
+    AesKeyAlgorithm(SerializableAesKeyAlgorithm),
+    HmacKeyAlgorithm(SerializableHmacKeyAlgorithm),
+    KmacKeyAlgorithm(SerializableKmacKeyAlgorithm),
+}
+
+/// A serializable version of the `Handle` type, used by the `CryptoKey` interface.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize, Zeroize, ZeroizeOnDrop)]
+pub enum SerializableCryptoKeyHandle {
+    RsaPrivateKey(Vec<u8>),
+    RsaPublicKey(Vec<u8>),
+    P256PrivateKey(Vec<u8>),
+    P384PrivateKey(Vec<u8>),
+    P521PrivateKey(Vec<u8>),
+    P256PublicKey(Vec<u8>),
+    P384PublicKey(Vec<u8>),
+    P521PublicKey(Vec<u8>),
+    Ed25519PrivateKey([u8; 32]),
+    Ed25519PublicKey([u8; 32]),
+    X25519PrivateKey([u8; 32]),
+    X25519PublicKey([u8; 32]),
+    Ed448PrivateKey(Vec<u8>),
+    Ed448PublicKey(Vec<u8>),
+    X448PrivateKey(Vec<u8>),
+    X448PublicKey(Vec<u8>),
+    Aes128Key(Vec<u8>),
+    Aes192Key(Vec<u8>),
+    Aes256Key(Vec<u8>),
+    HkdfSecret(Vec<u8>),
+    Pbkdf2(Vec<u8>),
+    Hmac(Vec<u8>),
+    MlKem512PrivateKey(Vec<u8>),
+    MlKem768PrivateKey(Vec<u8>),
+    MlKem1024PrivateKey(Vec<u8>),
+    MlKem512PublicKey(Vec<u8>),
+    MlKem768PublicKey(Vec<u8>),
+    MlKem1024PublicKey(Vec<u8>),
+    MlDsa44PrivateKey(Vec<u8>),
+    MlDsa65PrivateKey(Vec<u8>),
+    MlDsa87PrivateKey(Vec<u8>),
+    MlDsa44PublicKey(Vec<u8>),
+    MlDsa65PublicKey(Vec<u8>),
+    MlDsa87PublicKey(Vec<u8>),
+    ChaCha20Poly1305Key(Vec<u8>),
+    KmacKey(Vec<u8>),
+    Argon2Password(Vec<u8>),
+}
+
+/// A serializable version of the `CryptoKey` interface.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct SerializableCryptoKey {
+    pub key_type: String,
+    pub extractable: bool,
+    pub algorithm: SerializableKeyAlgorithmAndDerivatives,
+    pub usages: Vec<String>,
+    pub handle: SerializableCryptoKeyHandle,
+}
+
+impl BroadcastClone for SerializableCryptoKey {
+    type Id = CryptoKeyId;
+
+    fn source(data: &StructuredSerializedData) -> &Option<FxHashMap<Self::Id, Self>> {
+        &data.crypto_keys
+    }
+
+    fn destination(data: &mut StructuredSerializedData) -> &mut Option<FxHashMap<Self::Id, Self>> {
+        &mut data.crypto_keys
     }
 
     fn clone_for_broadcast(&self) -> Option<Self> {

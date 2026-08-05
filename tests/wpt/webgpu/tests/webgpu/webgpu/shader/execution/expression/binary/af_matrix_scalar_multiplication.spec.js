@@ -3,14 +3,14 @@
 **/export const description = `
 Execution Tests for matrix-scalar and scalar-matrix AbstractFloat multiplication expression
 `;import { makeTestGroup } from '../../../../../common/framework/test_group.js';
-import { GPUTest } from '../../../../gpu_test.js';
+import { AllFeaturesMaxLimitsGPUTest } from '../../../../gpu_test.js';
 import { Type } from '../../../../util/conversion.js';
 import { onlyConstInputSource, run } from '../expression.js';
 
 import { d } from './af_matrix_scalar_multiplication.cache.js';
-import { abstractFloatBinary } from './binary.js';
+import { abstractFloatBinary, kAbstractFloatMatrixBinaryOpBatchSize } from './binary.js';
 
-export const g = makeTestGroup(GPUTest);
+export const g = makeTestGroup(AllFeaturesMaxLimitsGPUTest);
 
 g.test('matrix_scalar').
 specURL('https://www.w3.org/TR/WGSL/#floating-point-evaluation').
@@ -36,7 +36,8 @@ fn(async (t) => {
     [Type.mat(cols, rows, Type.abstractFloat), Type.abstractFloat],
     Type.mat(cols, rows, Type.abstractFloat),
     t.params,
-    cases
+    cases,
+    kAbstractFloatMatrixBinaryOpBatchSize
   );
 });
 
@@ -64,6 +65,7 @@ fn(async (t) => {
     [Type.abstractFloat, Type.mat(cols, rows, Type.abstractFloat)],
     Type.mat(cols, rows, Type.abstractFloat),
     t.params,
-    cases
+    cases,
+    kAbstractFloatMatrixBinaryOpBatchSize
   );
 });

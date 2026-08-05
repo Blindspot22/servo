@@ -6,27 +6,30 @@
 // information for an approach that we'll likely need to take when the
 // renderer moves to a sandboxed process.
 
+use std::cell::RefCell;
+use std::ffi::c_void;
 use std::fmt;
-use std::io::Cursor;
 use std::ops::Deref;
 use std::sync::Arc;
 
 use app_units::Au;
-use dwrote::{FontCollection, FontFace, FontFile};
+use dwrote::{
+    DWRITE_FONT_AXIS_VALUE, DWRITE_FONT_SIMULATIONS_BOLD, DWRITE_FONT_SIMULATIONS_NONE,
+    FontCollection, FontFace, FontFile, FontSimulations,
+};
 use euclid::default::{Point2D, Rect, Size2D};
-use log::{debug, warn};
+use fonts_traits::LocalFontIdentifier;
+use log::debug;
+use read_fonts::TableProvider;
+use skrifa::Tag;
 use style::Zero;
-use style::computed_values::font_stretch::T as StyleFontStretch;
-use style::computed_values::font_weight::T as StyleFontWeight;
-use style::values::computed::font::FontStyle as StyleFontStyle;
-use truetype::tables::WindowsMetrics;
-use truetype::value::Read;
-use webrender_api::FontInstanceFlags;
+use webrender_api::{FontInstanceFlags, FontVariation};
+use winapi::shared::minwindef::{BOOL, FALSE};
+use winapi::um::wingdi::FW_SEMIBOLD;
 
-use super::font_list::LocalFontIdentifier;
 use crate::{
-    FontData, FontIdentifier, FontMetrics, FontTableMethods, FontTableTag, FontTemplateDescriptor,
-    FractionalPixel, GlyphId, PlatformFontMethods, ot_tag,
+    FontData, FontIdentifier, FontMetrics, FontTableMethods, FontTemplateDescriptor,
+    FractionalPixel, GlyphId, PlatformFontMethods,
 };
 
 // 1em = 12pt = 16px, assuming 72 points per inch and 96 px per inch
@@ -47,14 +50,6 @@ pub struct FontTable {
     data: Vec<u8>,
 }
 
-impl FontTable {
-    pub fn wrap(data: &[u8]) -> FontTable {
-        FontTable {
-            data: data.to_vec(),
-        }
-    }
-}
-
 impl FontTableMethods for FontTable {
     fn buffer(&self) -> &[u8] {
         &self.data
@@ -67,6 +62,7 @@ pub struct PlatformFont {
     em_size: f32,
     du_to_px: f32,
     scaled_du_to_px: f32,
+    variations: Vec<FontVariation>,
 }
 
 // Based on information from the Skia codebase, it seems that DirectWrite APIs from
@@ -92,7 +88,11 @@ impl<T> Deref for Nondebug<T> {
 }
 
 impl PlatformFont {
-    fn new(font_face: FontFace, pt_size: Option<Au>) -> Result<Self, &'static str> {
+    fn new(
+        font_face: FontFace,
+        pt_size: Option<Au>,
+        variations: Vec<FontVariation>,
+    ) -> Result<Self, &'static str> {
         let pt_size = pt_size.unwrap_or(au_from_pt(12.));
         let du_per_em = font_face.metrics().metrics0().designUnitsPerEm as f32;
 
@@ -107,7 +107,73 @@ impl PlatformFont {
             em_size,
             du_to_px: design_units_to_pixels,
             scaled_du_to_px: scaled_design_units_to_pixels,
+            variations,
         })
+    }
+
+    fn new_with_variations(
+        font_face: FontFace,
+        pt_size: Option<Au>,
+        variations: &[FontVariation],
+        synthetic_bold: bool,
+    ) -> Result<Self, &'static str> {
+        // If the font face is already bold, applying synthetic bold would "double embolden" the font
+        let font_face_is_bold = DirectWriteTableProvider::from(&font_face)
+            .os2()
+            .is_ok_and(|os2| os2.us_weight_class() >= FW_SEMIBOLD as u16);
+
+        // Variable fonts do not count as font synthesis and their use is not affected by
+        // the font-synthesis property.
+        //
+        // See <https://www.w3.org/TR/css-fonts-4/#font-synthesis-intro>
+        let is_variable_font = font_face.has_variations();
+
+        let synthetic_bold = !font_face_is_bold && !is_variable_font && synthetic_bold;
+
+        let simulations = match synthetic_bold {
+            true => DWRITE_FONT_SIMULATIONS_BOLD,
+            false => DWRITE_FONT_SIMULATIONS_NONE,
+        };
+
+        if variations.is_empty() {
+            // The font_face created in `new_from_local_font_identifier` may already have some simulations applied
+            let font_face = match font_face.simulations() as u32 == simulations {
+                true => font_face,
+                false => font_face.create_font_face_with_simulations(simulations),
+            };
+            return Self::new(font_face, pt_size, vec![]);
+        }
+
+        // On FreeType and CoreText platforms, the platform layer is able to read the minimum, maxmimum,
+        // and default values of each axis. This doesn't seem possible here and it seems that Gecko
+        // also just sets the value of the axis based on the values from the style as well.
+        //
+        // dwrote (and presumably the Windows APIs) accept a reversed version of the table
+        // tag bytes, which means that `u32::swap_bytes` must be called here in order to
+        // use a byte order compatible with the rest of Servo.
+        let variations: Vec<_> = variations
+            .into_iter()
+            .map(|variation| DWRITE_FONT_AXIS_VALUE {
+                axisTag: variation.tag.swap_bytes(),
+                value: variation.value,
+            })
+            .collect();
+
+        let Some(font_face) = font_face.create_font_face_with_variations(simulations, &variations)
+        else {
+            return Err("Could not adapt FontFace to given variations");
+        };
+
+        let variations = font_face.variations().unwrap_or_default();
+        let variations = variations
+            .iter()
+            .map(|dwrote_variation| FontVariation {
+                tag: dwrote_variation.axisTag.swap_bytes(),
+                value: dwrote_variation.value,
+            })
+            .collect();
+
+        Self::new(font_face, pt_size, variations)
     }
 }
 
@@ -116,119 +182,70 @@ impl PlatformFontMethods for PlatformFont {
         _font_identifier: FontIdentifier,
         data: &FontData,
         pt_size: Option<Au>,
+        variations: &[FontVariation],
+        synthetic_bold: bool,
     ) -> Result<Self, &'static str> {
         let font_face = FontFile::new_from_buffer(Arc::new(data.clone()))
             .ok_or("Could not create FontFile")?
-            .create_face(
-                0, /* face_index */
-                dwrote::DWRITE_FONT_SIMULATIONS_NONE,
-            )
+            .create_face(0 /* face_index */, DWRITE_FONT_SIMULATIONS_NONE)
             .map_err(|_| "Could not create FontFace")?;
-        Self::new(font_face, pt_size)
+        Self::new_with_variations(font_face, pt_size, variations, synthetic_bold)
     }
 
     fn new_from_local_font_identifier(
         font_identifier: LocalFontIdentifier,
         pt_size: Option<Au>,
+        variations: &[FontVariation],
+        synthetic_bold: bool,
     ) -> Result<PlatformFont, &'static str> {
         let font_face = FontCollection::system()
-            .get_font_from_descriptor(&font_identifier.font_descriptor)
+            .font_from_descriptor(&font_identifier.font_descriptor)
+            .ok()
+            .flatten()
             .ok_or("Could not create Font from descriptor")?
             .create_font_face();
-        Self::new(font_face, pt_size)
+        Self::new_with_variations(font_face, pt_size, variations, synthetic_bold)
     }
 
     fn descriptor(&self) -> FontTemplateDescriptor {
-        // We need the font (DWriteFont) in order to be able to query things like
-        // the family name, face name, weight, etc.  On Windows 10, the
-        // DWriteFontFace3 interface provides this on the FontFace, but that's only
-        // available on Win10+.
-        //
-        // Instead, we do the parsing work using the truetype crate for raw fonts.
-        // We're just extracting basic info, so this is sufficient for now.
-        //
-        // The `dwrote` APIs take SFNT table tags in a reversed byte order, which
-        // is why `u32::swap_bytes()` is called here.
-        let windows_metrics_bytes = self
-            .face
-            .get_font_table(u32::swap_bytes(ot_tag!('O', 'S', '/', '2')));
-        if windows_metrics_bytes.is_none() {
-            warn!("Could not find OS/2 table in font.");
-            return FontTemplateDescriptor::default();
-        }
-
-        let mut cursor = Cursor::new(windows_metrics_bytes.as_ref().unwrap());
-        let Ok(table) = WindowsMetrics::read(&mut cursor) else {
-            warn!("Could not read OS/2 table in font.");
-            return FontTemplateDescriptor::default();
-        };
-
-        let (weight_val, width_val, italic_bool) = match table {
-            WindowsMetrics::Version0(ref m) => {
-                (m.weight_class, m.width_class, m.selection_flags.0 & 1 == 1)
-            },
-            WindowsMetrics::Version1(ref m) => {
-                (m.weight_class, m.width_class, m.selection_flags.0 & 1 == 1)
-            },
-            WindowsMetrics::Version2(ref m) |
-            WindowsMetrics::Version3(ref m) |
-            WindowsMetrics::Version4(ref m) => {
-                (m.weight_class, m.width_class, m.selection_flags.0 & 1 == 1)
-            },
-            WindowsMetrics::Version5(ref m) => {
-                (m.weight_class, m.width_class, m.selection_flags.0 & 1 == 1)
-            },
-        };
-
-        let weight = StyleFontWeight::from_float(weight_val as f32);
-        let stretch = match width_val.clamp(1, 9) {
-            1 => StyleFontStretch::ULTRA_CONDENSED,
-            2 => StyleFontStretch::EXTRA_CONDENSED,
-            3 => StyleFontStretch::CONDENSED,
-            4 => StyleFontStretch::SEMI_CONDENSED,
-            5 => StyleFontStretch::NORMAL,
-            6 => StyleFontStretch::SEMI_EXPANDED,
-            7 => StyleFontStretch::EXPANDED,
-            8 => StyleFontStretch::EXTRA_EXPANDED,
-            9 => StyleFontStretch::ULTRA_CONDENSED,
-            _ => {
-                warn!("Unknown stretch size.");
-                StyleFontStretch::NORMAL
-            },
-        };
-
-        let style = if italic_bool {
-            StyleFontStyle::ITALIC
-        } else {
-            StyleFontStyle::NORMAL
-        };
-
-        FontTemplateDescriptor::new(weight, stretch, style)
+        DirectWriteTableProvider::new(self)
+            .os2()
+            .as_ref()
+            .map(Self::descriptor_from_os2_table)
+            .unwrap_or_default()
     }
 
     fn glyph_index(&self, codepoint: char) -> Option<GlyphId> {
-        let glyph = self.face.get_glyph_indices(&[codepoint as u32])[0];
-        if glyph == 0 {
+        let Ok(glyphs) = self.face.glyph_indices(&[codepoint as u32]) else {
+            return None;
+        };
+        let Some(glyph) = glyphs.first() else {
+            return None;
+        };
+        if *glyph == 0 {
             return None;
         }
-        Some(glyph as GlyphId)
+        Some(*glyph as GlyphId)
     }
 
     fn glyph_h_advance(&self, glyph: GlyphId) -> Option<FractionalPixel> {
         if glyph == 0 {
             return None;
         }
-
-        let gm = self.face.get_design_glyph_metrics(&[glyph as u16], false)[0];
-        let f = (gm.advanceWidth as f32 * self.scaled_du_to_px) as FractionalPixel;
-
-        Some(f)
+        let Ok(metrics) = self.face.design_glyph_metrics(&[glyph as u16], false) else {
+            return None;
+        };
+        let Some(glyph_metric) = metrics.first() else {
+            return None;
+        };
+        Some((glyph_metric.advanceWidth as f32 * self.scaled_du_to_px) as FractionalPixel)
     }
 
     fn glyph_h_kerning(&self, first_glyph: GlyphId, second_glyph: GlyphId) -> FractionalPixel {
         let adjustment = self
             .face
-            .get_glyph_pair_kerning_adjustment(first_glyph as u16, second_glyph as u16);
+            .glyph_pair_kerning_adjustment(first_glyph as u16, second_glyph as u16)
+            .unwrap_or_default();
 
         (adjustment as f32 * self.scaled_du_to_px) as FractionalPixel
     }
@@ -284,24 +301,39 @@ impl PlatformFontMethods for PlatformFont {
         metrics
     }
 
-    fn table_for_tag(&self, tag: FontTableTag) -> Option<FontTable> {
+    fn table_for_tag(&self, tag: Tag) -> Option<FontTable> {
         // dwrote (and presumably the Windows APIs) accept a reversed version of the table
         // tag bytes, which means that `u32::swap_bytes` must be called here in order to
         // use a byte order compatible with the rest of Servo.
         self.face
-            .get_font_table(u32::swap_bytes(tag))
+            .font_table(u32::from_be_bytes(tag.to_be_bytes()).swap_bytes())
+            .ok()
+            .flatten()
             .map(|bytes| FontTable { data: bytes })
     }
 
     fn webrender_font_instance_flags(&self) -> FontInstanceFlags {
-        FontInstanceFlags::SUBPIXEL_POSITION
+        let mut flags = FontInstanceFlags::SUBPIXEL_POSITION;
+
+        // TODO: Add support for synthetic italics.
+        // <https://github.com/servo/servo/issues/39637>
+        if matches!(
+            self.face.simulations(),
+            FontSimulations::Bold | FontSimulations::BoldOblique
+        ) {
+            flags |= FontInstanceFlags::SYNTHETIC_BOLD;
+        }
+
+        flags
     }
 
     fn typographic_bounds(&self, glyph_id: GlyphId) -> Rect<f32> {
-        let metrics = self
-            .face
-            .get_design_glyph_metrics(&[glyph_id as u16], false);
-        let metrics = &metrics[0];
+        let Ok(metrics) = self.face.design_glyph_metrics(&[glyph_id as u16], false) else {
+            return Rect::zero();
+        };
+        let Some(metrics) = metrics.first() else {
+            return Rect::zero();
+        };
         let advance_width = metrics.advanceWidth as f32;
         let advance_height = metrics.advanceHeight as f32;
         let left_side_bearing = metrics.leftSideBearing as f32;
@@ -317,5 +349,86 @@ impl PlatformFontMethods for PlatformFont {
             Point2D::new(left_side_bearing, y_offset),
             Size2D::new(width, height),
         )
+    }
+
+    fn variations(&self) -> &[FontVariation] {
+        &self.variations
+    }
+}
+
+/// A wrapper struct around [`PlatformFont`] which is responsible for
+/// implementing [`TableProvider`] and cleaning up any font table contexts from
+/// DirectWrite when the struct is dropped.
+struct DirectWriteTableProvider<'platform_font> {
+    platform_font: &'platform_font FontFace,
+    contexts: RefCell<Vec<*mut c_void>>,
+}
+
+impl<'platform_font> DirectWriteTableProvider<'platform_font> {
+    fn new(platform_font: &'platform_font PlatformFont) -> Self {
+        Self {
+            platform_font: &platform_font.face,
+            contexts: Default::default(),
+        }
+    }
+}
+
+impl<'platform_font> From<&'platform_font FontFace> for DirectWriteTableProvider<'platform_font> {
+    fn from(value: &'platform_font FontFace) -> Self {
+        Self {
+            platform_font: value,
+            contexts: Default::default(),
+        }
+    }
+}
+
+impl Drop for DirectWriteTableProvider<'_> {
+    fn drop(&mut self) {
+        let direct_write_face = unsafe { self.platform_font.as_ptr() };
+        assert!(!direct_write_face.is_null());
+
+        let direct_write_face = unsafe { &*direct_write_face };
+        for context in self.contexts.borrow_mut().drain(..) {
+            unsafe { direct_write_face.ReleaseFontTable(context) };
+        }
+    }
+}
+
+impl<'platform_font> TableProvider<'platform_font> for DirectWriteTableProvider<'platform_font> {
+    fn data_for_tag(&self, tag: Tag) -> Option<read_fonts::FontData<'platform_font>> {
+        let direct_write_face = unsafe { self.platform_font.as_ptr() };
+        if direct_write_face.is_null() {
+            return None;
+        }
+
+        let direct_write_face = unsafe { &*direct_write_face };
+        let direct_write_tag = u32::from_be_bytes(tag.to_be_bytes()).swap_bytes();
+        let mut table_data_ptr: *const u8 = std::ptr::null_mut();
+        let mut table_size: u32 = 0;
+        let mut table_context: *mut c_void = std::ptr::null_mut();
+        let mut exists: BOOL = FALSE;
+
+        let hr = unsafe {
+            direct_write_face.TryGetFontTable(
+                direct_write_tag,
+                &mut table_data_ptr as *mut *const _ as *mut *const c_void,
+                &mut table_size,
+                &mut table_context,
+                &mut exists,
+            )
+        };
+
+        if hr != 0 || exists == 0 {
+            return None;
+        }
+
+        self.contexts.borrow_mut().push(table_context);
+
+        if table_data_ptr.is_null() || table_size == 0 {
+            return None;
+        }
+
+        let bytes = unsafe { std::slice::from_raw_parts(table_data_ptr, table_size as usize) };
+        Some(read_fonts::FontData::new(bytes))
     }
 }

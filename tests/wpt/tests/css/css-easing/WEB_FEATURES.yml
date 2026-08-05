@@ -1,4 +1,5 @@
-features:
-- name: linear-easing
-  files:
-  - linear-timing-*
+rules:
+- linear-timing-*: [linear-easing]
+- step-timing-functions-*: [steps-easing]
+- step-jump-*: [steps-easing]
+- cubic-bezier-timing-functions-output.html: [cubic-bezier-easing]

@@ -3,14 +3,14 @@
 **/export const description = `
 Execution Tests for matrix-matrix AbstractFloat multiplication expression
 `;import { makeTestGroup } from '../../../../../common/framework/test_group.js';
-import { GPUTest } from '../../../../gpu_test.js';
+import { AllFeaturesMaxLimitsGPUTest } from '../../../../gpu_test.js';
 import { Type } from '../../../../util/conversion.js';
 import { onlyConstInputSource, run } from '../expression.js';
 
 import { d } from './af_matrix_matrix_multiplication.cache.js';
-import { abstractFloatBinary } from './binary.js';
+import { abstractFloatBinary, kAbstractFloatMatrixBinaryOpBatchSize } from './binary.js';
 
-export const g = makeTestGroup(GPUTest);
+export const g = makeTestGroup(AllFeaturesMaxLimitsGPUTest);
 
 g.test('matrix_matrix').
 specURL('https://www.w3.org/TR/WGSL/#floating-point-evaluation').
@@ -40,6 +40,7 @@ fn(async (t) => {
     [Type.mat(x_cols, x_rows, Type.abstractFloat), Type.mat(y_cols, y_rows, Type.abstractFloat)],
     Type.mat(y_cols, x_rows, Type.abstractFloat),
     t.params,
-    cases
+    cases,
+    kAbstractFloatMatrixBinaryOpBatchSize
   );
 });

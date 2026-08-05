@@ -7,15 +7,20 @@ use std::io::Read;
 use std::path::PathBuf;
 
 use app_units::Au;
-use euclid::num::Zero;
 use fonts::platform::font::PlatformFont;
 use fonts::{
     Font, FontData, FontDescriptor, FontIdentifier, FontTemplate, FontTemplateRef,
     PlatformFontMethods, ShapingFlags, ShapingOptions,
 };
+use icu_locid::subtags::Language;
 use servo_url::ServoUrl;
+use style::computed_values::font_optical_sizing::T as FontOpticalSizing;
+use style::computed_values::font_variant_position::T as FontVariantPosition;
 use style::properties::longhands::font_variant_caps::computed_value::T as FontVariantCaps;
-use style::values::computed::{FontStretch, FontStyle, FontWeight};
+use style::values::computed::{
+    FontFeatureSettings, FontStretch, FontStyle, FontSynthesis, FontVariantEastAsian,
+    FontVariantLigatures, FontVariantNumeric, FontWeight,
+};
 use unicode_script::Script;
 
 fn make_font(path: PathBuf) -> Font {
@@ -27,19 +32,19 @@ fn make_font(path: PathBuf) -> Font {
     let data = FontData::from_bytes(&bytes);
 
     let identifier = FontIdentifier::Web(ServoUrl::from_file_path(path).unwrap());
-    let platform_font = PlatformFont::new_from_data(identifier.clone(), &data, None).unwrap();
+    let platform_font =
+        PlatformFont::new_from_data(identifier.clone(), &data, None, &[], false).unwrap();
 
-    let template = FontTemplate {
-        identifier,
-        descriptor: platform_font.descriptor(),
-        stylesheet: None,
-    };
+    let template = FontTemplate::new(identifier, platform_font.descriptor(), None);
     let descriptor = FontDescriptor {
         weight: FontWeight::normal(),
         stretch: FontStretch::hundred(),
         style: FontStyle::normal(),
         variant: FontVariantCaps::Normal,
         pt_size: Au::from_px(24),
+        variation_settings: vec![],
+        synthesis_weight: FontSynthesis::Auto,
+        optical_sizing: FontOpticalSizing::Auto,
     };
     Font::new(FontTemplateRef::new(template), descriptor, Some(data), None).unwrap()
 }
@@ -75,9 +80,16 @@ fn test_font_can_do_fast_shaping() {
     // Fast shaping requires a font with a kern table and no GPOS or GSUB tables.
     let shaping_options = ShapingOptions {
         letter_spacing: None,
-        word_spacing: Au::zero(),
+        word_spacing: None,
         script: Script::Latin,
+        language: Language::UND,
         flags: ShapingFlags::empty(),
+        ligatures: FontVariantLigatures::NORMAL,
+        numeric: FontVariantNumeric::NORMAL,
+        east_asian: FontVariantEastAsian::NORMAL,
+        feature_settings: FontFeatureSettings::normal(),
+        position: FontVariantPosition::Normal,
+        alternates: Default::default(),
     };
     assert!(!dejavu_sans.can_do_fast_shaping("WAVE", &shaping_options));
     assert!(dejavu_sans_fast_shapeable.can_do_fast_shaping("WAVE", &shaping_options));
@@ -85,9 +97,16 @@ fn test_font_can_do_fast_shaping() {
     // Non-Latin script should never have fast shaping.
     let shaping_options = ShapingOptions {
         letter_spacing: None,
-        word_spacing: Au::zero(),
+        word_spacing: None,
         script: Script::Cherokee,
+        language: Language::UND,
         flags: ShapingFlags::empty(),
+        ligatures: FontVariantLigatures::NORMAL,
+        numeric: FontVariantNumeric::NORMAL,
+        east_asian: FontVariantEastAsian::NORMAL,
+        feature_settings: FontFeatureSettings::normal(),
+        position: FontVariantPosition::Normal,
+        alternates: Default::default(),
     };
     assert!(!dejavu_sans.can_do_fast_shaping("WAVE", &shaping_options));
     assert!(!dejavu_sans_fast_shapeable.can_do_fast_shaping("WAVE", &shaping_options));
@@ -95,9 +114,16 @@ fn test_font_can_do_fast_shaping() {
     // Right-to-left text should never use fast shaping.
     let shaping_options = ShapingOptions {
         letter_spacing: None,
-        word_spacing: Au::zero(),
+        word_spacing: None,
         script: Script::Latin,
+        language: Language::UND,
         flags: ShapingFlags::RTL_FLAG,
+        ligatures: FontVariantLigatures::NORMAL,
+        numeric: FontVariantNumeric::NORMAL,
+        east_asian: FontVariantEastAsian::NORMAL,
+        feature_settings: FontFeatureSettings::normal(),
+        position: FontVariantPosition::Normal,
+        alternates: Default::default(),
     };
     assert!(!dejavu_sans.can_do_fast_shaping("WAVE", &shaping_options));
     assert!(!dejavu_sans_fast_shapeable.can_do_fast_shaping("WAVE", &shaping_options));

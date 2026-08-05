@@ -6,9 +6,13 @@ use std::f32;
 
 use app_units::{Au, MAX_AU, MIN_AU};
 use euclid::default::{Point2D as UntypedPoint2D, Rect as UntypedRect, Size2D as UntypedSize2D};
-use euclid::{Box2D, Length, Point2D, SideOffsets2D, Size2D, Vector2D};
+use euclid::{Box2D, Length, Point2D, Rect, Scale, SideOffsets2D, Size2D, Vector2D};
 use malloc_size_of_derive::MallocSizeOf;
-use webrender_api::units::{FramebufferPixel, LayoutPoint, LayoutRect, LayoutSize};
+use webrender::FastTransform;
+use webrender_api::units::{
+    DeviceIntRect, DeviceIntSize, DevicePixel, FramebufferPixel, LayoutPixel, LayoutPoint,
+    LayoutRect, LayoutSize,
+};
 
 // Units for use with euclid::length and euclid::scale_factor.
 
@@ -43,12 +47,30 @@ pub type DeviceIndependentPoint = Point2D<f32, DeviceIndependentPixel>;
 pub type DeviceIndependentVector2D = Vector2D<f32, DeviceIndependentPixel>;
 pub type DeviceIndependentSize = Size2D<f32, DeviceIndependentPixel>;
 
+pub type FastLayoutTransform = FastTransform<LayoutPixel, LayoutPixel>;
+
 // An Au is an "App Unit" and represents 1/60th of a CSS pixel.  It was
 // originally proposed in 2002 as a standard unit of measure in Gecko.
 // See https://bugzilla.mozilla.org/show_bug.cgi?id=177805 for more info.
 
 pub trait MaxRect {
     fn max_rect() -> Self;
+}
+
+/// A helper function to convert a Device rect to CSS pixels.
+pub fn convert_rect_to_css_pixel(
+    rect: DeviceIntRect,
+    scale: Scale<f32, DeviceIndependentPixel, DevicePixel>,
+) -> DeviceIndependentIntRect {
+    (rect.to_f32() / scale).round().to_i32()
+}
+
+/// A helper function to convert a Device size to CSS pixels.
+pub fn convert_size_to_css_pixel(
+    size: DeviceIntSize,
+    scale: Scale<f32, DeviceIndependentPixel, DevicePixel>,
+) -> DeviceIndependentIntSize {
+    (size.to_f32() / scale).round().to_i32()
 }
 
 impl MaxRect for UntypedRect<Au> {
@@ -64,16 +86,22 @@ impl MaxRect for UntypedRect<Au> {
 impl MaxRect for LayoutRect {
     #[inline]
     fn max_rect() -> Self {
+        // `LayoutRect` is always consumed by WebRender. WebRender does not accept coordinates
+        // outside of the range of 1e9 * 2. We duplicate this range here.
+        //
+        // See webrender/src/util.rs in the WebRender source directory:
+        // <https://github.com/servo/webrender/blob/fa9f41d84b903b43faa129e2bedbd4e1cc54f2e2/webrender/src/util.rs#L968>
+        const MAX_COORDINATE: f32 = 1.0e9;
         Self::from_origin_and_size(
-            LayoutPoint::new(f32::MIN / 2.0, f32::MIN / 2.0),
-            LayoutSize::new(f32::MAX, f32::MAX),
+            LayoutPoint::new(-MAX_COORDINATE, -MAX_COORDINATE),
+            LayoutSize::new(2.0 * MAX_COORDINATE, 2.0 * MAX_COORDINATE),
         )
     }
 }
 
 /// A helper function to convert a rect of `f32` pixels to a rect of app units.
-pub fn f32_rect_to_au_rect(rect: UntypedRect<f32>) -> UntypedRect<Au> {
-    UntypedRect::new(
+pub fn f32_rect_to_au_rect<T>(rect: Rect<f32, T>) -> Rect<Au, T> {
+    Rect::new(
         Point2D::new(
             Au::from_f32_px(rect.origin.x),
             Au::from_f32_px(rect.origin.y),
@@ -86,8 +114,8 @@ pub fn f32_rect_to_au_rect(rect: UntypedRect<f32>) -> UntypedRect<Au> {
 }
 
 /// A helper function to convert a rect of `Au` pixels to a rect of f32 units.
-pub fn au_rect_to_f32_rect(rect: UntypedRect<Au>) -> UntypedRect<f32> {
-    UntypedRect::new(
+pub fn au_rect_to_f32_rect<T>(rect: Rect<Au, T>) -> Rect<f32, T> {
+    Rect::new(
         Point2D::new(rect.origin.x.to_f32_px(), rect.origin.y.to_f32_px()),
         Size2D::new(rect.size.width.to_f32_px(), rect.size.height.to_f32_px()),
     )

@@ -5,27 +5,23 @@
 //! Handles highlighting selected DOM nodes in the inspector. At the moment it only replies and
 //! changes nothing on Servo's side.
 
-use std::net::TcpStream;
+use std::sync::Arc;
 
-use base::id::PipelineId;
 use devtools_traits::DevtoolScriptControlMsg;
-use ipc_channel::ipc::IpcSender;
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{self, Map, Value};
 
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
-use crate::protocol::JsonPacketStream;
-use crate::{EmptyReplyMsg, StreamId};
+use crate::actor::{Actor, ActorEncode, ActorError, ActorRegistry, base_name, new_actor_name};
+use crate::actors::browsing_context::BrowsingContextActor;
+use crate::actors::inspector::InspectorActor;
+use crate::protocol::ClientRequest;
+use crate::{ActorMsg, EmptyReplyMsg, StreamId};
 
-#[derive(Serialize)]
-pub struct HighlighterMsg {
-    pub actor: String,
-}
-
-pub struct HighlighterActor {
+#[derive(MallocSizeOf)]
+pub(crate) struct HighlighterActor {
     pub name: String,
-    pub script_sender: IpcSender<DevtoolScriptControlMsg>,
-    pub pipeline: PipelineId,
+    pub browsing_context_name: String,
 }
 
 #[derive(Serialize)]
@@ -35,8 +31,8 @@ struct ShowReply {
 }
 
 impl Actor for HighlighterActor {
-    fn name(&self) -> String {
-        self.name.clone()
+    fn name(&self) -> &str {
+        &self.name
     }
 
     /// The highligher actor can handle the following messages:
@@ -44,74 +40,95 @@ impl Actor for HighlighterActor {
     /// - `show`: Enables highlighting for the selected node
     ///
     /// - `hide`: Disables highlighting for the selected node
+    ///
+    /// - `finalize`: Performs cleanup for this actor; currently a no-op
     fn handle_message(
         &self,
+        request: ClientRequest,
         registry: &ActorRegistry,
         msg_type: &str,
         msg: &Map<String, Value>,
-        stream: &mut TcpStream,
         _id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
-        Ok(match msg_type {
+    ) -> Result<(), ActorError> {
+        match msg_type {
             "show" => {
-                let Some(node_actor) = msg.get("node") else {
-                    // TODO: send missing parameter error
-                    return Ok(ActorMessageStatus::Ignored);
+                let Some(node_name) = msg.get("node") else {
+                    return Err(ActorError::MissingParameter);
                 };
 
-                let Some(node_actor_name) = node_actor.as_str() else {
-                    // TODO: send invalid parameter error
-                    return Ok(ActorMessageStatus::Ignored);
+                let Some(node_name) = node_name.as_str() else {
+                    return Err(ActorError::BadParameterType);
                 };
 
-                if node_actor_name.starts_with("inspector") {
+                if node_name.starts_with(base_name::<InspectorActor>()) {
                     // TODO: For some reason, the client initially asks us to highlight
                     // the inspector? Investigate what this is supposed to mean.
                     let msg = ShowReply {
-                        from: self.name(),
+                        from: self.name().into(),
                         value: false,
                     };
-                    let _ = stream.write_json_packet(&msg);
-                    return Ok(ActorMessageStatus::Processed);
+                    return request.reply_final(&msg);
                 }
 
-                self.instruct_script_thread_to_highlight_node(
-                    Some(node_actor_name.to_owned()),
-                    registry,
-                );
+                self.instruct_script_thread_to_highlight_node(Some(node_name.into()), registry);
                 let msg = ShowReply {
-                    from: self.name(),
+                    from: self.name().into(),
                     value: true,
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
 
             "hide" => {
                 self.instruct_script_thread_to_highlight_node(None, registry);
 
-                let msg = EmptyReplyMsg { from: self.name() };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                let msg = EmptyReplyMsg {
+                    from: self.name().into(),
+                };
+                request.reply_final(&msg)?
             },
 
-            _ => ActorMessageStatus::Ignored,
-        })
+            "finalize" => {
+                request.mark_handled();
+            },
+
+            _ => return Err(ActorError::UnrecognizedPacketType),
+        };
+        Ok(())
     }
 }
 
 impl HighlighterActor {
+    pub fn register(registry: &ActorRegistry, browsing_context_name: String) -> Arc<Self> {
+        let name = new_actor_name::<Self>();
+        let actor = Self {
+            name,
+            browsing_context_name,
+        };
+        registry.register::<Self>(actor)
+    }
+
     fn instruct_script_thread_to_highlight_node(
         &self,
-        node_actor: Option<String>,
+        node_name: Option<String>,
         registry: &ActorRegistry,
     ) {
-        let node_id = node_actor.map(|node_actor| registry.actor_to_script(node_actor));
-        self.script_sender
+        let node_id = node_name.map(|node_name| registry.actor_to_script(node_name));
+        let browsing_context_actor =
+            registry.find::<BrowsingContextActor>(&self.browsing_context_name);
+        browsing_context_actor
+            .script_chan()
             .send(DevtoolScriptControlMsg::HighlightDomNode(
-                self.pipeline,
+                browsing_context_actor.pipeline_id(),
                 node_id,
             ))
             .unwrap();
+    }
+}
+
+impl ActorEncode<ActorMsg> for HighlighterActor {
+    fn encode(&self, _: &ActorRegistry) -> ActorMsg {
+        ActorMsg {
+            actor: self.name().into(),
+        }
     }
 }

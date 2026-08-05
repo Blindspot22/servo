@@ -2,19 +2,18 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-// TODO: Is this actor still relevant?
-#![allow(dead_code)]
+use std::sync::Arc;
 
-use std::net::TcpStream;
-
+use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::StreamId;
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
-use crate::protocol::{ActorDescription, JsonPacketStream, Method};
+use crate::actor::{Actor, ActorError, ActorRegistry, new_actor_name};
+use crate::protocol::{ActorDescription, ClientRequest, Method};
 
-pub struct PerformanceActor {
+#[derive(MallocSizeOf)]
+pub(crate) struct PerformanceActor {
     name: String,
 }
 
@@ -56,22 +55,22 @@ struct SuccessMsg {
 enum Error {}
 
 impl Actor for PerformanceActor {
-    fn name(&self) -> String {
-        self.name.clone()
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn handle_message(
         &self,
+        request: ClientRequest,
         _registry: &ActorRegistry,
         msg_type: &str,
         _msg: &Map<String, Value>,
-        stream: &mut TcpStream,
         _id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
-        Ok(match msg_type {
+    ) -> Result<(), ActorError> {
+        match msg_type {
             "connect" => {
                 let msg = ConnectReply {
-                    from: self.name(),
+                    from: self.name().into(),
                     traits: PerformanceTraits {
                         features: PerformanceFeatures {
                             with_markers: true,
@@ -82,28 +81,29 @@ impl Actor for PerformanceActor {
                         },
                     },
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
             "canCurrentlyRecord" => {
                 let msg = CanCurrentlyRecordReply {
-                    from: self.name(),
+                    from: self.name().into(),
                     value: SuccessMsg {
                         success: true,
                         errors: vec![],
                     },
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
-            _ => ActorMessageStatus::Ignored,
-        })
+            _ => return Err(ActorError::UnrecognizedPacketType),
+        };
+        Ok(())
     }
 }
 
 impl PerformanceActor {
-    pub fn new(name: String) -> PerformanceActor {
-        PerformanceActor { name }
+    pub fn register(registry: &ActorRegistry) -> Arc<Self> {
+        let name = new_actor_name::<Self>();
+        let actor = PerformanceActor { name };
+        registry.register::<Self>(actor)
     }
 
     pub fn description() -> ActorDescription {

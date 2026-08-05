@@ -3,7 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use js::rust::HandleObject;
+use script_bindings::reflector::reflect_dom_object_with_proto;
 use stylo_atoms::Atom;
 
 use crate::dom::bindings::codegen::Bindings::EventBinding::Event_Binding::EventMethods;
@@ -12,14 +14,12 @@ use crate::dom::bindings::codegen::Bindings::XRInputSourceEventBinding::{
 };
 use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::reflect_dom_object_with_proto;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::event::Event;
 use crate::dom::window::Window;
 use crate::dom::xrframe::XRFrame;
 use crate::dom::xrinputsource::XRInputSource;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct XRInputSourceEvent {
@@ -29,7 +29,6 @@ pub(crate) struct XRInputSourceEvent {
 }
 
 impl XRInputSourceEvent {
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn new_inherited(frame: &XRFrame, source: &XRInputSource) -> XRInputSourceEvent {
         XRInputSourceEvent {
             event: Event::new_inherited(),
@@ -39,21 +38,20 @@ impl XRInputSourceEvent {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         window: &Window,
         type_: Atom,
         bubbles: bool,
         cancelable: bool,
         frame: &XRFrame,
         source: &XRInputSource,
-        can_gc: CanGc,
     ) -> DomRoot<XRInputSourceEvent> {
-        Self::new_with_proto(
-            window, None, type_, bubbles, cancelable, frame, source, can_gc,
-        )
+        Self::new_with_proto(cx, window, None, type_, bubbles, cancelable, frame, source)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn new_with_proto(
+        cx: &mut JSContext,
         window: &Window,
         proto: Option<HandleObject>,
         type_: Atom,
@@ -61,13 +59,12 @@ impl XRInputSourceEvent {
         cancelable: bool,
         frame: &XRFrame,
         source: &XRInputSource,
-        can_gc: CanGc,
     ) -> DomRoot<XRInputSourceEvent> {
         let trackevent = reflect_dom_object_with_proto(
+            cx,
             Box::new(XRInputSourceEvent::new_inherited(frame, source)),
             window,
             proto,
-            can_gc,
         );
         {
             let event = trackevent.upcast::<Event>();
@@ -78,15 +75,16 @@ impl XRInputSourceEvent {
 }
 
 impl XRInputSourceEventMethods<crate::DomTypeHolder> for XRInputSourceEvent {
-    // https://immersive-web.github.io/webxr/#dom-xrinputsourceevent-xrinputsourceevent
+    /// <https://immersive-web.github.io/webxr/#dom-xrinputsourceevent-xrinputsourceevent>
     fn Constructor(
+        cx: &mut JSContext,
         window: &Window,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
         type_: DOMString,
         init: &XRInputSourceEventBinding::XRInputSourceEventInit,
     ) -> Fallible<DomRoot<XRInputSourceEvent>> {
         Ok(XRInputSourceEvent::new_with_proto(
+            cx,
             window,
             proto,
             Atom::from(type_),
@@ -94,21 +92,20 @@ impl XRInputSourceEventMethods<crate::DomTypeHolder> for XRInputSourceEvent {
             init.parent.cancelable,
             &init.frame,
             &init.inputSource,
-            can_gc,
         ))
     }
 
-    // https://immersive-web.github.io/webxr/#dom-xrinputsourceeventinit-frame
+    /// <https://immersive-web.github.io/webxr/#dom-xrinputsourceeventinit-frame>
     fn Frame(&self) -> DomRoot<XRFrame> {
         DomRoot::from_ref(&*self.frame)
     }
 
-    // https://immersive-web.github.io/webxr/#dom-xrinputsourceeventinit-inputsource
+    /// <https://immersive-web.github.io/webxr/#dom-xrinputsourceeventinit-inputsource>
     fn InputSource(&self) -> DomRoot<XRInputSource> {
         DomRoot::from_ref(&*self.source)
     }
 
-    // https://dom.spec.whatwg.org/#dom-event-istrusted
+    /// <https://dom.spec.whatwg.org/#dom-event-istrusted>
     fn IsTrusted(&self) -> bool {
         self.event.IsTrusted()
     }

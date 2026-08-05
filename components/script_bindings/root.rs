@@ -2,16 +2,18 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::{Cell, UnsafeCell};
+use std::cell::UnsafeCell;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
+use std::rc::Rc;
 use std::{fmt, mem, ptr};
 
-use js::gc::Traceable as JSTraceable;
-use js::jsapi::{JSObject, JSTracer};
+use js::gc::{Handle, Traceable as JSTraceable};
+use js::jsapi::{Heap, JSObject, JSTracer};
+use js::rust::GCMethods;
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
-use style::thread_state;
 
+use crate::assert::assert_in_script;
 use crate::conversions::DerivedFrom;
 use crate::inheritance::Castable;
 use crate::reflector::{DomObject, MutDomObject, Reflector};
@@ -35,18 +37,16 @@ where
     ///
     /// # Safety
     /// It must not outlive its associated `RootCollection`.
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub unsafe fn new(value: T) -> Self {
         unsafe fn add_to_root_list(object: *const dyn JSTraceable) -> *const RootCollection {
             assert_in_script();
             STACK_ROOTS.with(|root_list| {
-                let root_list = &*root_list.get().unwrap();
-                root_list.root(object);
-                root_list
+                unsafe { root_list.root(object) };
+                root_list as *const _
             })
         }
 
-        let root_list = add_to_root_list(value.stable_trace_object());
+        let root_list = unsafe { add_to_root_list(value.stable_trace_object()) };
         Root { value, root_list }
     }
 }
@@ -75,14 +75,17 @@ where
         // The JSTraceable impl for Reflector doesn't actually do anything,
         // so we need this shenanigan to actually trace the reflector of the
         // T pointer in Dom<T>.
-        #[cfg_attr(crown, allow(crown::unrooted_must_root))]
-        struct ReflectorStackRoot(Reflector);
-        unsafe impl JSTraceable for ReflectorStackRoot {
+        #[cfg_attr(crown, expect(crown::unrooted_must_root))]
+        struct ReflectorStackRoot<T>(Reflector<T>);
+        unsafe impl<T> JSTraceable for ReflectorStackRoot<T> {
             unsafe fn trace(&self, tracer: *mut JSTracer) {
-                trace_reflector(tracer, "on stack", &self.0);
+                unsafe { trace_reflector(tracer, "on stack", &self.0) };
             }
         }
-        unsafe { &*(self.reflector() as *const Reflector as *const ReflectorStackRoot) }
+        unsafe {
+            &*(self.reflector() as *const Reflector<T::ReflectorType>
+                as *const ReflectorStackRoot<T::ReflectorType>)
+        }
     }
 }
 
@@ -94,7 +97,6 @@ where
         // The JSTraceable impl for Reflector doesn't actually do anything,
         // so we need this shenanigan to actually trace the reflector of the
         // T pointer in Dom<T>.
-        #[cfg_attr(crown, allow(crown::unrooted_must_root))]
         struct MaybeUnreflectedStackRoot<T>(T);
         unsafe impl<T> JSTraceable for MaybeUnreflectedStackRoot<T>
         where
@@ -102,9 +104,9 @@ where
         {
             unsafe fn trace(&self, tracer: *mut JSTracer) {
                 if self.0.reflector().get_jsobject().is_null() {
-                    self.0.trace(tracer);
+                    unsafe { self.0.trace(tracer) };
                 } else {
-                    trace_reflector(tracer, "on stack", self.0.reflector());
+                    unsafe { trace_reflector(tracer, "on stack", self.0.reflector()) };
                 }
             }
         }
@@ -190,7 +192,6 @@ impl<T> Hash for Dom<T> {
 
 impl<T> Clone for Dom<T> {
     #[inline]
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn clone(&self) -> Self {
         assert_in_script();
         Dom { ptr: self.ptr }
@@ -199,7 +200,6 @@ impl<T> Clone for Dom<T> {
 
 impl<T: DomObject> Dom<T> {
     /// Create a `Dom<T>` from a `&T`
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub fn from_ref(obj: &T) -> Dom<T> {
         assert_in_script();
         Dom {
@@ -229,15 +229,15 @@ impl<T: DomObject> Deref for Dom<T> {
 }
 
 unsafe impl<T: DomObject> JSTraceable for Dom<T> {
-    unsafe fn trace(&self, trc: *mut JSTracer) {
-        let trace_string;
+    unsafe fn trace(&self, tracer: *mut JSTracer) {
         let trace_info = if cfg!(debug_assertions) {
-            trace_string = format!("for {} on heap", ::std::any::type_name::<T>());
-            &trace_string[..]
+            std::any::type_name::<T>()
         } else {
-            "for DOM object on heap"
+            "DOM object on heap"
         };
-        trace_reflector(trc, trace_info, (*self.ptr.as_ptr()).reflector());
+        unsafe {
+            trace_reflector(tracer, trace_info, (*self.ptr.as_ptr()).reflector());
+        }
     }
 }
 
@@ -255,10 +255,19 @@ where
     ///
     /// # Safety
     /// TODO: unclear why this is marked unsafe.
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub unsafe fn from_box(value: Box<T>) -> Self {
         Self {
             ptr: Box::leak(value).into(),
+        }
+    }
+
+    /// Create a new MaybeUnreflectedDom value from the given RCed DOM object.
+    ///
+    /// # Safety
+    /// TODO: unclear why this is marked unsafe.
+    pub unsafe fn from_rc(value: Rc<T>) -> Self {
+        Self {
+            ptr: ptr::NonNull::new(Rc::into_raw(value) as *mut T).unwrap(),
         }
     }
 }
@@ -283,8 +292,8 @@ where
     pub unsafe fn reflect_with(self, obj: *mut JSObject) -> DomRoot<T> {
         let ptr = self.as_ptr();
         drop(self);
-        let root = DomRoot::from_ref(&*ptr);
-        root.init_reflector(obj);
+        let root = DomRoot::from_ref(unsafe { &*ptr });
+        unsafe { root.init_reflector::<T>(obj) };
         root
     }
 }
@@ -327,7 +336,6 @@ impl<T: DomObject> DomRoot<T> {
     ///
     /// This should never be used to create on-stack values. Instead these values should always
     /// end up as members of other DOM objects.
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub fn as_traced(&self) -> Dom<T> {
         Dom::from_ref(self)
     }
@@ -389,9 +397,8 @@ pub struct RootCollection {
 
 impl RootCollection {
     /// Create an empty collection of roots
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> RootCollection {
-        assert_in_script();
+    #[expect(clippy::new_without_default)]
+    pub const fn new() -> RootCollection {
         RootCollection {
             roots: UnsafeCell::new(vec![]),
         }
@@ -400,26 +407,36 @@ impl RootCollection {
     /// Starts tracking a trace object.
     unsafe fn root(&self, object: *const dyn JSTraceable) {
         assert_in_script();
-        (*self.roots.get()).push(object);
+        unsafe { (*self.roots.get()).push(object) };
     }
 
     /// Stops tracking a trace object, asserting if it isn't found.
     unsafe fn unroot(&self, object: *const dyn JSTraceable) {
         assert_in_script();
-        let roots = &mut *self.roots.get();
+        let roots = unsafe { &mut *self.roots.get() };
         match roots
             .iter()
             .rposition(|r| std::ptr::addr_eq(*r as *const (), object as *const ()))
         {
             Some(idx) => {
-                roots.swap_remove(idx);
+                // Partial inlining of `Vec::swap_remove` to avoid having to read and return the value since
+                // we don't care about it, doing less work in our case.
+                // SAFETY: the copy source and destination are derived from valid positions in the vector.
+                unsafe {
+                    let len = roots.len() - 1;
+                    if len != idx {
+                        let base_ptr = roots.as_mut_ptr();
+                        ptr::copy_nonoverlapping(base_ptr.add(len), base_ptr.add(idx), 1);
+                    }
+                    roots.set_len(len);
+                }
             },
             None => panic!("Can't remove a root that was never rooted!"),
         }
     }
 }
 
-thread_local!(pub static STACK_ROOTS: Cell<Option<*const RootCollection>> = const { Cell::new(None) });
+thread_local!(pub static STACK_ROOTS: RootCollection = const { RootCollection::new() });
 
 /// SM Callback that traces the rooted reflectors
 ///
@@ -428,17 +445,13 @@ thread_local!(pub static STACK_ROOTS: Cell<Option<*const RootCollection>> = cons
 pub unsafe fn trace_roots(tracer: *mut JSTracer) {
     trace!("tracing stack roots");
     STACK_ROOTS.with(|collection| {
-        let collection = unsafe { &*(*collection.get().unwrap()).roots.get() };
+        let collection = unsafe { &*collection.roots.get() };
         for root in collection {
             unsafe {
                 (**root).trace(tracer);
             }
         }
     });
-}
-
-pub fn assert_in_script() {
-    debug_assert!(thread_state::get().is_script());
 }
 
 /// Get a slice of references to DOM objects.
@@ -459,4 +472,18 @@ where
         let _ = mem::transmute::<Dom<T>, &T>;
         unsafe { &*(self as *const [Dom<T>] as *const [&T]) }
     }
+}
+
+/// Returns a handle to a Heap member of a reflected DOM object.
+/// The provided callback acts as a projection of the rooted-ness of
+/// the provided DOM object; it must return a reference to a Heap
+/// member of the DOM object.
+pub fn rooted_heap_handle<'a, T: DomObject, U: GCMethods + Copy>(
+    object: &'a T,
+    f: impl Fn(&'a T) -> &'a Heap<U>,
+) -> Handle<'a, U> {
+    // SAFETY: Heap::handle is safe to call when the Heap is a member
+    //   of a rooted object. Our safety invariants for DOM objects
+    //   ensure that a &T is obtained via a root of T.
+    unsafe { Handle::from_raw(f(object).handle()) }
 }

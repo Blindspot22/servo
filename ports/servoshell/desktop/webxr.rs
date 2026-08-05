@@ -4,32 +4,30 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use servo::config::pref;
-use servo::config::prefs::Preferences;
-use servo::webxr::WebXrRegistry;
-use servo::webxr::glwindow::GlWindowDiscovery;
+use servo::webxr::{GlWindowDiscovery, WebXrRegistry};
 #[cfg(target_os = "windows")]
-use servo::webxr::openxr::{AppInfo, OpenXrDiscovery};
+use servo::webxr::{OpenXrAppInfo, OpenXrDiscovery};
+use servo::{Preferences, pref, prefs};
 use winit::event_loop::ActiveEventLoop;
 
-use super::window_trait::WindowPortsMethods;
+use crate::window::PlatformWindow;
 
-#[cfg(feature = "webxr")]
 enum XrDiscovery {
     GlWindow(GlWindowDiscovery),
     #[cfg(target_os = "windows")]
     OpenXr(OpenXrDiscovery),
 }
 
-#[cfg(feature = "webxr")]
 pub(crate) struct XrDiscoveryWebXrRegistry {
     xr_discovery: RefCell<Option<XrDiscovery>>,
 }
 
 impl XrDiscoveryWebXrRegistry {
     pub(crate) fn new_boxed(
-        window: Rc<dyn WindowPortsMethods>,
+        window: Rc<dyn PlatformWindow>,
         event_loop: Option<&ActiveEventLoop>,
         preferences: &Preferences,
     ) -> Box<Self> {
@@ -42,7 +40,7 @@ impl XrDiscoveryWebXrRegistry {
         let xr_discovery = if preferences.dom_webxr_openxr_enabled {
             #[cfg(target_os = "windows")]
             {
-                let app_info = AppInfo::new("Servoshell", 0, "Servo", 0);
+                let app_info = OpenXrAppInfo::new("Servoshell", 0, "Servo", 0);
                 Some(XrDiscovery::OpenXr(OpenXrDiscovery::new(None, app_info)))
             }
             #[cfg(not(target_os = "windows"))]
@@ -60,14 +58,28 @@ impl XrDiscoveryWebXrRegistry {
     }
 }
 
-#[cfg(feature = "webxr")]
+struct XrPrefObserver(Arc<AtomicBool>);
+
+impl prefs::PreferencesObserver for XrPrefObserver {
+    fn prefs_changed(&self, changes: &[(&'static str, prefs::PrefValue)]) {
+        if let Some((_, value)) = changes.iter().find(|(name, _)| *name == "dom_webxr_test") {
+            let prefs::PrefValue::Bool(value) = value else {
+                return;
+            };
+            self.0.store(*value, Ordering::Relaxed);
+        }
+    }
+}
+
 impl WebXrRegistry for XrDiscoveryWebXrRegistry {
     fn register(&self, xr: &mut servo::webxr::MainThreadRegistry) {
-        use servo::webxr::headless::HeadlessMockDiscovery;
+        use servo::webxr::HeadlessMockDiscovery;
 
-        if pref!(dom_webxr_test) {
-            xr.register_mock(HeadlessMockDiscovery::default());
-        } else if let Some(xr_discovery) = self.xr_discovery.take() {
+        let mock_enabled = Arc::new(AtomicBool::new(pref!(dom_webxr_test)));
+        xr.register_mock(HeadlessMockDiscovery::new(mock_enabled.clone()));
+        prefs::add_observer(Box::new(XrPrefObserver(mock_enabled)));
+
+        if let Some(xr_discovery) = self.xr_discovery.take() {
             match xr_discovery {
                 XrDiscovery::GlWindow(discovery) => xr.register(discovery),
                 #[cfg(target_os = "windows")]

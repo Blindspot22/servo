@@ -2,6 +2,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+//! This is a module, but this comment shouldn't trigger an error.
+//* This is also a module doc comment *//
+//This comment should trigger an error, because of missing space.
+
 use    app_units::Au;
 use raqote::{GradientStop, Source, SolidSource};
 use raqote::{Source, SolidSource},
@@ -79,7 +83,10 @@ impl test {
         let xif = 42 in {  xif  } // Should not trigger
     }
 
-    let option = Some(3);
-    println!("{}", option.unwrap());
-    panic!("What a way to end.");
+    //Comment with no space following it, should trigger an error.
+    let a = 3;//This should cause a problem.
+    //~^ This is a compile-test comment and shouldn't cause a problem.
+    // This comment has a URL, but it shouldn't trigger an error http://servo.org.
+    // This comment has a URL, but it shouldn't trigger an error http://servo.org.
+    /* This is another style of comment, but shouldn't trigger an error. */
 }

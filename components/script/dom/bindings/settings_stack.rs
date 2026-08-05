@@ -8,7 +8,7 @@ use js::jsapi::{GetScriptedCallerGlobal, JSTracer};
 use js::rust::Runtime;
 use script_bindings::settings_stack::*;
 
-//use script_bindings::interfaces::{DomHelpers, GlobalScopeHelpers};
+// use script_bindings::interfaces::{DomHelpers, GlobalScopeHelpers};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::trace::JSTraceable;
 use crate::dom::globalscope::GlobalScope;
@@ -20,15 +20,13 @@ thread_local!(pub(super) static STACK: RefCell<Vec<StackEntry<crate::DomTypeHold
 /// Traces the script settings stack.
 pub(crate) unsafe fn trace(tracer: *mut JSTracer) {
     STACK.with(|stack| {
-        stack.borrow().trace(tracer);
+        unsafe { stack.borrow().trace(tracer) };
     })
 }
 
 pub(crate) fn is_execution_stack_empty() -> bool {
     STACK.with(|stack| stack.borrow().is_empty())
 }
-
-pub(crate) type AutoEntryScript = GenericAutoEntryScript<crate::DomTypeHolder>;
 
 /// Returns the ["entry"] global object.
 ///
@@ -45,8 +43,6 @@ pub(crate) fn entry_global() -> DomRoot<GlobalScope> {
         })
         .unwrap()
 }
-
-pub type AutoIncumbentScript = GenericAutoIncumbentScript<crate::DomTypeHolder>;
 
 /// Returns the ["incumbent"] global object.
 ///

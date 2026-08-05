@@ -4,7 +4,7 @@
 
 // https://w3c.github.io/FileAPI/#file
 
-[Exposed=(Window,Worker)]
+[Exposed=(Window,Worker), Serializable]
 interface File : Blob {
   [Throws] constructor(sequence<BlobPart> fileBits,
               DOMString fileName,
@@ -15,4 +15,9 @@ interface File : Blob {
 
 dictionary FilePropertyBag : BlobPropertyBag {
   long long lastModified;
+};
+
+// https://wicg.github.io/entries-api/#file-interface
+partial interface File {
+    [Pref="dom_entries_api_enabled"] readonly attribute USVString webkitRelativePath;
 };

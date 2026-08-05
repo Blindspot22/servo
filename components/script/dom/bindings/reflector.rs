@@ -2,57 +2,39 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! The `Reflector` struct.
+use js::context::JSContext;
+use script_bindings::reflector::DomGlobalGeneric;
+use script_bindings::root::DomRoot;
 
-use js::rust::HandleObject;
-use script_bindings::interfaces::GlobalScopeHelpers;
-
-use crate::DomTypes;
-use crate::dom::bindings::conversions::DerivedFrom;
-use crate::dom::bindings::root::DomRoot;
-use crate::dom::globalscope::GlobalScope;
-use crate::realms::InRealm;
-use crate::script_runtime::CanGc;
-
-/// Create the reflector for a new DOM object and yield ownership to the
-/// reflector.
-pub(crate) fn reflect_dom_object<D, T, U>(obj: Box<T>, global: &U, can_gc: CanGc) -> DomRoot<T>
-where
-    D: DomTypes,
-    T: DomObject + DomObjectWrap<D>,
-    U: DerivedFrom<D::GlobalScope>,
-{
-    let global_scope = global.upcast();
-    unsafe { T::WRAP(D::GlobalScope::get_cx(), global_scope, None, obj, can_gc) }
-}
-
-pub(crate) fn reflect_dom_object_with_proto<D, T, U>(
-    obj: Box<T>,
-    global: &U,
-    proto: Option<HandleObject>,
-    can_gc: CanGc,
-) -> DomRoot<T>
-where
-    D: DomTypes,
-    T: DomObject + DomObjectWrap<D>,
-    U: DerivedFrom<D::GlobalScope>,
-{
-    let global_scope = global.upcast();
-    unsafe { T::WRAP(D::GlobalScope::get_cx(), global_scope, proto, obj, can_gc) }
-}
+use crate::DomTypeHolder;
+use crate::dom::types::GlobalScope;
+use crate::realms::enter_auto_realm;
 
 pub(crate) trait DomGlobal {
-    fn global_(&self, realm: InRealm) -> DomRoot<GlobalScope>;
+    /// Returns the [relevant global] in the same realm as the callee object.
+    /// Will enter the realm of the global to ensure the global is only
+    /// accessed from the correct realm.
+    ///
+    /// [relevant global]: https://html.spec.whatwg.org/multipage/#concept-relevant-global
     fn global(&self) -> DomRoot<GlobalScope>;
 }
 
-impl<T: DomGlobalGeneric<crate::DomTypeHolder>> DomGlobal for T {
-    fn global_(&self, realm: InRealm) -> DomRoot<GlobalScope> {
-        <Self as DomGlobalGeneric<crate::DomTypeHolder>>::global_(self, realm)
-    }
+impl<T: DomGlobalGeneric<DomTypeHolder>> DomGlobal for T {
+    #[expect(unsafe_code)]
     fn global(&self) -> DomRoot<GlobalScope> {
-        <Self as DomGlobalGeneric<crate::DomTypeHolder>>::global(self)
+        // SAFETY: We only use this `cx` to enter a realm. That does not
+        // incur a GC and hence is safe to perform. We do not want to
+        // pass a `cx` as parameter to this function, as this used in
+        // loads of places. At the same time, it also isn't necessary in
+        // nearly all cases to enter realm, since we are already in the
+        // correct realm.
+        //
+        // However, there are cases where it is difficult to ensure that
+        // we are in the correct realm. Hence we always enter a realm here
+        // even if that is unnecessary at times.
+        let cx = unsafe { JSContext::get_from_thread() };
+        let cx = &mut cx.expect("JS runtime has shut down");
+        let _realm = enter_auto_realm(cx, self);
+        <Self as DomGlobalGeneric<DomTypeHolder>>::global_from_reflector(self)
     }
 }
-
-pub(crate) use script_bindings::reflector::*;

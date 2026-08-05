@@ -8,38 +8,35 @@
 
 use std::sync::Arc;
 
-use content_security_policy as csp;
+use net_traits::blob_url_store::UrlWithBlobClaim;
 use net_traits::image_cache::{ImageCache, PendingImageId};
-use net_traits::request::{Destination, RequestBuilder as FetchRequestInit, RequestId};
-use net_traits::{
-    FetchMetadata, FetchResponseListener, FetchResponseMsg, NetworkError, ResourceFetchTiming,
-    ResourceTimingType,
-};
+use net_traits::request::{Destination, InternalRequest, RequestBuilder, RequestId};
+use net_traits::{FetchMetadata, FetchResponseMsg, NetworkError, ResourceFetchTiming};
 use servo_url::ServoUrl;
 
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
+use crate::dom::csp::{GlobalCspReporting, Violation};
 use crate::dom::document::Document;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::node::{Node, NodeTraits};
-use crate::dom::performanceresourcetiming::InitiatorType;
-use crate::network_listener::{self, PreInvoke, ResourceTimingListener};
-use crate::script_runtime::CanGc;
+use crate::dom::performance::performanceresourcetiming::InitiatorType;
+use crate::fetch::RequestWithGlobalScope;
+use crate::network_listener::{self, FetchResponseListener, ResourceTimingListener};
 
 struct LayoutImageContext {
     id: PendingImageId,
     cache: Arc<dyn ImageCache>,
-    resource_timing: ResourceFetchTiming,
     doc: Trusted<Document>,
     url: ServoUrl,
 }
 
 impl FetchResponseListener for LayoutImageContext {
     fn process_request_body(&mut self, _: RequestId) {}
-    fn process_request_eof(&mut self, _: RequestId) {}
     fn process_response(
         &mut self,
+        _: &mut js::context::JSContext,
         request_id: RequestId,
         metadata: Result<FetchMetadata, NetworkError>,
     ) {
@@ -49,39 +46,47 @@ impl FetchResponseListener for LayoutImageContext {
         );
     }
 
-    fn process_response_chunk(&mut self, request_id: RequestId, payload: Vec<u8>) {
+    fn process_response_chunk(
+        &mut self,
+        _: &mut js::context::JSContext,
+        request_id: RequestId,
+        payload: Vec<u8>,
+    ) {
         self.cache.notify_pending_response(
             self.id,
-            FetchResponseMsg::ProcessResponseChunk(request_id, payload),
+            FetchResponseMsg::ProcessResponseChunk(request_id, payload.into()),
         );
     }
 
     fn process_response_eof(
-        &mut self,
+        self,
+        cx: &mut js::context::JSContext,
         request_id: RequestId,
-        response: Result<ResourceFetchTiming, NetworkError>,
+        response: Result<(), NetworkError>,
+        timing: ResourceFetchTiming,
     ) {
         self.cache.notify_pending_response(
             self.id,
-            FetchResponseMsg::ProcessResponseEOF(request_id, response),
+            FetchResponseMsg::ProcessResponseEOF(request_id, response.clone(), timing.clone()),
         );
+        network_listener::submit_timing(cx, &self, &response, &timing);
     }
 
-    fn resource_timing_mut(&mut self) -> &mut ResourceFetchTiming {
-        &mut self.resource_timing
-    }
-
-    fn resource_timing(&self) -> &ResourceFetchTiming {
-        &self.resource_timing
-    }
-
-    fn submit_resource_timing(&mut self) {
-        network_listener::submit_timing(self, CanGc::note())
-    }
-
-    fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<csp::Violation>) {
+    fn process_csp_violations(
+        &mut self,
+        cx: &mut js::context::JSContext,
+        _request_id: RequestId,
+        violations: Vec<Violation>,
+    ) {
         let global = &self.resource_timing_global();
-        global.report_csp_violations(violations);
+        global.report_csp_violations(cx, violations, None, None);
+    }
+
+    fn process_content_length(&mut self, request_id: RequestId, size: usize) {
+        self.cache.notify_pending_response(
+            self.id,
+            FetchResponseMsg::ProcessContentLength(request_id, size),
+        );
     }
 }
 
@@ -95,34 +100,30 @@ impl ResourceTimingListener for LayoutImageContext {
     }
 }
 
-impl PreInvoke for LayoutImageContext {}
-
 pub(crate) fn fetch_image_for_layout(
     url: ServoUrl,
     node: &Node,
     id: PendingImageId,
+    is_internal_request: InternalRequest,
     cache: Arc<dyn ImageCache>,
 ) {
     let document = node.owner_document();
     let context = LayoutImageContext {
         id,
         cache,
-        resource_timing: ResourceFetchTiming::new(ResourceTimingType::Resource),
         doc: Trusted::new(&document),
         url: url.clone(),
     };
 
-    let request = FetchRequestInit::new(
+    let global = node.owner_global();
+    let request = RequestBuilder::new(
         Some(document.webview_id()),
-        url,
-        document.global().get_referrer(),
+        UrlWithBlobClaim::from_url_without_having_claimed_blob(url),
+        global.get_referrer(),
     )
-    .origin(document.origin().immutable().clone())
     .destination(Destination::Image)
-    .pipeline_id(Some(document.global().pipeline_id()))
-    .insecure_requests_policy(document.insecure_requests_policy())
-    .has_trustworthy_ancestor_origin(document.has_trustworthy_ancestor_origin())
-    .policy_container(document.policy_container().to_owned());
+    .is_internal_request(is_internal_request)
+    .with_global_scope(&global);
 
     // Layout image loads do not delay the document load event.
     document.fetch_background(request, context);

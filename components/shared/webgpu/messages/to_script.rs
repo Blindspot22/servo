@@ -4,13 +4,13 @@
 
 //! IPC messages that are sent to the ScriptThread.
 
-use base::id::PipelineId;
 use serde::{Deserialize, Serialize};
+use servo_base::id::PipelineId;
 use wgpu_core::id::{
-    AdapterId, BindGroupId, BindGroupLayoutId, BufferId, CommandBufferId, ComputePassEncoderId,
-    ComputePipelineId, DeviceId, PipelineLayoutId, QuerySetId, RenderBundleId, RenderPassEncoderId,
-    RenderPipelineId, SamplerId, ShaderModuleId, StagingBufferId, SurfaceId, TextureId,
-    TextureViewId,
+    AdapterId, BindGroupId, BindGroupLayoutId, BufferId, CommandBufferId, CommandEncoderId,
+    ComputePassEncoderId, ComputePipelineId, DeviceId, ExternalTextureId, PipelineLayoutId,
+    QuerySetId, RenderBundleEncoderId, RenderBundleId, RenderPassEncoderId, RenderPipelineId,
+    SamplerId, ShaderModuleId, StagingBufferId, SurfaceId, TextureId, TextureViewId,
 };
 
 use crate::{DeviceLostReason, Error, WebGPUDevice};
@@ -28,6 +28,7 @@ pub enum WebGPUMsg {
     FreeRenderPipeline(RenderPipelineId),
     FreeBindGroup(BindGroupId),
     FreeBindGroupLayout(BindGroupLayoutId),
+    FreeCommandEncoder(CommandEncoderId),
     FreeCommandBuffer(CommandBufferId),
     FreeTexture(TextureId),
     FreeTextureView(TextureViewId),
@@ -39,6 +40,8 @@ pub enum WebGPUMsg {
     FreeQuerySet(QuerySetId),
     FreeComputePass(ComputePassEncoderId),
     FreeRenderPass(RenderPassEncoderId),
+    FreeExternalTexture(ExternalTextureId),
+    FreeRenderBundleEncoder(RenderBundleEncoderId),
     UncapturedError {
         device: WebGPUDevice,
         pipeline_id: PipelineId,

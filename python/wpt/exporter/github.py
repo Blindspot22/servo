@@ -16,9 +16,9 @@ day be entirely replaced with something like PyGithub."""
 from __future__ import annotations
 
 import logging
-import urllib
+import urllib.parse
 
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING, Any
 
 import requests
 
@@ -29,7 +29,7 @@ USER_AGENT = "Servo web-platform-test sync service"
 TIMEOUT = 30  # 30 seconds
 
 
-def authenticated(sync: WPTSync, method, url, json=None) -> requests.Response:
+def authenticated(sync: WPTSync, method: str, url: str, json: dict[str, Any] | None = None) -> requests.Response:
     logging.info("  → Request: %s %s", method, url)
     if json:
         logging.info("  → Request JSON: %s", json)
@@ -40,13 +40,9 @@ def authenticated(sync: WPTSync, method, url, json=None) -> requests.Response:
     }
 
     url = urllib.parse.urljoin(sync.github_api_url, url)
-    response = requests.request(
-        method, url, headers=headers, json=json, timeout=TIMEOUT
-    )
+    response = requests.request(method, url, headers=headers, json=json, timeout=TIMEOUT)
     if int(response.status_code / 100) != 2:
-        raise ValueError(
-            f"Got unexpected {response.status_code} response: {response.text}"
-        )
+        raise ValueError(f"Got unexpected {response.status_code} response: {response.text}")
     return response
 
 
@@ -55,14 +51,14 @@ class GithubRepository:
     This class allows interacting with a single GitHub repository.
     """
 
-    def __init__(self, sync: WPTSync, repo: str, default_branch: str):
+    def __init__(self, sync: WPTSync, repo: str, default_branch: str) -> None:
         self.sync = sync
         self.repo = repo
         self.default_branch = default_branch
         self.org = repo.split("/")[0]
         self.pulls_url = f"repos/{self.repo}/pulls"
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.repo
 
     def get_pull_request(self, number: int) -> PullRequest:
@@ -71,40 +67,34 @@ class GithubRepository:
     def get_branch(self, name: str) -> GithubBranch:
         return GithubBranch(self, name)
 
-    def get_open_pull_request_for_branch(
-        self,
-        github_username: str,
-        branch: GithubBranch
-    ) -> Optional[PullRequest]:
+    def get_open_pull_request_for_branch(self, github_username: str, branch: GithubBranch) -> Optional[PullRequest]:
         """If this repository has an open pull request with the
         given source head reference targeting the main branch,
         return the first matching pull request, otherwise return None."""
 
-        params = "+".join([
-            "is:pr",
-            "state:open",
-            f"repo:{self.repo}",
-            f"author:{github_username}",
-            f"head:{branch.name}",
-        ])
+        params = "+".join(
+            [
+                "is:pr",
+                "state:open",
+                f"repo:{self.repo}",
+                f"author:{github_username}",
+                f"head:{branch.name}",
+            ]
+        )
         response = authenticated(self.sync, "GET", f"search/issues?q={params}")
         if int(response.status_code / 100) != 2:
             return None
 
         json = response.json()
-        if not isinstance(json, dict) or \
-           "total_count" not in json or \
-           "items" not in json:
-            raise ValueError(
-                f"Got unexpected response from GitHub search: {response.text}"
-            )
+        if not isinstance(json, dict) or "total_count" not in json or "items" not in json:
+            raise ValueError(f"Got unexpected response from GitHub search: {response.text}")
 
         if json["total_count"] < 1:
             return None
 
         return self.get_pull_request(json["items"][0]["number"])
 
-    def open_pull_request(self, branch: GithubBranch, title: str, body: str):
+    def open_pull_request(self, branch: GithubBranch, title: str, body: str) -> PullRequest:
         data = {
             "title": title,
             "head": branch.get_pr_head_reference_for_repo(self),
@@ -117,11 +107,11 @@ class GithubRepository:
 
 
 class GithubBranch:
-    def __init__(self, repo: GithubRepository, branch_name: str):
+    def __init__(self, repo: GithubRepository, branch_name: str) -> None:
         self.repo = repo
         self.name = branch_name
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f"{self.repo}/{self.name}"
 
     def get_pr_head_reference_for_repo(self, other_repo: GithubRepository) -> str:
@@ -138,30 +128,28 @@ class PullRequest:
     This class allows interacting with a single pull request on GitHub.
     """
 
-    def __init__(self, repo: GithubRepository, number: int):
+    def __init__(self, repo: GithubRepository, number: int) -> None:
         self.repo = repo
         self.context = repo.sync
         self.number = number
         self.base_url = f"repos/{self.repo.repo}/pulls/{self.number}"
         self.base_issues_url = f"repos/{self.repo.repo}/issues/{self.number}"
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f"{self.repo}#{self.number}"
 
-    def api(self, *args, **kwargs) -> requests.Response:
+    def api(self, *args: Any, **kwargs: dict[str, Any]) -> requests.Response:
         return authenticated(self.context, *args, **kwargs)
 
-    def leave_comment(self, comment: str):
-        return self.api(
-            "POST", f"{self.base_issues_url}/comments", json={"body": comment}
-        )
+    def leave_comment(self, comment: str) -> requests.Response:
+        return self.api("POST", f"{self.base_issues_url}/comments", json={"body": comment})
 
     def change(
         self,
         state: Optional[str] = None,
         title: Optional[str] = None,
         body: Optional[str] = None,
-    ):
+    ) -> requests.Response:
         data = {}
         if title:
             data["title"] = title
@@ -171,11 +159,12 @@ class PullRequest:
             data["state"] = state
         return self.api("PATCH", self.base_url, json=data)
 
-    def remove_label(self, label: str):
+    def remove_label(self, label: str) -> None:
         self.api("DELETE", f"{self.base_issues_url}/labels/{label}")
 
-    def add_labels(self, labels: list[str]):
-        self.api("POST", f"{self.base_issues_url}/labels", json=labels)
+    def add_labels(self, labels: list[str]) -> None:
+        data = {"labels": labels}
+        self.api("POST", f"{self.base_issues_url}/labels", json=data)
 
-    def merge(self):
+    def merge(self) -> None:
         self.api("PUT", f"{self.base_url}/merge", json={"merge_method": "rebase"})

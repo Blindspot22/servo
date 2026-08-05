@@ -2,10 +2,13 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::time::{Duration, SystemTime};
+
 use net::cookie::ServoCookie;
 use net::cookie_storage::CookieStorage;
 use net_traits::CookieSource;
 use servo_url::ServoUrl;
+use time::macros::datetime;
 
 #[test]
 fn test_domain_match() {
@@ -100,6 +103,14 @@ fn fn_cookie_constructor() {
     let u = &ServoUrl::parse("http://example.com/foobar").unwrap();
     let cookie = cookie::Cookie::parse("foobar=value;path=/").unwrap();
     assert!(ServoCookie::new_wrapped(cookie, u, CookieSource::HTTP).is_some());
+
+    let cookie = cookie::Cookie::parse("foo=bar; max-age=99999999999999999999999999999").unwrap();
+    let cookie = ServoCookie::new_wrapped(cookie, u, CookieSource::HTTP).unwrap();
+    assert!(
+        cookie
+            .expiry_time
+            .is_some_and(|exp| exp < SystemTime::now() + Duration::from_secs(401 * 24 * 60 * 60))
+    );
 }
 
 #[test]
@@ -209,6 +220,36 @@ fn add_cookie_to_storage(storage: &mut CookieStorage, url: &ServoUrl, cookie_str
     let cookie = cookie::Cookie::parse(cookie_str.to_owned()).unwrap();
     let cookie = ServoCookie::new_wrapped(cookie, url, source).unwrap();
     storage.push(cookie, url, source);
+}
+
+fn assert_ip_cookie_bucket_collision_eviction(ip_a: &str, ip_b: &str) {
+    let mut storage = CookieStorage::new(5);
+    let ip_a = ServoUrl::parse(ip_a).unwrap();
+    let ip_b = ServoUrl::parse(ip_b).unwrap();
+    let source = CookieSource::HTTP;
+
+    for i in 1..=3 {
+        add_cookie_to_storage(&mut storage, &ip_a, &format!("a{i}=val{i}"));
+    }
+
+    for i in 1..=5 {
+        add_cookie_to_storage(&mut storage, &ip_b, &format!("b{i}=val{i}"));
+    }
+
+    let cookies_a = storage.cookies_for_url(&ip_a, source).unwrap();
+    assert_eq!(cookies_a.split("; ").count(), 3);
+    for i in 1..=3 {
+        assert!(cookies_a.contains(&format!("a{i}=val{i}")));
+    }
+}
+
+#[test]
+fn test_ip_cookie_bucket_collision_eviction() {
+    assert_ip_cookie_bucket_collision_eviction("http://192.168.0.1/path", "http://10.0.0.1/path");
+    assert_ip_cookie_bucket_collision_eviction(
+        "http://[2001:db8::1]/path",
+        "http://[2001:db8::2]/path",
+    );
 }
 
 #[test]
@@ -361,7 +402,7 @@ fn add_retrieve_cookies(
 
     // Add all cookies to the store
     for str_cookie in set_cookies {
-        let cookie = ServoCookie::from_cookie_string(str_cookie.to_owned(), &url, source).unwrap();
+        let cookie = ServoCookie::from_cookie_string(str_cookie, &url, source).unwrap();
         storage.push(cookie, &url, source);
     }
 
@@ -382,7 +423,7 @@ fn test_cookie_eviction_expired() {
         );
         vec.push(st);
     }
-    vec.push("foo=bar; Secure; expires=Sun, 18-Apr-2027 21:06:29 GMT".to_owned());
+    vec.push("foo=bar; Secure; expires=Sun, 18-Apr-2127 21:06:29 GMT".to_owned());
     let r = add_retrieve_cookies(
         "https://home.example.org:8888/cookie-parser?0001",
         &vec,
@@ -396,13 +437,13 @@ fn test_cookie_eviction_all_secure_one_nonsecure() {
     let mut vec = Vec::new();
     for i in 1..5 {
         let st = format!(
-            "extra{}=bar; Secure; expires=Sun, 18-Apr-2026 21:06:29 GMT",
+            "extra{}=bar; Secure; expires=Sun, 18-Apr-2126 21:06:29 GMT",
             i
         );
         vec.push(st);
     }
-    vec.push("foo=bar; expires=Sun, 18-Apr-2026 21:06:29 GMT".to_owned());
-    vec.push("foo2=bar; Secure; expires=Sun, 18-Apr-2028 21:06:29 GMT".to_owned());
+    vec.push("foo=bar; expires=Sun, 18-Apr-2126 21:06:29 GMT".to_owned());
+    vec.push("foo2=bar; Secure; expires=Sun, 18-Apr-2128 21:06:29 GMT".to_owned());
     let r = add_retrieve_cookies(
         "https://home.example.org:8888/cookie-parser?0001",
         &vec,
@@ -419,12 +460,12 @@ fn test_cookie_eviction_all_secure_new_nonsecure() {
     let mut vec = Vec::new();
     for i in 1..6 {
         let st = format!(
-            "extra{}=bar; Secure; expires=Sun, 18-Apr-2026 21:06:29 GMT",
+            "extra{}=bar; Secure; expires=Sun, 18-Apr-2126 21:06:29 GMT",
             i
         );
         vec.push(st);
     }
-    vec.push("foo=bar; expires=Sun, 18-Apr-2077 21:06:29 GMT".to_owned());
+    vec.push("foo=bar; expires=Sun, 18-Apr-2177 21:06:29 GMT".to_owned());
     let r = add_retrieve_cookies(
         "https://home.example.org:8888/cookie-parser?0001",
         &vec,
@@ -440,10 +481,10 @@ fn test_cookie_eviction_all_secure_new_nonsecure() {
 fn test_cookie_eviction_all_nonsecure_new_secure() {
     let mut vec = Vec::new();
     for i in 1..6 {
-        let st = format!("extra{}=bar; expires=Sun, 18-Apr-2026 21:06:29 GMT", i);
+        let st = format!("extra{}=bar; expires=Sun, 18-Apr-2126 21:06:29 GMT", i);
         vec.push(st);
     }
-    vec.push("foo=bar; Secure; expires=Sun, 18-Apr-2077 21:06:29 GMT".to_owned());
+    vec.push("foo=bar; Secure; expires=Sun, 18-Apr-2177 21:06:29 GMT".to_owned());
     let r = add_retrieve_cookies(
         "https://home.example.org:8888/cookie-parser?0001",
         &vec,
@@ -459,10 +500,10 @@ fn test_cookie_eviction_all_nonsecure_new_secure() {
 fn test_cookie_eviction_all_nonsecure_new_nonsecure() {
     let mut vec = Vec::new();
     for i in 1..6 {
-        let st = format!("extra{}=bar; expires=Sun, 18-Apr-2026 21:06:29 GMT", i);
+        let st = format!("extra{}=bar; expires=Sun, 18-Apr-2126 21:06:29 GMT", i);
         vec.push(st);
     }
-    vec.push("foo=bar; expires=Sun, 18-Apr-2077 21:06:29 GMT".to_owned());
+    vec.push("foo=bar; expires=Sun, 18-Apr-2177 21:06:29 GMT".to_owned());
     let r = add_retrieve_cookies(
         "https://home.example.org:8888/cookie-parser?0001",
         &vec,
@@ -471,5 +512,102 @@ fn test_cookie_eviction_all_nonsecure_new_nonsecure() {
     assert_eq!(
         &r,
         "extra2=bar; extra3=bar; extra4=bar; extra5=bar; foo=bar"
+    );
+}
+
+#[test]
+fn test_parse_date() {
+    assert_eq!(
+        ServoCookie::parse_date("26 Jun 2024 15:35:10 GMT"), // without day of week
+        Some(datetime!(2024-06-26 15:35:10).assume_utc())
+    );
+    assert_eq!(
+        ServoCookie::parse_date("26-Jun-2024 15:35:10 GMT"), // dashed
+        Some(datetime!(2024-06-26 15:35:10).assume_utc())
+    );
+    assert_eq!(
+        ServoCookie::parse_date("26 Jun 2024 15:35:10"), // no GMT
+        Some(datetime!(2024-06-26 15:35:10).assume_utc())
+    );
+    assert_eq!(
+        ServoCookie::parse_date("26 Jun 24 15:35:10 GMT"), // 2-digit year
+        Some(datetime!(2024-06-26 15:35:10).assume_utc())
+    );
+    assert_eq!(
+        ServoCookie::parse_date("26 jun 2024 15:35:10 gmt"), // Lowercase
+        Some(datetime!(2024-06-26 15:35:10).assume_utc())
+    );
+}
+
+#[test]
+fn test_clear_storage_for_url_expires_matching_cookies() {
+    let mut storage = CookieStorage::new(5);
+    let source = CookieSource::HTTP;
+    let url = ServoUrl::parse("http://example.com/").unwrap();
+
+    add_cookie_to_storage(&mut storage, &url, "foo=bar");
+    assert_eq!(
+        storage.cookies_for_url(&url, source).as_deref(),
+        Some("foo=bar")
+    );
+
+    storage.clear_storage(Some(&url));
+
+    storage.remove_expired_cookies_for_url(&url);
+    assert_eq!(storage.cookies_for_url(&url, source), None);
+}
+
+#[test]
+fn test_clear_storage_without_url_clears_everything() {
+    let mut storage = CookieStorage::new(5);
+    let source = CookieSource::HTTP;
+    let url = ServoUrl::parse("http://example.com/").unwrap();
+    let other_url = ServoUrl::parse("http://example.org/").unwrap();
+
+    add_cookie_to_storage(&mut storage, &url, "foo=bar");
+    add_cookie_to_storage(&mut storage, &other_url, "baz=qux");
+
+    storage.clear_storage(None);
+
+    assert!(storage.cookie_site_descriptors().is_empty());
+    assert_eq!(storage.cookies_for_url(&url, source), None);
+    assert_eq!(storage.cookies_for_url(&other_url, source), None);
+}
+
+#[test]
+fn test_delete_cookie_with_name_expires_only_matching_cookie() {
+    let mut storage = CookieStorage::new(5);
+    let source = CookieSource::HTTP;
+    let url = ServoUrl::parse("http://example.com/").unwrap();
+
+    add_cookie_to_storage(&mut storage, &url, "foo=bar");
+    add_cookie_to_storage(&mut storage, &url, "baz=qux");
+
+    storage.delete_cookie_with_name(&url, "foo".to_owned());
+
+    storage.remove_expired_cookies_for_url(&url);
+    assert_eq!(
+        storage.cookies_for_url(&url, source).as_deref(),
+        Some("baz=qux")
+    );
+}
+
+#[test]
+fn test_delete_cookie_with_name_does_not_affect_other_domains() {
+    let mut storage = CookieStorage::new(5);
+    let source = CookieSource::HTTP;
+    let url = ServoUrl::parse("http://example.com/").unwrap();
+    let other_url = ServoUrl::parse("http://example.org/").unwrap();
+
+    add_cookie_to_storage(&mut storage, &url, "foo=bar");
+    add_cookie_to_storage(&mut storage, &other_url, "foo=bar");
+
+    storage.delete_cookie_with_name(&url, "foo".to_owned());
+
+    storage.remove_all_expired_cookies();
+    assert_eq!(storage.cookies_for_url(&url, source), None);
+    assert_eq!(
+        storage.cookies_for_url(&other_url, source).as_deref(),
+        Some("foo=bar")
     );
 }

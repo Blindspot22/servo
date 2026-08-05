@@ -88,26 +88,48 @@ const kTypeCases = {
       var x : i32 = 1;
       let y : i32 = x;`,
     valid: true
+  },
+  texture_2d: {
+    code: `let x = tex2d;`,
+    valid: 'texture_and_sampler_let',
+    decls: `@group(0) @binding(0) var tex2d : texture_2d<f32>;`
+  },
+  texture_storage_1d: {
+    code: `let x : texture_storage_1d<rgba32float, write> = tex1d;`,
+    valid: 'texture_and_sampler_let',
+    decls: `@group(0) @binding(0) var tex1d : texture_storage_1d<rgba32float, write>;`
+  },
+  sampler: {
+    code: `let s = samp;`,
+    valid: 'texture_and_sampler_let',
+    decls: `@group(0) @binding(0) var samp : sampler;`
+  },
+  sampler_comparison: {
+    code: `let s : sampler_comparison = samp_comp;`,
+    valid: 'texture_and_sampler_let',
+    decls: `@group(0) @binding(0) var samp_comp : sampler_comparison;`
   }
 };
 
 g.test('type').
 desc('Test let types').
 params((u) => u.combine('case', keysOf(kTypeCases))).
-beforeAllSubcases((t) => {
-  if (t.params.case === 'f16') {
-    t.selectDeviceOrSkipTestCase('shader-f16');
-  }
-}).
 fn((t) => {
+  if (t.params.case === 'f16') {
+    t.skipIfDeviceDoesNotHaveFeature('shader-f16');
+  }
   const testcase = kTypeCases[t.params.case];
+
   const code = `
 ${t.params.case === 'f16' ? 'enable f16;' : ''}
 ${testcase.decls ?? ''}
 fn foo() {
   ${testcase.code}
 }`;
-  const expect = testcase.valid;
+  let expect = testcase.valid === true;
+  if (testcase.valid === 'texture_and_sampler_let') {
+    expect = t.hasLanguageFeature('texture_and_sampler_let');
+  }
   t.expectCompileResult(expect, code);
 });
 
@@ -169,7 +191,7 @@ fn foo() {
   ${testcase.code}
 }`;
   const expect = testcase.valid;
-  t.expectCompileResult(expect, code);
+  t.expectCompileResult(expect === true, code);
 });
 
 g.test('module_scope').

@@ -7,7 +7,9 @@ use std::fmt;
 
 use app_units::Au;
 use malloc_size_of_derive::MallocSizeOf;
+use script::layout_dom::ServoLayoutNode;
 use servo_arc::Arc;
+use style::context::SharedStyleContext;
 use style::properties::ComputedValues;
 use stylo_taffy::TaffyStyloStyle;
 
@@ -15,16 +17,16 @@ use crate::PropagatedBoxTreeData;
 use crate::cell::ArcRefCell;
 use crate::construct_modern::{ModernContainerBuilder, ModernItemKind};
 use crate::context::LayoutContext;
-use crate::dom::LayoutBox;
+use crate::dom::{LayoutBox, WeakLayoutBox};
 use crate::dom_traversal::{NodeAndStyleInfo, NonReplacedContents};
 use crate::formatting_contexts::IndependentFormattingContext;
 use crate::fragment_tree::Fragment;
+use crate::layout_box_base::LayoutBoxBase;
 use crate::positioned::{AbsolutelyPositionedBox, PositioningContext};
 
 #[derive(Debug, MallocSizeOf)]
 pub(crate) struct TaffyContainer {
     children: Vec<ArcRefCell<TaffyItemBox>>,
-    #[conditional_malloc_size_of]
     style: Arc<ComputedValues>,
 }
 
@@ -35,32 +37,35 @@ impl TaffyContainer {
         contents: NonReplacedContents,
         propagated_data: PropagatedBoxTreeData,
     ) -> Self {
-        let mut builder =
-            ModernContainerBuilder::new(context, info, propagated_data.union(&info.style));
+        let mut builder = ModernContainerBuilder::new(context, info, propagated_data);
         contents.traverse(context, info, &mut builder);
         let items = builder.finish();
 
         let children = items
             .into_iter()
             .map(|item| {
-                let box_ = match item.kind {
-                    ModernItemKind::InFlow => ArcRefCell::new(TaffyItemBox::new(
-                        TaffyItemBoxInner::InFlowBox(item.formatting_context),
-                    )),
-                    ModernItemKind::OutOfFlow => {
-                        let abs_pos_box =
-                            ArcRefCell::new(AbsolutelyPositionedBox::new(item.formatting_context));
+                let taffy_item_box = match item.kind {
+                    ModernItemKind::InFlow(independent_formatting_context) => {
+                        ArcRefCell::new(TaffyItemBox::new(TaffyItemBoxInner::InFlowBox(
+                            independent_formatting_context,
+                        )))
+                    },
+                    ModernItemKind::OutOfFlow(independent_formatting_context) => {
+                        let abs_pos_box = ArcRefCell::new(AbsolutelyPositionedBox::new(
+                            independent_formatting_context,
+                        ));
                         ArcRefCell::new(TaffyItemBox::new(
                             TaffyItemBoxInner::OutOfFlowAbsolutelyPositionedBox(abs_pos_box),
                         ))
                     },
+                    ModernItemKind::ReusedBox(layout_box) => match layout_box {
+                        LayoutBox::TaffyItemBox(taffy_item_box) => taffy_item_box,
+                        _ => unreachable!("Undamaged taffy level element should be associated with taffy level box"),
+                    },
                 };
 
-                if let Some(box_slot) = item.box_slot {
-                    box_slot.set(LayoutBox::TaffyItemBox(box_.clone()));
-                }
-
-                box_
+                item.box_slot.set(LayoutBox::TaffyItemBox(taffy_item_box.clone()));
+                taffy_item_box
             })
             .collect();
 
@@ -69,6 +74,10 @@ impl TaffyContainer {
             style: info.style.clone(),
         }
     }
+
+    pub(crate) fn repair_style(&mut self, new_style: &Arc<ComputedValues>) {
+        self.style = new_style.clone();
+    }
 }
 
 #[derive(MallocSizeOf)]
@@ -76,11 +85,11 @@ pub(crate) struct TaffyItemBox {
     pub(crate) taffy_layout: taffy::Layout,
     pub(crate) child_fragments: Vec<Fragment>,
     pub(crate) positioning_context: PositioningContext,
-    #[conditional_malloc_size_of]
     pub(crate) style: Arc<ComputedValues>,
     pub(crate) taffy_level_box: TaffyItemBoxInner,
 }
 
+#[expect(clippy::large_enum_variant)]
 #[derive(Debug, MallocSizeOf)]
 pub(crate) enum TaffyItemBoxInner {
     InFlowBox(IndependentFormattingContext),
@@ -116,33 +125,62 @@ impl TaffyItemBox {
         }
     }
 
-    pub(crate) fn invalidate_cached_fragment(&mut self) {
-        self.taffy_layout = Default::default();
-        self.positioning_context = PositioningContext::default();
+    pub(crate) fn with_base<T>(&self, callback: impl FnOnce(&LayoutBoxBase) -> T) -> T {
         match self.taffy_level_box {
             TaffyItemBoxInner::InFlowBox(ref independent_formatting_context) => {
-                independent_formatting_context
-                    .base
-                    .invalidate_cached_fragment()
+                callback(&independent_formatting_context.base)
             },
             TaffyItemBoxInner::OutOfFlowAbsolutelyPositionedBox(ref positioned_box) => {
-                positioned_box
-                    .borrow()
-                    .context
-                    .base
-                    .invalidate_cached_fragment()
+                callback(&positioned_box.borrow().context.base)
             },
         }
     }
 
-    pub(crate) fn fragments(&self) -> Vec<Fragment> {
-        match self.taffy_level_box {
-            TaffyItemBoxInner::InFlowBox(ref independent_formatting_context) => {
-                independent_formatting_context.base.fragments()
+    pub(crate) fn with_base_mut<T>(&mut self, callback: impl FnOnce(&mut LayoutBoxBase) -> T) -> T {
+        match &mut self.taffy_level_box {
+            TaffyItemBoxInner::InFlowBox(independent_formatting_context) => {
+                callback(&mut independent_formatting_context.base)
             },
-            TaffyItemBoxInner::OutOfFlowAbsolutelyPositionedBox(ref positioned_box) => {
-                positioned_box.borrow().context.base.fragments()
+            TaffyItemBoxInner::OutOfFlowAbsolutelyPositionedBox(positioned_box) => {
+                callback(&mut positioned_box.borrow_mut().context.base)
             },
+        }
+    }
+
+    pub(crate) fn repair_style(
+        &mut self,
+        context: &SharedStyleContext,
+        node: &ServoLayoutNode,
+        new_style: &Arc<ComputedValues>,
+    ) {
+        self.style = new_style.clone();
+        match &mut self.taffy_level_box {
+            TaffyItemBoxInner::InFlowBox(independent_formatting_context) => {
+                independent_formatting_context.repair_style(context, node, new_style)
+            },
+            TaffyItemBoxInner::OutOfFlowAbsolutelyPositionedBox(positioned_box) => positioned_box
+                .borrow_mut()
+                .context
+                .repair_style(context, node, new_style),
+        }
+    }
+
+    fn is_in_flow_replaced(&self) -> bool {
+        match &self.taffy_level_box {
+            TaffyItemBoxInner::InFlowBox(fc) => fc.is_replaced(),
+            TaffyItemBoxInner::OutOfFlowAbsolutelyPositionedBox(_) => false,
+        }
+    }
+
+    pub(crate) fn attached_to_tree(&self, layout_box: WeakLayoutBox) {
+        match &self.taffy_level_box {
+            TaffyItemBoxInner::InFlowBox(formatting_context) => {
+                formatting_context.attached_to_tree(layout_box)
+            },
+            TaffyItemBoxInner::OutOfFlowAbsolutelyPositionedBox(positioned_box) => positioned_box
+                .borrow_mut()
+                .context
+                .attached_to_tree(layout_box),
         }
     }
 }

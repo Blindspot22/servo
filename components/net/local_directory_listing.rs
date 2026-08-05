@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::fs::{DirEntry, Metadata, ReadDir};
+use std::fs::Metadata;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Local};
@@ -15,38 +15,34 @@ use servo_config::pref;
 use servo_url::ServoUrl;
 use url::Url;
 
-pub fn fetch(request: &mut Request, url: ServoUrl, path_buf: PathBuf) -> Response {
+pub(crate) async fn fetch(request: &mut Request, url: ServoUrl, path_buf: PathBuf) -> Response {
     if !pref!(network_local_directory_listing_enabled) {
         // If you want to be able to browse local directories, configure Servo prefs so that
         // "network.local_directory_listing.enabled" is set to true.
-        return Response::network_error(NetworkError::Internal(
-            "Local directory listing feature has not been enabled in preferences".into(),
-        ));
+        return Response::network_error(NetworkError::LocalDirectoryError);
     }
 
     if !request.origin.is_opaque() {
         // Checking for an opaque origin as a shorthand for user activation
         // as opposed to a request originating from a script.
         // TODO(32534): carefully consider security of this approach.
-        return Response::network_error(NetworkError::Internal(
-            "Cannot request local directory listing from non-local origin.".into(),
-        ));
+        return Response::network_error(NetworkError::LocalDirectoryError);
     }
 
-    let directory_contents = match std::fs::read_dir(path_buf.clone()) {
+    let directory_contents = match tokio::fs::read_dir(path_buf.clone()).await {
         Ok(directory_contents) => directory_contents,
         Err(error) => {
-            return Response::network_error(NetworkError::Internal(format!(
+            return Response::network_error(NetworkError::ResourceLoadError(format!(
                 "Unable to access directory: {error}"
             )));
         },
     };
 
-    let output = build_html_directory_listing(url.as_url(), path_buf, directory_contents);
+    let output = build_html_directory_listing(url.as_url(), path_buf, directory_contents).await;
 
     let mut response = Response::new(url, ResourceFetchTiming::new(request.timing_type()));
     response.headers.typed_insert(ContentType::html());
-    *response.body.lock().unwrap() = ResponseBody::Done(output.into_bytes());
+    *response.body.lock() = ResponseBody::Done(output.into_bytes());
 
     response
 }
@@ -59,10 +55,10 @@ pub fn fetch(request: &mut Request, url: ServoUrl, path_buf: PathBuf) -> Respons
 /// * `url` - the original URL of the request that triggered this directory listing.
 /// * `path` - the full path to the local directory.
 /// * `directory_contents` - a [`ReadDir`] with the contents of the directory.
-pub fn build_html_directory_listing(
+pub(crate) async fn build_html_directory_listing(
     url: &Url,
     path: PathBuf,
-    directory_contents: ReadDir,
+    mut directory_contents: tokio::fs::ReadDir,
 ) -> String {
     let mut page_html = String::with_capacity(1024);
     page_html.push_str("<!DOCTYPE html>");
@@ -85,11 +81,8 @@ pub fn build_html_directory_listing(
         parent_url_string
     ));
 
-    for directory_entry in directory_contents {
-        let Ok(directory_entry) = directory_entry else {
-            continue;
-        };
-        let Ok(metadata) = directory_entry.metadata() else {
+    while let Ok(Some(directory_entry)) = directory_contents.next_entry().await {
+        let Ok(metadata) = directory_entry.metadata().await else {
             continue;
         };
         write_directory_entry(directory_entry, metadata, url, &mut page_html);
@@ -101,7 +94,12 @@ pub fn build_html_directory_listing(
     page_html
 }
 
-fn write_directory_entry(entry: DirEntry, metadata: Metadata, url: &Url, output: &mut String) {
+fn write_directory_entry(
+    entry: tokio::fs::DirEntry,
+    metadata: Metadata,
+    url: &Url,
+    output: &mut String,
+) {
     let Ok(name) = entry.file_name().into_string() else {
         return;
     };
@@ -130,9 +128,22 @@ fn write_directory_entry(entry: DirEntry, metadata: Metadata, url: &Url, output:
         .map(|time| time.format("%F %r").to_string())
         .unwrap_or_default();
 
+    // The file name is the only value here that reaches the page unencoded; the
+    // url crate percent-encodes `<`/`>` in `file_url_string`, and the remaining
+    // fields are produced by us. `{:?}` is not enough on its own because it
+    // leaves `</script>` intact inside the script element below.
+    let name = script_string_literal(&name);
     output.push_str(&format!(
-        "[{class:?}, {name:?}, {file_url_string:?}, {file_size:?}, {last_modified:?}],"
+        "[{class:?}, {name}, {file_url_string:?}, {file_size:?}, {last_modified:?}],"
     ));
+}
+
+/// Serialise `value` as a JavaScript string literal that is safe to embed in the
+/// inline `<script>` element of the directory listing. `{:?}` produces a valid
+/// literal but leaves any `<` (and therefore `</script>`) untouched, which lets a
+/// crafted file name close the script element and inject markup into the page.
+fn script_string_literal(value: &str) -> String {
+    format!("{value:?}").replace('<', "\\u003C")
 }
 
 pub fn metadata_to_file_size_string(metadata: &Metadata) -> String {
@@ -155,4 +166,24 @@ pub fn metadata_to_file_size_string(metadata: &Metadata) -> String {
     };
 
     format!("{:.2} {prefix}", float_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::script_string_literal;
+
+    #[test]
+    fn script_string_literal_neutralises_script_close() {
+        let literal = script_string_literal("a</script><img src=x onerror=alert(1)>b");
+        assert!(!literal.contains('<'));
+        assert!(!literal.to_lowercase().contains("</script"));
+    }
+
+    #[test]
+    fn script_string_literal_keeps_debug_escaping() {
+        // Quotes and backslashes from the input stay escaped so the result is
+        // still a valid JavaScript string literal.
+        assert_eq!(script_string_literal("a\"b\\c"), r#""a\"b\\c""#);
+        assert_eq!(script_string_literal("plain"), r#""plain""#);
+    }
 }

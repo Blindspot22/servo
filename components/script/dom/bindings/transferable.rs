@@ -5,16 +5,19 @@
 //! Trait representing the concept of [transferable objects]
 //! (<https://html.spec.whatwg.org/multipage/#transferable-objects>).
 
-use std::collections::HashMap;
 use std::hash::Hash;
 
-use base::id::NamespaceIndex;
+use rustc_hash::FxHashMap;
+use script_bindings::reflector::DomObject;
+use script_bindings::structuredclone::MarkedAsTransferableInIdl;
+use servo_base::id::NamespaceIndex;
 
-use crate::dom::bindings::reflector::DomObject;
+use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::structuredclone::StructuredData;
 use crate::dom::globalscope::GlobalScope;
-pub(crate) trait Transferable: DomObject
+
+pub(crate) trait Transferable: DomObject + MarkedAsTransferableInIdl
 where
     Self: Sized,
 {
@@ -25,8 +28,15 @@ where
         true
     }
 
-    fn transfer(&self) -> Result<(NamespaceIndex<Self::Index>, Self::Data), ()>;
+    /// <https://html.spec.whatwg.org/multipage/#transfer-steps>
+    fn transfer(
+        &self,
+        cx: &mut js::context::JSContext,
+    ) -> Fallible<(NamespaceIndex<Self::Index>, Self::Data)>;
+
+    /// <https://html.spec.whatwg.org/multipage/#transfer-receiving-steps>
     fn transfer_receive(
+        cx: &mut js::context::JSContext,
         owner: &GlobalScope,
         id: NamespaceIndex<Self::Index>,
         serialized: Self::Data,
@@ -34,5 +44,7 @@ where
 
     fn serialized_storage<'a>(
         data: StructuredData<'a, '_>,
-    ) -> &'a mut Option<HashMap<NamespaceIndex<Self::Index>, Self::Data>>;
+    ) -> &'a mut Option<FxHashMap<NamespaceIndex<Self::Index>, Self::Data>>;
 }
+
+pub(crate) fn assert_transferable<T: Transferable>() {}

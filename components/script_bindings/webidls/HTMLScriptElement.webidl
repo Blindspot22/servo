@@ -19,6 +19,8 @@ interface HTMLScriptElement : HTMLElement {
            attribute boolean async;
   [CEReactions]
            attribute boolean defer;
+  [SameObject, PutForwards=value]
+           readonly attribute DOMTokenList blocking;
   [CEReactions]
            attribute DOMString? crossOrigin;
   [CEReactions, SetterThrows]
@@ -31,6 +33,8 @@ interface HTMLScriptElement : HTMLElement {
            attribute DOMString integrity;
   [CEReactions]
            attribute DOMString referrerPolicy;
+
+  static boolean supports(DOMString type);
 
   // also has obsolete members
 };

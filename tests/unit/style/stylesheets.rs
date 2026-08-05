@@ -10,7 +10,9 @@ use style::context::QuirksMode;
 use style::error_reporting::{ContextualParseError, ParseErrorReporter};
 use style::media_queries::MediaList;
 use style::shared_lock::SharedRwLock;
-use style::stylesheets::{AllowImportRules, Origin, Stylesheet, UrlExtraData};
+use style::stylesheets::{
+    AllowImportRules, Origin, Stylesheet, StylesheetInDocument, UrlExtraData,
+};
 use url::Url;
 
 #[derive(Debug)]
@@ -125,8 +127,8 @@ fn test_report_error_stylesheet() {
         (7, 28, "Invalid media rule"),
         // When @counter-style is supported, this should be replaced with two errors
         (9, 19, "Invalid rule: '@counter-style "),
-        // When @font-feature-values is supported, this should be replaced with two errors
-        (10, 25, "Invalid rule: '@font-feature-values "),
+        (10, 42, "Unsupported rule: '@foo ', @ rule invalid"),
+        (10, 61, "Unsupported property declaration: 'foo: 1 invalid 2 ', found unexpected identifier invalid"),
         (11, 13, "Invalid rule: '@invalid'"),
         (12, 29, "Invalid rule: '@invalid'"),
         (13, 34, "Invalid rule: '@supports "),
@@ -193,14 +195,15 @@ fn test_source_map_url() {
             url.into(),
             Origin::UserAgent,
             media,
-            lock,
+            lock.clone(),
             None,
             None,
             QuirksMode::NoQuirks,
             AllowImportRules::Yes,
         );
-        let url_opt = stylesheet.contents.source_map_url.read();
-        assert_eq!(*url_opt, test.1);
+        let guard = lock.read();
+        let url_opt = stylesheet.contents(&guard).source_map_url.clone();
+        assert_eq!(url_opt, test.1);
     }
 }
 
@@ -220,13 +223,14 @@ fn test_source_url() {
             url.into(),
             Origin::UserAgent,
             media,
-            lock,
+            lock.clone(),
             None,
             None,
             QuirksMode::NoQuirks,
             AllowImportRules::Yes,
         );
-        let url_opt = stylesheet.contents.source_url.read();
-        assert_eq!(*url_opt, test.1);
+        let guard = lock.read();
+        let url_opt = stylesheet.contents(&guard).source_url.clone();
+        assert_eq!(url_opt, test.1);
     }
 }

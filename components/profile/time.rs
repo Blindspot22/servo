@@ -11,11 +11,11 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::thread;
 
-use ipc_channel::ipc::{self, IpcReceiver};
 use profile_traits::time::{
     ProfilerCategory, ProfilerChan, ProfilerData, ProfilerMsg, TimerMetadata,
     TimerMetadataFrameType, TimerMetadataReflowType,
 };
+use servo_base::generic_channel::{self, GenericReceiver};
 use servo_config::opts::OutputOptions;
 use time::Duration;
 
@@ -69,32 +69,11 @@ impl Formattable for Option<TimerMetadata> {
     }
 }
 
-impl Formattable for ProfilerCategory {
-    // some categories are subcategories of LayoutPerformCategory
-    // and should be printed to indicate this
-    fn format(&self, _output: &Option<OutputOptions>) -> String {
-        let padding = match *self {
-            ProfilerCategory::LayoutStyleRecalc |
-            ProfilerCategory::LayoutRestyleDamagePropagation |
-            ProfilerCategory::LayoutGeneratedContent |
-            ProfilerCategory::LayoutFloatPlacementSpeculation |
-            ProfilerCategory::LayoutMain |
-            ProfilerCategory::LayoutStoreOverflow |
-            ProfilerCategory::LayoutDispListBuild |
-            ProfilerCategory::LayoutParallelWarmup |
-            ProfilerCategory::LayoutTextShaping => "| + ",
-            _ => "",
-        };
-        let name: &'static str = self.into();
-        format!("{padding}{name}")
-    }
-}
-
 type ProfilerBuckets = BTreeMap<(ProfilerCategory, Option<TimerMetadata>), Vec<Duration>>;
 
 // back end of the profiler that handles data aggregation and performance metrics
 pub struct Profiler {
-    pub port: IpcReceiver<ProfilerMsg>,
+    pub port: GenericReceiver<ProfilerMsg>,
     buckets: ProfilerBuckets,
     output: Option<OutputOptions>,
     pub last_msg: Option<ProfilerMsg>,
@@ -104,9 +83,9 @@ pub struct Profiler {
 
 impl Profiler {
     pub fn create(output: &Option<OutputOptions>, file_path: Option<String>) -> ProfilerChan {
-        let (chan, port) = ipc::channel().unwrap();
         match *output {
             Some(ref option) => {
+                let (chan, port) = generic_channel::channel().unwrap();
                 // Spawn the time profiler thread
                 let outputoption = option.clone();
                 thread::Builder::new()
@@ -136,45 +115,33 @@ impl Profiler {
                             .expect("Thread spawning failed");
                     },
                 }
+
+                ProfilerChan(Some(chan))
             },
             None => {
-                // this is when the -p option hasn't been specified
-                if file_path.is_some() {
-                    // Spawn the time profiler
-                    thread::Builder::new()
-                        .name("TimeProfiler".to_owned())
-                        .spawn(move || {
-                            let trace = file_path.as_ref().and_then(|p| TraceDump::new(p).ok());
-                            let mut profiler = Profiler::new(port, trace, None);
-                            profiler.start();
-                        })
-                        .expect("Thread spawning failed");
-                } else {
-                    // No-op to handle messages when the time profiler is not printing:
-                    thread::Builder::new()
-                        .name("TimeProfiler".to_owned())
-                        .spawn(move || {
-                            loop {
-                                match port.recv() {
-                                    Err(_) => break,
-                                    Ok(ProfilerMsg::Exit(chan)) => {
-                                        let _ = chan.send(());
-                                        break;
-                                    },
-                                    _ => {},
-                                }
-                            }
-                        })
-                        .expect("Thread spawning failed");
+                match file_path {
+                    Some(path) => {
+                        let (chan, port) = generic_channel::channel().unwrap();
+                        // Spawn the time profiler
+                        thread::Builder::new()
+                            .name("TimeProfiler".to_owned())
+                            .spawn(move || {
+                                let trace = TraceDump::new(path).ok();
+                                let mut profiler = Profiler::new(port, trace, None);
+                                profiler.start();
+                            })
+                            .expect("Thread spawning failed");
+
+                        ProfilerChan(Some(chan))
+                    },
+                    None => ProfilerChan(None),
                 }
             },
         }
-
-        ProfilerChan(chan)
     }
 
     pub fn new(
-        port: IpcReceiver<ProfilerMsg>,
+        port: GenericReceiver<ProfilerMsg>,
         trace: Option<TraceDump>,
         output: Option<OutputOptions>,
     ) -> Profiler {
@@ -276,7 +243,7 @@ impl Profiler {
                         writeln!(
                             file,
                             "{}\t{}\t{:15.4}\t{:15.4}\t{:15.4}\t{:15.4}\t{:15}",
-                            category.format(&self.output),
+                            category.variant_name(),
                             meta.format(&self.output),
                             mean.as_seconds_f64() * 1000.,
                             median.as_seconds_f64() * 1000.,
@@ -319,7 +286,7 @@ impl Profiler {
                         writeln!(
                             &mut lock,
                             "{:-35}{} {:15.4} {:15.4} {:15.4} {:15.4} {:15}",
-                            category.format(&self.output),
+                            category.variant_name(),
                             meta.format(&self.output),
                             mean.as_seconds_f64() * 1000.,
                             median.as_seconds_f64() * 1000.,

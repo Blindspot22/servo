@@ -3,7 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
-use ipc_channel::ipc::IpcSender;
+use js::context::JSContext;
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use servo_base::generic_channel::GenericSender;
 use webxr_api::{
     Handedness, InputId, MockButton, MockButtonType, MockDeviceMsg, MockInputMsg, SelectEvent,
     SelectKind, TargetRayMode,
@@ -18,27 +20,23 @@ use crate::dom::bindings::codegen::Bindings::XRInputSourceBinding::{
     XRHandedness, XRTargetRayMode,
 };
 use crate::dom::bindings::error::{Error, Fallible};
-use crate::dom::bindings::reflector::{Reflector, reflect_dom_object};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::fakexrdevice::get_origin;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct FakeXRInputController {
     reflector: Reflector,
-    #[ignore_malloc_size_of = "defined in ipc-channel"]
     #[no_trace]
-    sender: IpcSender<MockDeviceMsg>,
-    #[ignore_malloc_size_of = "defined in webxr-api"]
+    sender: GenericSender<MockDeviceMsg>,
     #[no_trace]
     id: InputId,
 }
 
 impl FakeXRInputController {
     pub(crate) fn new_inherited(
-        sender: IpcSender<MockDeviceMsg>,
+        sender: GenericSender<MockDeviceMsg>,
         id: InputId,
     ) -> FakeXRInputController {
         FakeXRInputController {
@@ -49,15 +47,15 @@ impl FakeXRInputController {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
-        sender: IpcSender<MockDeviceMsg>,
+        sender: GenericSender<MockDeviceMsg>,
         id: InputId,
-        can_gc: CanGc,
     ) -> DomRoot<FakeXRInputController> {
-        reflect_dom_object(
+        reflect_dom_object_with_cx(
             Box::new(FakeXRInputController::new_inherited(sender, id)),
             global,
-            can_gc,
+            cx,
         )
     }
 
@@ -157,10 +155,10 @@ impl FakeXRInputControllerMethods<crate::DomTypeHolder> for FakeXRInputControlle
     fn UpdateButtonState(&self, button_state: &FakeXRButtonStateInit) -> Fallible<()> {
         // https://immersive-web.github.io/webxr-test-api/#validate-a-button-state
         if (button_state.pressed || *button_state.pressedValue > 0.0) && !button_state.touched {
-            return Err(Error::Type("Pressed button must also be touched".into()));
+            return Err(Error::Type(c"Pressed button must also be touched".into()));
         }
         if *button_state.pressedValue < 0.0 {
-            return Err(Error::Type("Pressed value must be non-negative".into()));
+            return Err(Error::Type(c"Pressed value must be non-negative".into()));
         }
 
         // TODO: Steps 3-5 of updateButtonState

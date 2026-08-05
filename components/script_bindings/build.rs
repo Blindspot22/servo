@@ -5,7 +5,7 @@
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Instant;
 use std::{env, fmt};
 
@@ -24,13 +24,14 @@ fn main() {
     println!("cargo::rerun-if-changed=webidls");
     println!("cargo::rerun-if-changed=codegen");
     println!("cargo::rerun-if-changed={}", css_properties_json.display());
-    println!("cargo::rerun-if-changed=../../third_party/WebIDL/WebIDL.py");
-    // NB: We aren't handling changes in `third_party/ply` here.
+    println!("cargo::rerun-if-changed=third_party/WebIDL/parser/WebIDL.py");
+    println!("cargo::rerun-if-changed=third_party/ply");
 
-    let status = Command::new(find_python())
+    let status = find_python()
         .arg("codegen/run.py")
         .arg(&css_properties_json)
         .arg(&out_dir)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .status()
         .unwrap();
     if !status.success() {
@@ -46,7 +47,7 @@ fn main() {
         let parts = value.as_array().unwrap();
         map.entry(
             Bytes(key),
-            &format!(
+            format!(
                 "Interface {{ define: {}, enabled: {} }}",
                 parts[0].as_str().unwrap(),
                 parts[1].as_str().unwrap()
@@ -78,55 +79,68 @@ impl phf_shared::PhfHash for Bytes<'_> {
     }
 }
 
-/// Tries to find a suitable python
-///
-/// Algorithm
-/// 1. Trying to find python3/python in $VIRTUAL_ENV (this should be from Servo's venv)
-/// 2. Checking PYTHON3 (set by mach)
-/// 3. Falling back to the system installation.
-///
-/// Note: This function should be kept in sync with the version in `components/servo/build.rs`
-fn find_python() -> PathBuf {
-    let mut candidates = vec![];
-    if let Some(venv) = env::var_os("VIRTUAL_ENV") {
-        let bin_directory = PathBuf::from(venv).join("bin");
+/// Tests if a python command works by running it with --version.
+/// Returns Ok(()) if it works, Err with message if not.
+fn try_python_command(program: &str, args: &[&str]) -> Result<(), String> {
+    let mut command = Command::new(program);
+    command.args(args);
+    command.arg("--version");
+    command.stdin(Stdio::null());
 
-        let python3 = bin_directory.join("python3");
-        if python3.exists() {
-            candidates.push(python3);
-        }
-        let python = bin_directory.join("python");
-        if python.exists() {
-            candidates.push(python);
-        }
-    };
-    if let Some(python3) = env::var_os("PYTHON3") {
-        let python3 = PathBuf::from(python3);
-        if python3.exists() {
-            candidates.push(python3);
-        }
+    let command_result = command.output();
+
+    if let Ok(output) = command_result {
+        return if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "`{} {:?}` failed with {}",
+                program,
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        };
+    }
+    Err(format!(
+        "`{} {:?}` failed to run (is it installed?)",
+        program, args
+    ))
+}
+
+/// Tries to find a suitable python, which in Servo is always `uv run python`.
+///
+/// To be accommodating to different environments, which may manage python differently, we fallback
+/// to `python3` and `python` in that order.
+fn find_python() -> Command {
+    // Test uv first - if it works, create a FRESH command to return
+    let uv_result = try_python_command("uv", &["run", "--frozen", "python"])
+        .inspect_err(|e| println!("cargo:warning={e}"));
+    if uv_result.is_ok() {
+        let mut cmd = Command::new("uv");
+        cmd.args(["run", "--frozen", "python"]);
+        return cmd;
     }
 
-    let system_python = ["python3", "python"].map(PathBuf::from);
-    candidates.extend_from_slice(&system_python);
+    println!(
+        "cargo:warning=`uv` not found - Falling back to the default python! \
+        If the build fails, please install uv and make sure it is in your PATH or make sure \
+        to provision a python environment >= python 3.11."
+    );
 
-    for name in &candidates {
-        // Command::new() allows us to omit the `.exe` suffix on windows
-        if Command::new(name)
-            .arg("--version")
-            .output()
-            .is_ok_and(|out| out.status.success())
-        {
-            return name.to_owned();
-        }
+    let python3_result = try_python_command("python3", &[]);
+    if python3_result.is_ok() {
+        return Command::new("python3");
     }
-    let candidates = candidates
-        .into_iter()
-        .map(|c| c.into_os_string())
-        .collect::<Vec<_>>();
-    panic!(
-        "Can't find python (tried {:?})! Try enabling Servo's Python venv, \
-        setting the PYTHON3 env var or adding python3 to PATH.",
-        candidates.join(", ".as_ref())
-    )
+
+    let python_result = try_python_command("python", &[]);
+    if python_result.is_ok() {
+        return Command::new("python");
+    }
+
+    // We first try `python` before printing an error for `python3`, since python3 is often missing
+    // provided via python on Windows (but not necessarily on linux).
+    println!("cargo:warning={}", python3_result.unwrap_err());
+    println!("cargo:warning={}", python_result.unwrap_err());
+
+    panic!("No suitable python found! Tried: `uv run python`, `python3`, `python`.");
 }

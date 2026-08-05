@@ -3,9 +3,12 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 #![deny(unsafe_code)]
+#![allow(clippy::too_many_arguments)]
 
 mod backend;
-mod raqote_backend;
-
 pub mod canvas_data;
 pub mod canvas_paint_thread;
+mod peniko_conversions;
+#[cfg(feature = "vello")]
+mod vello_backend;
+mod vello_cpu_backend;

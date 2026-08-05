@@ -14,7 +14,6 @@ mod font_context {
     use std::thread;
 
     use app_units::Au;
-    use compositing_traits::CrossProcessCompositorApi;
     use fonts::platform::font::PlatformFont;
     use fonts::{
         FallbackFontSelectionOptions, FontContext, FontDescriptor, FontFamilyDescriptor,
@@ -22,16 +21,19 @@ mod font_context {
         PlatformFontMethods, SystemFontServiceMessage, SystemFontServiceProxy,
         SystemFontServiceProxySender, fallback_font_families,
     };
-    use ipc_channel::ipc::{self, IpcReceiver};
+    use icu_locid::subtags::Language;
     use net_traits::ResourceThreads;
+    use paint_api::CrossProcessPaintApi;
     use parking_lot::Mutex;
     use servo_arc::Arc as ServoArc;
+    use servo_base::generic_channel::{self, GenericReceiver};
     use style::ArcSlice;
+    use style::computed_values::font_optical_sizing::T as FontOpticalSizing;
     use style::properties::longhands::font_variant_caps::computed_value::T as FontVariantCaps;
     use style::properties::style_structs::Font as FontStyleStruct;
     use style::values::computed::font::{
         FamilyName, FontFamily, FontFamilyList, FontFamilyNameSyntax, FontStretch, FontStyle,
-        FontWeight, SingleFontFamily,
+        FontSynthesis, FontWeight, SingleFontFamily,
     };
     use stylo_atoms::Atom;
     use webrender_api::{FontInstanceKey, FontKey, IdNamespace};
@@ -45,14 +47,13 @@ mod font_context {
     impl TestContext {
         fn new() -> TestContext {
             let (system_font_service, system_font_service_proxy) = MockSystemFontService::spawn();
-            let (core_sender, _) = ipc::channel().unwrap();
-            let (storage_sender, _) = ipc::channel().unwrap();
-            let mock_resource_threads = ResourceThreads::new(core_sender, storage_sender);
-            let mock_compositor_api = CrossProcessCompositorApi::dummy();
+            let (core_sender, _) = generic_channel::channel().unwrap();
+            let mock_resource_threads = ResourceThreads::new(core_sender);
+            let mock_paint_api = CrossProcessPaintApi::dummy();
 
             let proxy_clone = Arc::new(system_font_service_proxy.to_sender().to_proxy());
             Self {
-                context: FontContext::new(proxy_clone, mock_compositor_api, mock_resource_threads),
+                context: FontContext::new(proxy_clone, mock_paint_api, mock_resource_threads),
                 system_font_service,
                 system_font_service_proxy,
             }
@@ -83,7 +84,7 @@ mod font_context {
 
     impl MockSystemFontService {
         fn spawn() -> (Arc<MockSystemFontService>, SystemFontServiceProxy) {
-            let (sender, receiver) = ipc::channel().unwrap();
+            let (sender, receiver) = generic_channel::channel().unwrap();
             let system_font_service = Arc::new(Self::new());
 
             let system_font_service_clone = system_font_service.clone();
@@ -97,7 +98,7 @@ mod font_context {
             )
         }
 
-        fn run(&self, receiver: IpcReceiver<SystemFontServiceMessage>) {
+        fn run(&self, receiver: GenericReceiver<SystemFontServiceMessage>) {
             loop {
                 match receiver.recv().unwrap() {
                     SystemFontServiceMessage::GetFontTemplates(
@@ -125,17 +126,18 @@ mod font_context {
                                 .collect(),
                         );
                     },
-                    SystemFontServiceMessage::GetFontInstanceKey(result_sender) |
-                    SystemFontServiceMessage::GetFontInstance(_, _, _, result_sender) => {
+                    SystemFontServiceMessage::GetFontInstanceKey(_, result_sender) |
+                    SystemFontServiceMessage::GetFontInstance(_, _, _, _, _, result_sender) => {
                         let _ = result_sender.send(FontInstanceKey(IdNamespace(0), 0));
                     },
-                    SystemFontServiceMessage::GetFontKey(result_sender) => {
+                    SystemFontServiceMessage::GetFontKey(_, result_sender) => {
                         let _ = result_sender.send(FontKey(IdNamespace(0), 0));
                     },
                     SystemFontServiceMessage::Exit(result_sender) => {
                         let _ = result_sender.send(());
                         break;
                     },
+                    SystemFontServiceMessage::PrefetchFontKeys(_) => {},
                     SystemFontServiceMessage::Ping => {},
                     SystemFontServiceMessage::CollectMemoryReport(..) => {},
                 }
@@ -178,11 +180,16 @@ mod font_context {
 
             let local_font_identifier = LocalFontIdentifier {
                 path: path.to_str().expect("Could not load test font").into(),
-                variation_index: 0,
+                face_index: 0,
+                named_instance_index: 0,
             };
-            let handle =
-                PlatformFont::new_from_local_font_identifier(local_font_identifier.clone(), None)
-                    .expect("Could not load test font");
+            let handle = PlatformFont::new_from_local_font_identifier(
+                local_font_identifier.clone(),
+                None,
+                &[],
+                false,
+            )
+            .expect("Could not load test font");
 
             family.add_template(FontTemplate::new(
                 FontIdentifier::Local(local_font_identifier),
@@ -226,28 +233,16 @@ mod font_context {
 
         assert!(
             std::ptr::eq(
-                &*context
-                    .context
-                    .font_group(ServoArc::new(style1.clone()))
-                    .read(),
-                &*context
-                    .context
-                    .font_group(ServoArc::new(style1.clone()))
-                    .read()
+                &*context.context.font_group(ServoArc::new(style1.clone())),
+                &*context.context.font_group(ServoArc::new(style1.clone())),
             ),
             "the same font group should be returned for two styles with the same hash"
         );
 
         assert!(
             !std::ptr::eq(
-                &*context
-                    .context
-                    .font_group(ServoArc::new(style1.clone()))
-                    .read(),
-                &*context
-                    .context
-                    .font_group(ServoArc::new(style2.clone()))
-                    .read()
+                &*context.context.font_group(ServoArc::new(style1.clone())),
+                &*context.context.font_group(ServoArc::new(style2.clone())),
             ),
             "different font groups should be returned for two styles with different hashes"
         )
@@ -263,8 +258,7 @@ mod font_context {
         let group = context.context.font_group(ServoArc::new(style));
 
         let font = group
-            .write()
-            .find_by_codepoint(&mut context.context, 'a', None, None)
+            .find_by_codepoint(&mut context.context, 'a', None, Language::UND)
             .unwrap();
         assert_eq!(&font_face_name(&font.identifier()), "csstest-ascii");
         assert_eq!(
@@ -277,8 +271,7 @@ mod font_context {
         );
 
         let font = group
-            .write()
-            .find_by_codepoint(&mut context.context, 'a', None, None)
+            .find_by_codepoint(&mut context.context, 'a', None, Language::UND)
             .unwrap();
         assert_eq!(&font_face_name(&font.identifier()), "csstest-ascii");
         assert_eq!(
@@ -291,8 +284,7 @@ mod font_context {
         );
 
         let font = group
-            .write()
-            .find_by_codepoint(&mut context.context, 'á', None, None)
+            .find_by_codepoint(&mut context.context, 'á', None, Language::UND)
             .unwrap();
         assert_eq!(&font_face_name(&font.identifier()), "csstest-basic-regular");
         assert_eq!(
@@ -315,8 +307,7 @@ mod font_context {
         let group = context.context.font_group(ServoArc::new(style));
 
         let font = group
-            .write()
-            .find_by_codepoint(&mut context.context, 'a', None, None)
+            .find_by_codepoint(&mut context.context, 'a', None, Language::UND)
             .unwrap();
         assert_eq!(
             &font_face_name(&font.identifier()),
@@ -325,8 +316,7 @@ mod font_context {
         );
 
         let font = group
-            .write()
-            .find_by_codepoint(&mut context.context, 'á', None, None)
+            .find_by_codepoint(&mut context.context, 'á', None, Language::UND)
             .unwrap();
         assert_eq!(
             &font_face_name(&font.identifier()),
@@ -345,6 +335,9 @@ mod font_context {
             style: FontStyle::normal(),
             variant: FontVariantCaps::Normal,
             pt_size: Au(10),
+            variation_settings: vec![],
+            synthesis_weight: FontSynthesis::Auto,
+            optical_sizing: FontOpticalSizing::Auto,
         };
 
         let family = SingleFontFamily::FamilyName(FamilyName {

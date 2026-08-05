@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-#![cfg_attr(crown, allow(crown::unrooted_must_root))]
+#![cfg_attr(crown, expect(crown::unrooted_must_root))]
 
 use std::cell::Cell;
 use std::io;
@@ -14,8 +14,10 @@ use html5ever::tokenizer::{Tokenizer as HtmlTokenizer, TokenizerOpts};
 use html5ever::tree_builder::{QuirksMode as HTML5EverQuirksMode, TreeBuilder, TreeBuilderOpts};
 use html5ever::{QualName, local_name, ns};
 use markup5ever::TokenizerResult;
+use script_bindings::script_runtime::temp_cx;
 use script_bindings::trace::CustomTraceable;
 use servo_url::ServoUrl;
+use style::attr::AttrValue;
 use style::context::QuirksMode as StyleContextQuirksMode;
 use xml5ever::LocalName;
 
@@ -29,13 +31,12 @@ use crate::dom::document::Document;
 use crate::dom::documentfragment::DocumentFragment;
 use crate::dom::documenttype::DocumentType;
 use crate::dom::element::Element;
-use crate::dom::htmlscriptelement::HTMLScriptElement;
-use crate::dom::htmltemplateelement::HTMLTemplateElement;
+use crate::dom::html::htmlscriptelement::HTMLScriptElement;
+use crate::dom::html::htmltemplateelement::HTMLTemplateElement;
 use crate::dom::node::Node;
 use crate::dom::processinginstruction::ProcessingInstruction;
 use crate::dom::servoparser::{ParsingAlgorithm, Sink};
 use crate::dom::shadowroot::ShadowRoot;
-use crate::script_runtime::CanGc;
 
 #[derive(JSTraceable, MallocSizeOf)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
@@ -51,12 +52,14 @@ impl Tokenizer {
         fragment_context: Option<super::FragmentContext>,
         parsing_algorithm: ParsingAlgorithm,
     ) -> Self {
+        let custom_element_reaction_stack = document.custom_element_reaction_stack();
         let sink = Sink {
             base_url: url,
             document: Dom::from_ref(document),
             current_line: Cell::new(1),
             script: Default::default(),
             parsing_algorithm,
+            custom_element_reaction_stack,
         };
 
         let quirks_mode = match document.quirks_mode() {
@@ -66,27 +69,28 @@ impl Tokenizer {
         };
 
         let options = TreeBuilderOpts {
-            ignore_missing_rules: true,
             scripting_enabled: document.scripting_enabled(),
             iframe_srcdoc: document.url().as_str() == "about:srcdoc",
             quirks_mode,
             ..Default::default()
         };
 
-        let inner = if let Some(fc) = fragment_context {
-            let tb = TreeBuilder::new_for_fragment(
+        let inner = if let Some(fragment_context) = fragment_context {
+            let tree_builder = TreeBuilder::new_for_fragment(
                 sink,
-                Dom::from_ref(fc.context_elem),
-                fc.form_elem.map(Dom::from_ref),
+                Dom::from_ref(fragment_context.context_elem),
+                fragment_context.form_elem.map(Dom::from_ref),
                 options,
             );
 
-            let tok_options = TokenizerOpts {
-                initial_state: Some(tb.tokenizer_state_for_context_elem()),
+            let tokenizer_options = TokenizerOpts {
+                initial_state: Some(tree_builder.tokenizer_state_for_context_elem(
+                    fragment_context.context_element_allows_scripting,
+                )),
                 ..Default::default()
             };
 
-            HtmlTokenizer::new(tb, tok_options)
+            HtmlTokenizer::new(tree_builder, tokenizer_options)
         } else {
             HtmlTokenizer::new(TreeBuilder::new(sink, options), Default::default())
         };
@@ -99,6 +103,9 @@ impl Tokenizer {
             TokenizerResult::Done => TokenizerResult::Done,
             TokenizerResult::Script(script) => {
                 TokenizerResult::Script(DomRoot::from_ref(script.downcast().unwrap()))
+            },
+            TokenizerResult::EncodingIndicator(encoding) => {
+                TokenizerResult::EncodingIndicator(encoding)
             },
         }
     }
@@ -114,20 +121,40 @@ impl Tokenizer {
     pub(crate) fn set_plaintext_state(&self) {
         self.inner.set_plaintext_state();
     }
+
+    pub(crate) fn get_current_line(&self) -> u32 {
+        self.inner.sink.sink.current_line.get() as u32
+    }
 }
 
-fn start_element<S: Serializer>(node: &Element, serializer: &mut S) -> io::Result<()> {
-    let name = QualName::new(None, node.namespace().clone(), node.local_name().clone());
-    let attrs = node
-        .attrs()
-        .iter()
-        .map(|attr| {
-            let qname = QualName::new(None, attr.namespace().clone(), attr.local_name().clone());
-            let value = attr.value().clone();
-            (qname, value)
-        })
-        .collect::<Vec<_>>();
-    let attr_refs = attrs.iter().map(|(qname, value)| {
+/// <https://html.spec.whatwg.org/multipage/#html-fragment-serialisation-algorithm>
+fn start_element<S: Serializer>(element: &Element, serializer: &mut S) -> io::Result<()> {
+    let name = QualName::new(
+        None,
+        element.namespace().clone(),
+        element.local_name().clone(),
+    );
+
+    let mut attributes = vec![];
+
+    // The "is" value of an element is treated as if it was an attribute and it is serialized before all
+    // other attributes. If the element already has an "is" attribute then the "is" value is ignored.
+    if !element.has_attribute(&LocalName::from("is")) &&
+        let Some(is_value) = element.get_is()
+    {
+        let qualified_name = QualName::new(None, ns!(), LocalName::from("is"));
+
+        attributes.push((qualified_name, AttrValue::String(is_value.to_string())));
+    }
+
+    // Collect all the "normal" attributes
+    attributes.extend(element.attrs().borrow().iter().map(|attr| {
+        let qname = QualName::new(None, attr.namespace().clone(), attr.local_name().clone());
+        let value = attr.value().clone();
+        (qname, value)
+    }));
+
+    let attr_refs = attributes.iter().map(|(qname, value)| {
         let ar: AttrRef = (qname, &**value);
         ar
     });
@@ -152,19 +179,13 @@ struct SerializationIterator {
     shadow_roots: Vec<DomRoot<ShadowRoot>>,
 }
 
-enum SerializationChildrenIterator<C, S> {
-    None,
-    Children(C),
-    ShadowContents(S),
-}
-
 impl SerializationIterator {
     fn new(
+        cx: &mut js::context::JSContext,
         node: &Node,
         skip_first: bool,
         serialize_shadow_roots: bool,
         shadow_roots: Vec<DomRoot<ShadowRoot>>,
-        can_gc: CanGc,
     ) -> SerializationIterator {
         let mut ret = SerializationIterator {
             stack: vec![],
@@ -172,24 +193,20 @@ impl SerializationIterator {
             shadow_roots,
         };
         if skip_first || node.is::<DocumentFragment>() || node.is::<Document>() {
-            ret.handle_node_contents(node, can_gc);
+            ret.handle_node_contents(cx, node);
         } else {
             ret.push_node(node);
         }
         ret
     }
 
-    fn handle_node_contents(&mut self, node: &Node, can_gc: CanGc) {
+    fn handle_node_contents(&mut self, cx: &mut js::context::JSContext, node: &Node) {
         if node.downcast::<Element>().is_some_and(Element::is_void) {
             return;
         }
 
         if let Some(template_element) = node.downcast::<HTMLTemplateElement>() {
-            for child in template_element
-                .Content(can_gc)
-                .upcast::<Node>()
-                .rev_children()
-            {
+            for child in template_element.Content(cx).upcast::<Node>().rev_children() {
                 self.push_node(&child);
             }
         } else {
@@ -226,7 +243,11 @@ impl SerializationIterator {
 impl Iterator for SerializationIterator {
     type Item = SerializationCommand;
 
+    #[expect(unsafe_code)]
     fn next(&mut self) -> Option<SerializationCommand> {
+        // TODO: https://github.com/servo/servo/issues/42839
+        let mut cx = unsafe { temp_cx() };
+        let cx = &mut cx;
         let res = self.stack.pop()?;
 
         match &res {
@@ -237,7 +258,7 @@ impl Iterator for SerializationIterator {
                     element.local_name().clone(),
                 );
                 self.stack.push(SerializationCommand::CloseElement(name));
-                self.handle_node_contents(element.upcast(), CanGc::note());
+                self.handle_node_contents(cx, element.upcast());
             },
             SerializationCommand::SerializeShadowRoot(shadow_root) => {
                 self.stack
@@ -246,7 +267,7 @@ impl Iterator for SerializationIterator {
                         ns!(),
                         local_name!("template"),
                     )));
-                self.handle_node_contents(shadow_root.upcast(), CanGc::note());
+                self.handle_node_contents(cx, shadow_root.upcast());
             },
             _ => {},
         }
@@ -257,19 +278,19 @@ impl Iterator for SerializationIterator {
 
 /// <https://html.spec.whatwg.org/multipage/#html-fragment-serialisation-algorithm>
 pub(crate) fn serialize_html_fragment<S: Serializer>(
+    cx: &mut js::context::JSContext,
     node: &Node,
     serializer: &mut S,
     traversal_scope: TraversalScope,
     serialize_shadow_roots: bool,
     shadow_roots: Vec<DomRoot<ShadowRoot>>,
-    can_gc: CanGc,
 ) -> io::Result<()> {
     let iter = SerializationIterator::new(
+        cx,
         node,
         traversal_scope != IncludeNode,
         serialize_shadow_roots,
         shadow_roots,
-        can_gc,
     );
 
     for cmd in iter {
@@ -283,7 +304,7 @@ pub(crate) fn serialize_html_fragment<S: Serializer>(
             SerializationCommand::SerializeNonelement(n) => match n.type_id() {
                 NodeTypeId::DocumentType => {
                     let doctype = n.downcast::<DocumentType>().unwrap();
-                    serializer.write_doctype(doctype.name())?;
+                    serializer.write_doctype(&doctype.name().str())?;
                 },
 
                 NodeTypeId::CharacterData(CharacterDataTypeId::Text(_)) => {
@@ -299,7 +320,7 @@ pub(crate) fn serialize_html_fragment<S: Serializer>(
                 NodeTypeId::CharacterData(CharacterDataTypeId::ProcessingInstruction) => {
                     let pi = n.downcast::<ProcessingInstruction>().unwrap();
                     let data = pi.upcast::<CharacterData>().data();
-                    serializer.write_processing_instruction(pi.target(), &data)?;
+                    serializer.write_processing_instruction(&pi.target().str(), &data)?;
                 },
 
                 NodeTypeId::DocumentFragment(_) | NodeTypeId::Attr => {},
@@ -345,20 +366,25 @@ pub(crate) fn serialize_html_fragment<S: Serializer>(
     Ok(())
 }
 
-// TODO: This trait confuses the concepts of XML serialization and HTML serialization and
-// the impl should go away eventually
-impl Serialize for &Node {
+pub(crate) struct HtmlSerialize<'a> {
+    node: &'a Node,
+}
+
+impl<'a> HtmlSerialize<'a> {
+    pub(crate) fn new(node: &'a Node) -> HtmlSerialize<'a> {
+        HtmlSerialize { node }
+    }
+}
+
+impl Serialize for HtmlSerialize<'_> {
+    #[expect(unsafe_code)]
     fn serialize<S>(&self, serializer: &mut S, traversal_scope: TraversalScope) -> io::Result<()>
     where
         S: Serializer,
     {
-        serialize_html_fragment(
-            self,
-            serializer,
-            traversal_scope,
-            false,
-            vec![],
-            CanGc::note(),
-        )
+        // TODO: https://github.com/servo/servo/issues/42839
+        let mut cx = unsafe { temp_cx() };
+        let cx = &mut cx;
+        serialize_html_fragment(cx, self.node, serializer, traversal_scope, false, vec![])
     }
 }

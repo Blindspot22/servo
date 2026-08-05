@@ -14,21 +14,29 @@
 //! we don't need to make the code more complex for it. The `mach` update command makes sure that
 //! those cases are not present.
 
-use std::collections::HashSet;
 use std::iter::FromIterator;
 use std::sync::LazyLock;
 
 use embedder_traits::resources::{self, Resource};
+use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
+use malloc_size_of_derive::MallocSizeOf;
+use rustc_hash::FxHashSet;
 use servo_url::{Host, ImmutableOrigin, ServoUrl};
 
-#[derive(Clone, Debug, Default)]
+// We can use FxHash here.
+// The list is given by publicsuffix.org so an attack is highly unlikely
+#[derive(Clone, Debug, Default, MallocSizeOf)]
 pub struct PubDomainRules {
-    rules: HashSet<String>,
-    wildcards: HashSet<String>,
-    exceptions: HashSet<String>,
+    rules: FxHashSet<String>,
+    wildcards: FxHashSet<String>,
+    exceptions: FxHashSet<String>,
 }
 
 static PUB_DOMAINS: LazyLock<PubDomainRules> = LazyLock::new(load_pub_domains);
+
+pub fn public_suffix_list_size_of(ops: &mut MallocSizeOfOps) -> usize {
+    PUB_DOMAINS.size_of(ops)
+}
 
 impl<'a> FromIterator<&'a str> for PubDomainRules {
     fn from_iter<T>(iter: T) -> Self
@@ -133,11 +141,48 @@ pub fn is_reg_domain(domain: &str) -> bool {
     PUB_DOMAINS.is_registrable_suffix(domain)
 }
 
+/// <https://html.spec.whatwg.org/multipage/#same-site>
+pub fn is_same_site(site_a: &ImmutableOrigin, site_b: &ImmutableOrigin) -> bool {
+    // First steps are for
+    // https://html.spec.whatwg.org/multipage/#concept-site-same-site
+    //
+    // Step 1. If A and B are the same opaque origin, then return true.
+    if !site_a.is_tuple() && !site_b.is_tuple() && site_a == site_b {
+        return true;
+    }
+
+    // Step 2. If A or B is an opaque origin, then return false.
+    let ImmutableOrigin::Tuple(scheme_a, host_a, _) = site_a else {
+        return false;
+    };
+    let ImmutableOrigin::Tuple(scheme_b, host_b, _) = site_b else {
+        return false;
+    };
+
+    // Step 3. If A's and B's scheme values are different, then return false.
+    if scheme_a != scheme_b {
+        return false;
+    }
+
+    // Step 4. If A's and B's host values are not equal, then return false.
+    // Includes the steps of https://html.spec.whatwg.org/multipage/#obtain-a-site
+    if let (Host::Domain(domain_a), Host::Domain(domain_b)) = (host_a, host_b) {
+        if reg_suffix(domain_a) != reg_suffix(domain_b) {
+            return false;
+        }
+    } else if host_a != host_b {
+        return false;
+    }
+
+    // Step 5. Return true.
+    true
+}
+
 /// The registered domain name (aka eTLD+1) for a URL.
 /// Returns None if the URL has no host name.
 /// Returns the registered suffix for the host name if it is a domain.
 /// Leaves the host name alone if it is an IP address.
-pub fn reg_host(url: &ServoUrl) -> Option<Host> {
+pub fn registered_domain_name(url: &ServoUrl) -> Option<Host> {
     match url.origin() {
         ImmutableOrigin::Tuple(_, Host::Domain(domain), _) => {
             Some(Host::Domain(String::from(reg_suffix(&domain))))

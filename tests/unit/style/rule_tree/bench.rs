@@ -10,10 +10,14 @@ use style::context::QuirksMode;
 use style::error_reporting::{ContextualParseError, ParseErrorReporter};
 use style::media_queries::MediaList;
 use style::properties::{Importance, PropertyDeclaration, PropertyDeclarationBlock, longhands};
-use style::rule_tree::{CascadeLevel, RuleTree, StrongRuleNode, StyleSource};
+use style::rule_tree::{
+    CascadeLevel, CascadeOrigin, RuleCascadeFlags, RuleTree, StrongRuleNode, StyleSource,
+};
 use style::shared_lock::{SharedRwLock, StylesheetGuards};
 use style::stylesheets::layer_rule::LayerOrder;
-use style::stylesheets::{AllowImportRules, CssRule, Origin, Stylesheet, UrlExtraData};
+use style::stylesheets::{
+    AllowImportRules, CssRule, Origin, Stylesheet, StylesheetInDocument, UrlExtraData,
+};
 use style::thread_state::{self, ThreadState};
 use test::{self, Bencher};
 use url::Url;
@@ -77,14 +81,14 @@ fn parse_rules(lock: &SharedRwLock, css: &str) -> Vec<(StyleSource, CascadeLevel
         AllowImportRules::Yes,
     );
     let guard = s.shared_lock.read();
-    let rules = s.contents.rules.read_with(&guard);
+    let rules = s.contents(&guard).rules.read_with(&guard);
     rules
         .0
         .iter()
         .filter_map(|rule| match *rule {
             CssRule::Style(ref style_rule) => Some((
                 StyleSource::from_declarations(style_rule.read_with(&guard).block.clone()),
-                CascadeLevel::UserNormal,
+                CascadeLevel::new(CascadeOrigin::User),
             )),
             _ => None,
         })
@@ -95,7 +99,7 @@ fn test_insertion(rule_tree: &RuleTree, rules: Vec<(StyleSource, CascadeLevel)>)
     rule_tree.insert_ordered_rules(rules.into_iter().map(|(style_source, cascade_level)| {
         (
             style_source,
-            CascadePriority::new(cascade_level, LayerOrder::root()),
+            CascadePriority::new(cascade_level, LayerOrder::root(), RuleCascadeFlags::empty()),
         )
     }))
 }
@@ -113,7 +117,7 @@ fn test_insertion_style_attribute(
                 Importance::Normal,
             ),
         ))),
-        CascadeLevel::UserNormal,
+        CascadeLevel::new(CascadeOrigin::User),
     ));
     test_insertion(rule_tree, rules)
 }

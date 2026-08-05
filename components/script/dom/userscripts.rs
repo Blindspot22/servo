@@ -2,17 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::rc::Rc;
+use script_bindings::root::DomRoot;
 
-use js::jsval::UndefinedValue;
-
-use crate::dom::bindings::refcounted::Trusted;
-use crate::dom::bindings::str::DOMString;
-use crate::dom::htmlheadelement::HTMLHeadElement;
-use crate::dom::htmlscriptelement::SourceCode;
+use crate::dom::html::htmlheadelement::HTMLHeadElement;
 use crate::dom::node::NodeTraits;
-use crate::script_module::ScriptFetchOptions;
-use crate::script_runtime::CanGc;
+use crate::dom::window::Window;
+use crate::realms::enter_auto_realm;
 
 pub(crate) fn load_script(head: &HTMLHeadElement) {
     let doc = head.owner_document();
@@ -20,25 +15,19 @@ pub(crate) fn load_script(head: &HTMLHeadElement) {
     if userscripts.is_empty() {
         return;
     }
-    let window = Trusted::new(doc.window());
-    doc.add_delayed_task(task!(UserScriptExecute: move || {
-        let win = window.root();
-        let cx = win.get_cx();
-        rooted!(in(*cx) let mut rval = UndefinedValue());
+    let win = DomRoot::from_ref(doc.window());
+    doc.add_delayed_task(task!(UserScriptExecute: |cx, win: DomRoot<Window>| {
+        let global_scope = win.as_global_scope();
+        let mut realm = enter_auto_realm(cx, global_scope);
+        let cx = &mut realm.current_realm();
 
         for user_script in userscripts {
-            let script_text = SourceCode::Text(
-                Rc::new(DOMString::from_string(user_script.script))
-            );
-            let global_scope = win.as_global_scope();
-            global_scope.evaluate_script_on_global_with_result(
-                &script_text,
-                &user_script.source_file.map(|path| path.to_string_lossy().to_string()).unwrap_or_default(),
-                rval.handle_mut(),
-                1,
-                ScriptFetchOptions::default_classic_script(global_scope),
-                global_scope.api_base_url(),
-                CanGc::note(),
+            _ = global_scope.evaluate_js_on_global(
+                cx,
+                user_script.script().into(),
+                &user_script.source_file().map(|path| path.to_string_lossy().to_string()).unwrap_or_default(),
+                None,
+                None,
             );
         }
     }));

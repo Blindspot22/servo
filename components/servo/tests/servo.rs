@@ -9,18 +9,14 @@
 //! of `assert!` for test assertions. `ensure!` will produce a `Result::Err` in
 //! place of panicking.
 
+#[expect(dead_code)]
 mod common;
 
-use anyhow::ensure;
-use common::{ServoTest, run_api_tests};
+use common::ServoTest;
 
-fn test_simple_servo_is_not_animating_by_default(
-    servo_test: &ServoTest,
-) -> Result<(), anyhow::Error> {
-    ensure!(!servo_test.servo().animating());
-    Ok(())
-}
-
-fn main() {
-    run_api_tests!(test_simple_servo_is_not_animating_by_default);
+#[test]
+fn test_simple_start_and_stop_servo() {
+    // The drop implementation of `Servo` will trigger the shutdown processs and also spin the
+    // event loop until shutdown is complete.
+    ServoTest::new();
 }

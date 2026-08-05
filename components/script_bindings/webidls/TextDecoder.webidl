@@ -15,9 +15,8 @@ dictionary TextDecodeOptions {
 [Exposed=(Window,Worker)]
 interface TextDecoder {
   [Throws] constructor(optional DOMString label = "utf-8", optional TextDecoderOptions options = {});
-  readonly attribute DOMString encoding;
-  readonly attribute boolean fatal;
-  readonly attribute boolean ignoreBOM;
+
   [Throws]
   USVString decode(optional BufferSource input, optional TextDecodeOptions options = {});
 };
+TextDecoder includes TextDecoderCommon;

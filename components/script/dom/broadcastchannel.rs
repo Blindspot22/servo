@@ -4,20 +4,21 @@
 
 use std::cell::Cell;
 
-use constellation_traits::BroadcastMsg;
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use js::rust::{HandleObject, HandleValue};
+use script_bindings::reflector::reflect_dom_object_with_proto;
+use servo_constellation_traits::BroadcastChannelMsg;
 use uuid::Uuid;
 
 use crate::dom::bindings::codegen::Bindings::BroadcastChannelBinding::BroadcastChannelMethods;
 use crate::dom::bindings::error::{Error, ErrorResult};
-use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object_with_proto};
+use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::structuredclone;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 
 #[dom_struct]
 pub(crate) struct BroadcastChannel {
@@ -30,16 +31,16 @@ pub(crate) struct BroadcastChannel {
 
 impl BroadcastChannel {
     fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
         name: DOMString,
-        can_gc: CanGc,
     ) -> DomRoot<BroadcastChannel> {
         let channel = reflect_dom_object_with_proto(
+            cx,
             Box::new(BroadcastChannel::new_inherited(name)),
             global,
             proto,
-            can_gc,
         );
         global.track_broadcast_channel(&channel);
         channel
@@ -69,19 +70,21 @@ impl BroadcastChannel {
 impl BroadcastChannelMethods<crate::DomTypeHolder> for BroadcastChannel {
     /// <https://html.spec.whatwg.org/multipage/#broadcastchannel>
     fn Constructor(
+        cx: &mut JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
         name: DOMString,
     ) -> DomRoot<BroadcastChannel> {
-        BroadcastChannel::new(global, proto, name, can_gc)
+        BroadcastChannel::new(cx, global, proto, name)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-messageport-postmessage>
-    fn PostMessage(&self, cx: SafeJSContext, message: HandleValue) -> ErrorResult {
+    fn PostMessage(&self, cx: &mut JSContext, message: HandleValue) -> ErrorResult {
         // Step 3, if closed.
         if self.closed.get() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(Some(
+                "Cannot post message on a closed BroadcastChannel".to_string(),
+            )));
         }
 
         // Step 6, StructuredSerialize(message).
@@ -89,9 +92,9 @@ impl BroadcastChannelMethods<crate::DomTypeHolder> for BroadcastChannel {
 
         let global = self.global();
 
-        let msg = BroadcastMsg {
+        let msg = BroadcastChannelMsg {
             origin: global.origin().immutable().clone(),
-            channel_name: self.Name().to_string(),
+            channel_name: String::from(self.Name()),
             data,
         };
 

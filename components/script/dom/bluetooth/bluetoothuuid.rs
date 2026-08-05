@@ -4,16 +4,17 @@
 
 use dom_struct::dom_struct;
 use regex::Regex;
+use script_bindings::cformat;
+use script_bindings::reflector::Reflector;
 
 use crate::dom::bindings::codegen::Bindings::BluetoothUUIDBinding::BluetoothUUIDMethods;
 use crate::dom::bindings::codegen::UnionTypes::StringOrUnsignedLong;
 use crate::dom::bindings::error::Error::Type;
 use crate::dom::bindings::error::Fallible;
-use crate::dom::bindings::reflector::Reflector;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::window::Window;
 
-#[allow(clippy::upper_case_acronyms)]
+#[expect(clippy::upper_case_acronyms)]
 pub(crate) type UUID = DOMString;
 pub(crate) type BluetoothServiceUUID = StringOrUnsignedLong;
 pub(crate) type BluetoothCharacteristicUUID = StringOrUnsignedLong;
@@ -25,7 +26,7 @@ pub(crate) struct BluetoothUUID {
     reflector_: Reflector,
 }
 
-//https://developer.bluetooth.org/gatt/services/Pages/ServicesHome.aspx
+// https://developer.bluetooth.org/gatt/services/Pages/ServicesHome.aspx
 const BLUETOOTH_ASSIGNED_SERVICES: &[(&str, u32)] = &[
     ("org.bluetooth.service.alert_notification", 0x1811_u32),
     ("org.bluetooth.service.automation_io", 0x1815_u32),
@@ -76,7 +77,7 @@ const BLUETOOTH_ASSIGNED_SERVICES: &[(&str, u32)] = &[
     ("org.bluetooth.service.weight_scale", 0x181d_u32),
 ];
 
-//https://developer.bluetooth.org/gatt/services/Pages/ServicesHome.aspx
+// https://developer.bluetooth.org/gatt/services/Pages/ServicesHome.aspx
 const BLUETOOTH_ASSIGNED_CHARCTERISTICS: &[(&str, u32)] = &[
     (
         "org.bluetooth.characteristic.aerobic_heart_rate_lower_limit",
@@ -524,7 +525,7 @@ const BLUETOOTH_ASSIGNED_CHARCTERISTICS: &[(&str, u32)] = &[
     ("org.bluetooth.characteristic.wind_chill", 0x2a79_u32),
 ];
 
-//https://developer.bluetooth.org/gatt/services/Pages/ServicesHome.aspx
+// https://developer.bluetooth.org/gatt/services/Pages/ServicesHome.aspx
 const BLUETOOTH_ASSIGNED_DESCRIPTORS: &[(&str, u32)] = &[
     (
         "org.bluetooth.descriptor.gatt.characteristic_extended_properties",
@@ -583,22 +584,22 @@ const DESCRIPTOR_ERROR_MESSAGE: &str = "https://developer.bluetooth.org/gatt/des
      DescriptorsHomePage.aspx\ne.g. 'gatt.characteristic_presentation_format'.";
 
 impl BluetoothUUIDMethods<crate::DomTypeHolder> for BluetoothUUID {
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothuuid-canonicaluuid
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothuuid-canonicaluuid>
     fn CanonicalUUID(_: &Window, alias: u32) -> UUID {
         canonical_uuid(alias)
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothuuid-getservice
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothuuid-getservice>
     fn GetService(_: &Window, name: BluetoothServiceUUID) -> Fallible<UUID> {
         Self::service(name)
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothuuid-getcharacteristic
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothuuid-getcharacteristic>
     fn GetCharacteristic(_: &Window, name: BluetoothCharacteristicUUID) -> Fallible<UUID> {
         Self::characteristic(name)
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothuuid-getdescriptor
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothuuid-getdescriptor>
     fn GetDescriptor(_: &Window, name: BluetoothDescriptorUUID) -> Fallible<UUID> {
         Self::descriptor(name)
     }
@@ -626,7 +627,7 @@ fn canonical_uuid(alias: u32) -> UUID {
     UUID::from(format!("{:08x}", &alias) + BASE_UUID)
 }
 
-// https://webbluetoothcg.github.io/web-bluetooth/#resolveuuidname
+/// <https://webbluetoothcg.github.io/web-bluetooth/#resolveuuidname>
 fn resolve_uuid_name(
     name: StringOrUnsignedLong,
     assigned_numbers_table: &'static [(&'static str, u32)],
@@ -638,7 +639,7 @@ fn resolve_uuid_name(
         StringOrUnsignedLong::String(dstring) => {
             // Step 2.
             let regex = Regex::new(VALID_UUID_REGEX).unwrap();
-            if regex.is_match(&dstring) {
+            if regex.is_match(&dstring.str()) {
                 Ok(dstring)
             } else {
                 // Step 3.
@@ -656,9 +657,12 @@ fn resolve_uuid_name(
                             _ => unreachable!(),
                         };
                         // Step 4.
-                        Err(Type(format!(
+                        Err(Type(cformat!(
                             "Invalid {} name : '{}'.\n{} {}",
-                            attribute_type, dstring, UUID_ERROR_MESSAGE, error_url_message
+                            attribute_type,
+                            dstring,
+                            UUID_ERROR_MESSAGE,
+                            error_url_message
                         )))
                     },
                 }

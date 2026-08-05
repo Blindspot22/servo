@@ -4,25 +4,22 @@
 
 use std::cmp::{max, min};
 use std::ops::Range;
-use std::path::PathBuf;
-use std::time::SystemTime;
 
-use base::id::WebViewId;
-use embedder_traits::FilterPattern;
+use embedder_traits::{EmbedderControlId, EmbedderControlResponse, FilePickerRequest};
 use ipc_channel::ipc::IpcSender;
 use malloc_size_of_derive::MallocSizeOf;
 use num_traits::ToPrimitive;
+use profile_traits::generic_callback::GenericCallback;
 use serde::{Deserialize, Serialize};
+use servo_base::generic_channel::GenericSender;
+use servo_url::ImmutableOrigin;
 use uuid::Uuid;
 
+use crate::CoreResourceMsg;
 use crate::blob_url_store::{BlobBuf, BlobURLStoreError};
 
-// HACK: Not really process-safe now, we should send Origin
-//       directly instead of this in future, blocked on #11722
-/// File manager store entry's origin
-pub type FileOrigin = String;
-
 /// A token modulating access to a file for a blob URL.
+#[derive(Clone, Debug)]
 pub enum FileTokenCheck {
     /// Checking against a token not required,
     /// used for accessing a file
@@ -122,64 +119,64 @@ impl RelativePos {
     }
 }
 
-/// Response to file selection request
-#[derive(Debug, Deserialize, Serialize)]
-pub struct SelectedFile {
-    pub id: Uuid,
-    pub filename: PathBuf,
-    pub modified: SystemTime,
-    pub size: u64,
-    // https://w3c.github.io/FileAPI/#dfn-type
-    pub type_string: String,
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 pub enum FileManagerThreadMsg {
-    /// Select a single file. Last field is pre-selected file path for testing
-    SelectFile(
-        WebViewId,
-        Vec<FilterPattern>,
-        IpcSender<FileManagerResult<SelectedFile>>,
-        FileOrigin,
-        Option<PathBuf>,
-    ),
-
-    /// Select multiple files. Last field is pre-selected file paths for testing
+    /// Select a file or files.
     SelectFiles(
-        WebViewId,
-        Vec<FilterPattern>,
-        IpcSender<FileManagerResult<Vec<SelectedFile>>>,
-        FileOrigin,
-        Option<Vec<PathBuf>>,
+        EmbedderControlId,
+        FilePickerRequest,
+        GenericCallback<EmbedderControlResponse>,
     ),
 
     /// Read FileID-indexed file in chunks, optionally check URL validity based on boolean flag
     ReadFile(
         IpcSender<FileManagerResult<ReadFileProgress>>,
         Uuid,
-        FileOrigin,
+        ImmutableOrigin,
     ),
 
     /// Add an entry as promoted memory-based blob
-    PromoteMemory(Uuid, BlobBuf, bool, FileOrigin),
+    PromoteMemory(Uuid, BlobBuf, bool, ImmutableOrigin),
 
     /// Add a sliced entry pointing to the parent FileID, and send back the associated FileID
     /// as part of a valid Blob URL
     AddSlicedURLEntry(
         Uuid,
         RelativePos,
-        IpcSender<Result<Uuid, BlobURLStoreError>>,
-        FileOrigin,
+        GenericSender<Result<Uuid, BlobURLStoreError>>,
+        ImmutableOrigin,
     ),
 
     /// Decrease reference count and send back the acknowledgement
-    DecRef(Uuid, FileOrigin, IpcSender<Result<(), BlobURLStoreError>>),
+    DecRef(
+        Uuid,
+        ImmutableOrigin,
+        GenericSender<Result<(), BlobURLStoreError>>,
+    ),
 
     /// Activate an internal FileID so it becomes valid as part of a Blob URL
-    ActivateBlobURL(Uuid, IpcSender<Result<(), BlobURLStoreError>>, FileOrigin),
+    ActivateBlobURL(
+        Uuid,
+        IpcSender<Result<(), BlobURLStoreError>>,
+        ImmutableOrigin,
+    ),
 
     /// Revoke Blob URL and send back the acknowledgement
-    RevokeBlobURL(Uuid, FileOrigin, IpcSender<Result<(), BlobURLStoreError>>),
+    RevokeBlobURL(
+        Uuid,
+        ImmutableOrigin,
+        GenericSender<Result<(), BlobURLStoreError>>,
+    ),
+
+    GetTokenForFile(Uuid, ImmutableOrigin, GenericSender<GetTokenForFileReply>),
+    RevokeTokenForFile(Uuid, Uuid),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct GetTokenForFileReply {
+    pub token: Option<Uuid>,
+    pub revoke_sender: GenericSender<CoreResourceMsg>,
+    pub refresh_sender: GenericSender<CoreResourceMsg>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

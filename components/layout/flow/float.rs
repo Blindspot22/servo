@@ -828,22 +828,21 @@ impl FloatBandLink {
     ///     A   B          B   R
     /// ```
     fn skew(&self) -> FloatBandLink {
-        if let Some(ref this) = self.0 {
-            if let Some(ref left) = this.left.0 {
-                if this.level == left.level {
-                    return FloatBandLink(Some(Arc::new(FloatBandNode {
-                        level: this.level,
-                        left: left.left.clone(),
-                        band: left.band,
-                        right: FloatBandLink(Some(Arc::new(FloatBandNode {
-                            level: this.level,
-                            left: left.right.clone(),
-                            band: this.band,
-                            right: this.right.clone(),
-                        }))),
-                    })));
-                }
-            }
+        if let Some(ref this) = self.0 &&
+            let Some(ref left) = this.left.0 &&
+            this.level == left.level
+        {
+            return FloatBandLink(Some(Arc::new(FloatBandNode {
+                level: this.level,
+                left: left.left.clone(),
+                band: left.band,
+                right: FloatBandLink(Some(Arc::new(FloatBandNode {
+                    level: this.level,
+                    left: left.right.clone(),
+                    band: this.band,
+                    right: this.right.clone(),
+                }))),
+            })));
         }
 
         (*self).clone()
@@ -858,24 +857,22 @@ impl FloatBandLink {
     ///         B   X    A   B
     /// ```
     fn split(&self) -> FloatBandLink {
-        if let Some(ref this) = self.0 {
-            if let Some(ref right) = this.right.0 {
-                if let Some(ref right_right) = right.right.0 {
-                    if this.level == right_right.level {
-                        return FloatBandLink(Some(Arc::new(FloatBandNode {
-                            level: this.level + 1,
-                            left: FloatBandLink(Some(Arc::new(FloatBandNode {
-                                level: this.level,
-                                left: this.left.clone(),
-                                band: this.band,
-                                right: right.left.clone(),
-                            }))),
-                            band: right.band,
-                            right: right.right.clone(),
-                        })));
-                    }
-                }
-            }
+        if let Some(ref this) = self.0 &&
+            let Some(ref right) = this.right.0 &&
+            let Some(ref right_right) = right.right.0 &&
+            this.level == right_right.level
+        {
+            return FloatBandLink(Some(Arc::new(FloatBandNode {
+                level: this.level + 1,
+                left: FloatBandLink(Some(Arc::new(FloatBandNode {
+                    level: this.level,
+                    left: this.left.clone(),
+                    band: this.band,
+                    right: right.left.clone(),
+                }))),
+                band: right.band,
+                right: right.right.clone(),
+            })));
         }
 
         (*self).clone()
@@ -897,8 +894,7 @@ impl FloatBox {
                 info,
                 display_inside,
                 contents,
-                // Text decorations are not propagated to any out-of-flow descendants
-                propagated_data.without_text_decorations(),
+                propagated_data,
             ),
         }
     }
@@ -992,12 +988,12 @@ impl SequentialLayoutState {
         self.bfc_relative_block_position + self.current_margin.solve()
     }
 
-    /// Collapses margins, moving the block position down by the collapsed value of `current_margin`
+    /// Commits margins, moving the block position down by the collapsed value of `current_margin`
     /// and resetting `current_margin` to zero.
     ///
     /// Call this method before laying out children when it is known that the start margin of the
     /// current fragment can't collapse with the margins of any of its children.
-    pub(crate) fn collapse_margins(&mut self) {
+    pub(crate) fn commit_margin(&mut self) {
         self.advance_block_position(self.current_margin.solve());
         self.current_margin = CollapsedMargin::zero();
     }
@@ -1067,36 +1063,6 @@ impl SequentialLayoutState {
             .map(|offset| offset - self.position_with_zero_clearance(block_start_margin))
     }
 
-    /// A block that is replaced or establishes an independent formatting context can't overlap floats,
-    /// it has to be placed next to them, and may get some clearance if there isn't enough space.
-    /// Given such a block with the provided 'clear', 'block_start_margin', 'pbm' and 'object_size',
-    /// this method finds an area that is big enough and doesn't overlap floats.
-    /// It returns a tuple with:
-    /// - The clearance amount (if any), which includes both the effect of 'clear'
-    ///   and the extra space to avoid floats.
-    /// - The LogicalRect in which the block can be placed without overlapping floats.
-    pub(crate) fn calculate_clearance_and_inline_adjustment(
-        &self,
-        clear: Clear,
-        block_start_margin: &CollapsedMargin,
-        pbm: &PaddingBorderMargin,
-        object_size: LogicalVec2<Au>,
-    ) -> (Option<Au>, LogicalRect<Au>) {
-        // First compute the clear position required by the 'clear' property.
-        // The code below may then add extra clearance when the element can't fit
-        // next to floats not covered by 'clear'.
-        let clear_position = self.calculate_clear_position(clear, block_start_margin);
-        let ceiling =
-            clear_position.unwrap_or_else(|| self.position_without_clearance(block_start_margin));
-        let mut placement = PlacementAmongFloats::new(&self.floats, ceiling, object_size, pbm);
-        let placement_rect = placement.place();
-        let position = &placement_rect.start_corner;
-        let has_clearance = clear_position.is_some() || position.block > ceiling;
-        let clearance = has_clearance
-            .then(|| position.block - self.position_with_zero_clearance(block_start_margin));
-        (clearance, placement_rect)
-    }
-
     /// Adds a new adjoining margin.
     pub(crate) fn adjoin_assign(&mut self, margin: &CollapsedMargin) {
         self.current_margin.adjoin_assign(margin)
@@ -1114,7 +1080,7 @@ impl SequentialLayoutState {
     /// This function places a Fragment that has been created for a FloatBox.
     pub(crate) fn place_float_fragment(
         &mut self,
-        box_fragment: &mut BoxFragment,
+        box_fragment: &BoxFragment,
         containing_block: &ContainingBlock,
         margins_collapsing_with_parent_containing_block: CollapsedMargin,
         block_offset_from_containing_block_top: Au,
@@ -1130,9 +1096,10 @@ impl SequentialLayoutState {
             block_start_of_containing_block_in_bfc + block_offset_from_containing_block_top,
         );
 
+        let style = box_fragment.style().clone();
         let container_writing_mode = containing_block.style.writing_mode;
         let logical_float_size = box_fragment
-            .content_rect
+            .content_rect()
             .size
             .to_logical(container_writing_mode);
         let pbm_sums = box_fragment
@@ -1140,21 +1107,15 @@ impl SequentialLayoutState {
             .to_logical(container_writing_mode);
         let margin_box_start_corner = self.floats.add_float(&PlacementInfo {
             size: logical_float_size + pbm_sums.sum(),
-            side: FloatSide::from_style_and_container_writing_mode(
-                &box_fragment.style,
-                container_writing_mode,
-            )
-            .expect("Float box wasn't floated!"),
-            clear: Clear::from_style_and_container_writing_mode(
-                &box_fragment.style,
-                container_writing_mode,
-            ),
+            side: FloatSide::from_style_and_container_writing_mode(&style, container_writing_mode)
+                .expect("Float box wasn't floated!"),
+            clear: Clear::from_style_and_container_writing_mode(&style, container_writing_mode),
         });
 
         // Re-calculate relative adjustment so that it is not lost when the BoxFragment's
         // `content_rect` is overwritten below.
-        let relative_offset = match box_fragment.style.clone_position() {
-            Position::Relative => relative_adjustement(&box_fragment.style, containing_block),
+        let relative_offset = match style.clone_position() {
+            Position::Relative => relative_adjustement(&style, containing_block),
             _ => LogicalVec2::zero(),
         };
 
@@ -1169,13 +1130,15 @@ impl SequentialLayoutState {
             block: new_position_in_bfc.block - block_start_of_containing_block_in_bfc,
         };
 
-        box_fragment.content_rect = LogicalRect {
-            start_corner: new_position_in_containing_block,
-            size: box_fragment
-                .content_rect
-                .size
-                .to_logical(container_writing_mode),
-        }
-        .as_physical(Some(containing_block));
+        box_fragment.base.set_rect(
+            LogicalRect {
+                start_corner: new_position_in_containing_block,
+                size: box_fragment
+                    .content_rect()
+                    .size
+                    .to_logical(container_writing_mode),
+            }
+            .as_physical(Some(containing_block)),
+        );
     }
 }
