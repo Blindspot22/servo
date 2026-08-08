@@ -234,8 +234,8 @@ impl FontMetrics {
 
 #[derive(Debug, Default)]
 struct CachedShapeData {
-    glyph_advances: HashMap<GlyphId, FractionalPixel>,
-    glyph_indices: HashMap<char, Option<GlyphId>>,
+    glyph_advances: FxHashMap<GlyphId, FractionalPixel>,
+    glyph_indices: FxHashMap<char, Option<GlyphId>>,
     shaped_text: HashMap<ShapeCacheEntry, Arc<ShapedText>>,
 }
 
@@ -598,7 +598,7 @@ impl Font {
         glyph_index
     }
 
-    pub(crate) fn has_glyph_for(&self, codepoint: char) -> bool {
+    pub fn has_glyph_for(&self, codepoint: char) -> bool {
         self.glyph_index(codepoint).is_some()
     }
 

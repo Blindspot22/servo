@@ -96,13 +96,13 @@ use std::thread::JoinHandle;
 use std::{process, thread};
 
 use background_hang_monitor_api::{
-    BackgroundHangMonitorControlMsg, BackgroundHangMonitorRegister, HangMonitorAlert,
+    BackgroundHangMonitorControlMsg, BackgroundHangMonitorRegister, HangAlert,
 };
 use content_security_policy::sandboxing_directive::SandboxingFlagSet;
 use crossbeam_channel::{Receiver, Select, Sender, unbounded};
 use devtools_traits::{
     ChromeToDevtoolsControlMsg, DevtoolsControlMsg, DevtoolsPageInfo, NavigationState,
-    ScriptToDevtoolsControlMsg,
+    ScriptToDevtoolsControlMsg, WorkerId,
 };
 use embedder_traits::resources::{self, Resource};
 use embedder_traits::user_contents::{UserContentManagerId, UserContents};
@@ -166,7 +166,7 @@ use servo_constellation_traits::{
     ScreenshotReadinessResponse, ScriptToConstellationMessage, ScrollStateUpdate,
     ServiceWorkerAlgorithm, ServiceWorkerManagerFactory, ServiceWorkerMsg,
     StructuredSerializedData, TargetSnapshotParams, TraversalDirection, UserContentManagerAction,
-    WindowSizeType,
+    WindowSizeType, WorkerAnimationFrameTick,
 };
 use servo_url::{Host, ImmutableOrigin, ServoUrl};
 use storage_traits::StorageThreads;
@@ -266,6 +266,13 @@ struct BrowsingContextGroup {
     webgpus: HashMap<Host, WebGPU>,
 }
 
+struct WorkerAnimationFrameProvider {
+    webview_id: WebViewId,
+    pipeline_id: PipelineId,
+    sender: GenericSender<WorkerAnimationFrameTick>,
+    tick_pending: bool,
+}
+
 /// The `Constellation` itself. In the servo browser, there is one
 /// constellation, which maintains all of the browser global data.
 /// In embedded applications, there may be more than one constellation,
@@ -313,11 +320,11 @@ pub struct Constellation<STF, SWF> {
 
     /// A channel for the background hang monitor to send messages
     /// to the constellation.
-    pub(crate) background_hang_monitor_sender: GenericSender<HangMonitorAlert>,
+    pub(crate) background_hang_monitor_sender: GenericSender<HangAlert>,
 
     /// A channel for the constellation to receiver messages
     /// from the background hang monitor.
-    background_hang_monitor_receiver: RoutedReceiver<HangMonitorAlert>,
+    background_hang_monitor_receiver: RoutedReceiver<HangAlert>,
 
     /// A factory for creating layouts. This allows customizing the kind
     /// of layout created for a [`Constellation`] and prevents a circular crate
@@ -411,6 +418,8 @@ pub struct Constellation<STF, SWF> {
     /// The set of all the pipelines in the browser.  (See the `pipeline` module
     /// for more details.)
     pipelines: FxHashMap<PipelineId, Pipeline>,
+
+    worker_animation_frame_providers: FxHashMap<WorkerId, WorkerAnimationFrameProvider>,
 
     /// The set of all the browsing contexts in the browser.
     browsing_contexts: FxHashMap<BrowsingContextId, BrowsingContext>,
@@ -619,6 +628,7 @@ where
         thread::Builder::new()
             .name("Constellation".to_owned())
             .spawn(move || {
+                servo_base::threadboost::mark_thread_as_critical();
                 let (script_ipc_sender, script_ipc_receiver) =
                     generic_channel::channel().expect("ipc channel failure");
                 let script_receiver = script_ipc_receiver.route_preserving_errors();
@@ -702,6 +712,7 @@ where
                     broadcast_channels: Default::default(),
                     pipeline_interests: Default::default(),
                     pipelines: Default::default(),
+                    worker_animation_frame_providers: Default::default(),
                     browsing_contexts: Default::default(),
                     pending_changes: vec![],
                     next_pipeline_namespace_id: Cell::new(FIRST_CONTENT_PIPELINE_NAMESPACE_ID),
@@ -1220,7 +1231,7 @@ where
         enum Request {
             PipelineNamespace(PipelineNamespaceRequest),
             Script((WebViewId, PipelineId, ScriptToConstellationMessage)),
-            BackgroundHangMonitor(HangMonitorAlert),
+            BackgroundHangMonitor(HangAlert),
             Embedder(EmbedderToConstellationMessage),
             RemoveProcess(usize),
         }
@@ -1303,17 +1314,10 @@ where
     }
 
     #[servo_tracing::instrument(skip_all)]
-    fn handle_request_from_background_hang_monitor(&self, message: HangMonitorAlert) {
-        match message {
-            HangMonitorAlert::Profile(bytes) => self
-                .constellation_to_embedder_proxy
-                .send(ConstellationToEmbedderMsg::ReportProfile(bytes)),
-            HangMonitorAlert::Hang(hang) => {
-                // TODO: In case of a permanent hang being reported, add a "kill script" workflow,
-                // via the embedder?
-                warn!("Component hang alert: {:?}", hang);
-            },
-        }
+    fn handle_request_from_background_hang_monitor(&self, message: HangAlert) {
+        // TODO: In case of a permanent hang being reported, add a "kill script" workflow,
+        // via the embedder?
+        warn!("Component hang alert: {:?}", message);
     }
 
     #[servo_tracing::instrument(skip_all)]
@@ -1414,11 +1418,6 @@ where
             },
             EmbedderToConstellationMessage::RefreshCursor(pipeline_id) => {
                 self.handle_refresh_cursor(pipeline_id)
-            },
-            EmbedderToConstellationMessage::ToggleProfiler(rate, max_duration) => {
-                self.send_message_to_all_background_hang_monitors(
-                    BackgroundHangMonitorControlMsg::ToggleSampler(rate, max_duration),
-                );
             },
             EmbedderToConstellationMessage::ExitFullScreen(webview_id) => {
                 self.handle_exit_fullscreen_msg(webview_id);
@@ -1753,6 +1752,26 @@ where
             ScriptToConstellationMessage::ChangeRunningAnimationsState(animation_state) => {
                 self.handle_change_running_animations_state(source_pipeline_id, animation_state)
             },
+            ScriptToConstellationMessage::RegisterWorkerAnimationFrameProvider(
+                worker_id,
+                sender,
+            ) => self.handle_register_worker_animation_frame_provider(
+                webview_id,
+                source_pipeline_id,
+                worker_id,
+                sender,
+            ),
+            ScriptToConstellationMessage::UnregisterWorkerAnimationFrameProvider(worker_id) => {
+                self.handle_unregister_worker_animation_frame_provider(worker_id)
+            },
+            ScriptToConstellationMessage::ChangeWorkerAnimationFrameProviderState(
+                worker_id,
+                active,
+            ) => self.handle_change_worker_animation_frame_provider_state(
+                source_pipeline_id,
+                worker_id,
+                active,
+            ),
             // Ask the embedder for permission to load a new page.
             ScriptToConstellationMessage::LoadUrl(
                 load_data,
@@ -2914,6 +2933,8 @@ where
 
     fn handle_pipeline_exited(&mut self, pipeline_id: PipelineId) {
         debug!("{}: Exited", pipeline_id);
+        self.remove_worker_animation_frame_providers_for_pipeline(pipeline_id);
+
         let Some(pipeline) = self.pipelines.remove(&pipeline_id) else {
             return;
         };
@@ -3690,22 +3711,221 @@ where
         pipeline_id: PipelineId,
         animation_state: AnimationState,
     ) {
-        if let Some(pipeline) = self.pipelines.get_mut(&pipeline_id) &&
-            pipeline.animation_state != animation_state
-        {
-            pipeline.animation_state = animation_state;
-            self.paint_proxy
-                .send(PaintMessage::ChangeRunningAnimationsState(
-                    pipeline.webview_id,
-                    pipeline_id,
-                    animation_state,
-                ))
+        match animation_state {
+            AnimationState::AnimationCallbacksPresent => {
+                self.handle_change_document_animation_frame_provider_state(pipeline_id, true);
+            },
+            AnimationState::AnimationCallbacksAbsent => {
+                self.handle_change_document_animation_frame_provider_state(pipeline_id, false);
+            },
+            AnimationState::AnimationsPresent | AnimationState::NoAnimationsPresent => {
+                if let Some(pipeline) = self.pipelines.get_mut(&pipeline_id) &&
+                    pipeline.animation_state != animation_state
+                {
+                    pipeline.animation_state = animation_state;
+                    self.paint_proxy
+                        .send(PaintMessage::ChangeRunningAnimationsState(
+                            pipeline.webview_id,
+                            pipeline_id,
+                            animation_state,
+                        ))
+                }
+            },
         }
     }
 
+    fn send_animation_frame_callbacks_state_if_changed(&mut self, pipeline_id: PipelineId) {
+        let Some(pipeline) = self.pipelines.get_mut(&pipeline_id) else {
+            return;
+        };
+
+        // Paint only tracks per-pipeline callback state.
+        let callbacks_active =
+            pipeline.document_callbacks_active || !pipeline.worker_callbacks_active.is_empty();
+        if pipeline.last_callbacks_active_sent_to_paint == callbacks_active {
+            return;
+        }
+
+        pipeline.last_callbacks_active_sent_to_paint = callbacks_active;
+        let animation_state = if callbacks_active {
+            AnimationState::AnimationCallbacksPresent
+        } else {
+            AnimationState::AnimationCallbacksAbsent
+        };
+
+        self.paint_proxy
+            .send(PaintMessage::ChangeRunningAnimationsState(
+                pipeline.webview_id,
+                pipeline_id,
+                animation_state,
+            ));
+    }
+
+    fn handle_change_document_animation_frame_provider_state(
+        &mut self,
+        pipeline_id: PipelineId,
+        active: bool,
+    ) {
+        let Some(pipeline) = self.pipelines.get_mut(&pipeline_id) else {
+            return;
+        };
+
+        if pipeline.document_callbacks_active == active {
+            return;
+        }
+
+        pipeline.document_callbacks_active = active;
+        self.send_animation_frame_callbacks_state_if_changed(pipeline_id);
+    }
+
+    fn handle_register_worker_animation_frame_provider(
+        &mut self,
+        webview_id: WebViewId,
+        pipeline_id: PipelineId,
+        worker_id: WorkerId,
+        sender: GenericSender<WorkerAnimationFrameTick>,
+    ) {
+        if !self.pipelines.contains_key(&pipeline_id) {
+            debug!(
+                "Ignoring worker animation frame provider for closed pipeline: worker={worker_id:?}, pipeline={pipeline_id:?} ---->",
+            );
+            return;
+        }
+
+        debug!(
+            "Registering worker animation frame provider: worker={worker_id:?}, pipeline={pipeline_id:?}---->",
+        );
+        self.worker_animation_frame_providers.insert(
+            worker_id,
+            WorkerAnimationFrameProvider {
+                webview_id,
+                pipeline_id,
+                sender,
+                tick_pending: false,
+            },
+        );
+    }
+
+    fn handle_unregister_worker_animation_frame_provider(&mut self, worker_id: WorkerId) {
+        let Some(provider) = self.worker_animation_frame_providers.remove(&worker_id) else {
+            return;
+        };
+
+        debug!(
+            "Unregistering worker animation frame provider: worker={worker_id:?}, pipeline={:?}",
+            provider.pipeline_id,
+        );
+        if let Some(pipeline) = self.pipelines.get_mut(&provider.pipeline_id) {
+            pipeline.worker_callbacks_active.remove(&worker_id);
+        }
+        self.send_animation_frame_callbacks_state_if_changed(provider.pipeline_id);
+    }
+
+    fn remove_worker_animation_frame_providers_for_pipeline(&mut self, pipeline_id: PipelineId) {
+        let worker_ids = self
+            .worker_animation_frame_providers
+            .iter()
+            .filter_map(|(worker_id, provider)| {
+                (provider.pipeline_id == pipeline_id).then_some(*worker_id)
+            })
+            .collect::<Vec<_>>();
+
+        if worker_ids.is_empty() {
+            return;
+        }
+
+        for worker_id in &worker_ids {
+            self.worker_animation_frame_providers.remove(worker_id);
+        }
+
+        if let Some(pipeline) = self.pipelines.get_mut(&pipeline_id) {
+            let mut changed = false;
+            for worker_id in &worker_ids {
+                changed |= pipeline.worker_callbacks_active.remove(worker_id);
+            }
+            if changed {
+                self.send_animation_frame_callbacks_state_if_changed(pipeline_id);
+            }
+        }
+    }
+
+    fn handle_change_worker_animation_frame_provider_state(
+        &mut self,
+        pipeline_id: PipelineId,
+        worker_id: WorkerId,
+        active: bool,
+    ) {
+        let Some(provider) = self.worker_animation_frame_providers.get_mut(&worker_id) else {
+            return;
+        };
+        let provider_pipeline_id = provider.pipeline_id;
+        let provider_webview_id = provider.webview_id;
+        if provider_pipeline_id != pipeline_id {
+            warn!("Worker animation frame state arrived for an unexpected pipeline --->");
+            return;
+        }
+        let tick_was_pending = std::mem::take(&mut provider.tick_pending);
+
+        if !self.pipelines.contains_key(&pipeline_id) {
+            debug!(
+                "Removing worker animation frame provider for closed pipeline: worker={worker_id:?}, pipeline={pipeline_id:?}",
+            );
+            self.worker_animation_frame_providers.remove(&worker_id);
+            return;
+        }
+
+        let Some(pipeline) = self.pipelines.get_mut(&pipeline_id) else {
+            return;
+        };
+
+        let changed = if active {
+            pipeline.worker_callbacks_active.insert(worker_id)
+        } else {
+            pipeline.worker_callbacks_active.remove(&worker_id)
+        };
+        debug!(
+            "Worker animation frame provider state: worker={worker_id:?}, pipeline={pipeline_id:?}, active={active}, changed={changed}",
+        );
+        if changed {
+            self.send_animation_frame_callbacks_state_if_changed(pipeline_id);
+        } else if active && tick_was_pending {
+            // Worker only rAF may not produce a display list so request a frame
+            // for the next refresh-driver tick.
+            self.paint_proxy
+                .send(PaintMessage::GenerateFrame(vec![PainterId::from(
+                    provider_webview_id,
+                )]));
+        }
+    }
+
+    fn deliver_rendering_opportunity_to_worker(&mut self, worker_id: WorkerId) {
+        let mut send_failed = false;
+        {
+            let Some(provider) = self.worker_animation_frame_providers.get_mut(&worker_id) else {
+                return;
+            };
+            if provider.tick_pending {
+                debug!("Skipping pending rendering opportunity: worker={worker_id:?}");
+                return;
+            }
+            if provider.sender.send(WorkerAnimationFrameTick).is_err() {
+                send_failed = true;
+            } else {
+                debug!("Delivered rendering opportunity: worker={worker_id:?}");
+                provider.tick_pending = true;
+            }
+        }
+
+        if send_failed {
+            self.handle_unregister_worker_animation_frame_provider(worker_id);
+        }
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#rendering-opportunity>
     #[servo_tracing::instrument(skip_all)]
     fn handle_tick_animation(&mut self, webview_ids: Vec<WebViewId>) {
         let mut animating_event_loops = HashSet::new();
+        let mut animating_workers = FxHashSet::default();
 
         for webview_id in webview_ids.iter() {
             for browsing_context in self.fully_active_browsing_contexts_iter(*webview_id) {
@@ -3713,6 +3933,9 @@ where
                     continue;
                 };
 
+                animating_workers.extend(pipeline.worker_callbacks_active.iter().copied());
+
+                // Window rAF still follows the existing script-thread path.
                 let event_loop = &pipeline.event_loop;
                 if !animating_event_loops.contains(&event_loop.id()) {
                     // No error handling here. It's unclear what to do when this fails as the error isn't associated
@@ -3723,6 +3946,25 @@ where
                         .send(ScriptThreadMessage::TickAllAnimations(webview_ids.clone()));
                     animating_event_loops.insert(event_loop.id());
                 }
+            }
+        }
+
+        // Step 6.1.2 runs on the worker event loop; constellation only sends
+        // tick messages for workers active on this refresh tick.
+        for worker_id in animating_workers {
+            let Some(provider) = self.worker_animation_frame_providers.get(&worker_id) else {
+                error!(
+                    "No animation frame provider found for active worker: worker={worker_id:?}, webviews={webview_ids:?}",
+                );
+                continue;
+            };
+            if webview_ids.contains(&provider.webview_id) {
+                self.deliver_rendering_opportunity_to_worker(worker_id);
+            } else {
+                error!(
+                    "Worker animation frame provider's WebView is not part of the current refresh tick: worker={worker_id:?}, provider_webview={:?}, webviews={webview_ids:?}",
+                    provider.webview_id,
+                );
             }
         }
     }
@@ -5965,7 +6207,10 @@ where
     fn create_canvas_paint_thread(
         &self,
     ) -> (Sender<ConstellationCanvasMsg>, GenericSender<CanvasMsg>) {
-        CanvasPaintThread::start(self.paint_proxy.cross_process_paint_api.clone())
+        CanvasPaintThread::start(
+            self.paint_proxy.cross_process_paint_api.clone(),
+            self.mem_profiler_chan.clone(),
+        )
     }
 
     fn handle_embedder_control_response(

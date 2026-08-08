@@ -16,6 +16,7 @@ use net_traits::image_cache::Image as CachedImage;
 use paint_api::display_list::{PaintDisplayListInfo, SpatialTreeNodeInfo};
 use servo_arc::Arc as ServoArc;
 use servo_base::id::{PipelineId, ScrollTreeNodeId};
+use servo_base::text::Utf32CodeUnits;
 use servo_config::opts::{DiagnosticsLogging, DiagnosticsLoggingOption};
 use servo_config::{pref, prefs};
 use servo_url::ServoUrl;
@@ -647,13 +648,16 @@ impl DisplayListBuilder<'_> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn check_for_lcp_candidate(
         &mut self,
         state: &TraversalState,
-        clip_rect: LayoutRect,
         bounds: LayoutRect,
+        clip_rect: LayoutRect,
         tag: Option<Tag>,
         url: Option<ServoUrl>,
+        natural_width: Option<Au>,
+        natural_height: Option<Au>,
     ) {
         if !pref!(largest_contentful_paint_enabled) {
             return;
@@ -664,8 +668,15 @@ impl DisplayListBuilder<'_> {
             .scroll_tree
             .cumulative_node_to_root_transform(state.spatial_id);
 
-        self.paint_timing_handler
-            .update_lcp_candidate(tag, bounds, clip_rect, transform, url);
+        self.paint_timing_handler.compute_new_lcp_candidate(
+            tag,
+            bounds,
+            clip_rect,
+            transform,
+            url,
+            natural_width,
+            natural_height,
+        );
     }
 
     fn visit_stacking_context_reference_frame_info(
@@ -769,7 +780,7 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
     fn visit_iframe(&mut self, state: &TraversalState, fragment: &Arc<IFrameFragment>) {
         fragment.base.visit_fragment(self);
 
-        let style = fragment.base.style();
+        let style = fragment.style.borrow();
         if style.get_inherited_box().visibility != Visibility::Visible {
             return;
         }
@@ -801,7 +812,7 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
     ) {
         fragment.base.visit_fragment(self);
 
-        let style = fragment.base.style();
+        let style = fragment.style.borrow();
         if style.get_inherited_box().visibility != Visibility::Visible {
             return;
         }
@@ -842,10 +853,12 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
 
                 self.check_for_lcp_candidate(
                     state,
-                    common.clip_rect,
                     rect,
+                    common.clip_rect,
                     fragment.base.tag,
                     fragment.url.clone(),
+                    fragment.natural_width,
+                    fragment.natural_height,
                 );
             }
         }
@@ -863,7 +876,7 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
     ) {
         fragment.base.visit_fragment(self);
 
-        let style = fragment.base.style();
+        let style = fragment.style();
         if style.get_inherited_box().visibility != Visibility::Visible {
             return;
         }
@@ -1033,7 +1046,7 @@ impl Fragment {
         let mut baseline_origin = rect.origin;
         baseline_origin.y += fragment.font_metrics.ascent;
 
-        let include_whitespace = fragment.offsets.is_some() ||
+        let include_whitespace = fragment.run_data.selection.is_some() ||
             state
                 .text_decorations
                 .iter()
@@ -1050,7 +1063,7 @@ impl Fragment {
             return;
         }
 
-        let parent_style = fragment.base.style();
+        let parent_style = fragment.style();
         let color = parent_style.clone_color();
         let font_size = parent_style.clone_font_size();
         let font_metrics = &fragment.font_metrics;
@@ -1284,17 +1297,26 @@ impl Fragment {
         fragment_x_offset: Au,
         justification_adjustment: Au,
     ) {
-        let Some(offsets) = fragment.offsets.as_ref() else {
+        let run_data = &fragment.run_data;
+        let Some(shared_selection) = &run_data.selection else {
             return;
         };
 
-        let shared_selection = offsets.shared_selection.borrow();
+        let shared_selection = shared_selection.borrow();
         if !shared_selection.enabled {
             return;
         }
 
-        if offsets.character_range.start > shared_selection.character_range.end ||
-            offsets.character_range.end < shared_selection.character_range.start
+        // The selection character range is in pre-transformed character offsets, so use the
+        // OffsetMap contained within `run_data` to convert it to post-transformed character
+        // offsets. This allows updating this selection directly from the DOM (skipping layout).
+        let dom_selection_range = &shared_selection.character_range;
+        let selection_character_range = run_data.map_dom_range_to_transformed_range(
+            Utf32CodeUnits(dom_selection_range.start)..Utf32CodeUnits(dom_selection_range.end),
+        );
+
+        if fragment.character_range_in_dom_node.start > selection_character_range.end ||
+            fragment.character_range_in_dom_node.end < selection_character_range.start
         {
             return;
         }
@@ -1304,21 +1326,21 @@ impl Fragment {
         // This code ensure that it is only painted if the cursor is on the starting index of the empty
         // fragment.
         if fragment.is_empty_for_text_cursor &&
-            !offsets
-                .character_range
-                .contains(&shared_selection.character_range.start)
+            !fragment
+                .character_range_in_dom_node
+                .contains(&selection_character_range.start)
         {
             return;
         }
 
-        let mut current_character_index = offsets.character_range.start;
+        let mut current_character_index = fragment.character_range_in_dom_node.start;
         let mut current_advance = Au::zero();
         let mut start_advance = None;
         let mut end_advance = None;
         for glyph_store in fragment.glyphs.iter() {
-            let glyph_store_character_count = glyph_store.character_count();
+            let glyph_store_character_count = Utf32CodeUnits(glyph_store.character_count());
             if current_character_index + glyph_store_character_count <
-                shared_selection.character_range.start
+                selection_character_range.start
             {
                 current_advance += glyph_store.total_advance() +
                     (justification_adjustment * glyph_store.total_word_separators() as i32);
@@ -1326,22 +1348,22 @@ impl Fragment {
                 continue;
             }
 
-            if current_character_index >= shared_selection.character_range.end {
+            if current_character_index >= selection_character_range.end {
                 break;
             }
 
             for glyph in glyph_store.glyphs() {
-                if current_character_index >= shared_selection.character_range.start {
+                if current_character_index >= selection_character_range.start {
                     start_advance = start_advance.or(Some(current_advance));
                 }
 
-                current_character_index += glyph.character_count();
+                current_character_index += Utf32CodeUnits(glyph.character_count());
                 current_advance += glyph.advance();
                 if glyph.char_is_word_separator() {
                     current_advance += justification_adjustment;
                 }
 
-                if current_character_index <= shared_selection.character_range.end {
+                if current_character_index <= selection_character_range.end {
                     end_advance = Some(current_advance);
                 }
             }
@@ -1350,8 +1372,8 @@ impl Fragment {
         let start_x = start_advance.unwrap_or(current_advance);
         let end_x = end_advance.unwrap_or(current_advance);
 
-        let parent_style = fragment.base.style();
-        if !shared_selection.character_range.is_empty() {
+        let parent_style = fragment.style();
+        if !selection_character_range.is_empty() {
             let selection_rect = Rect::new(
                 containing_block_rect.origin +
                     Vector2D::new(fragment_x_offset + start_x, Au::zero()),
@@ -1360,8 +1382,7 @@ impl Fragment {
             .to_webrender();
 
             if let Some(selection_color) = fragment
-                .selected_style
-                .borrow()
+                .selected_style()
                 .clone_background_color()
                 .as_absolute()
             {
@@ -1885,12 +1906,16 @@ impl<'a> BuilderForBoxFragment<'a> {
                         // > background-size has non-zero width and height values.
                         builder.mark_is_contentful();
 
+                        let natural_width = Some(Au::from_f32_px(size.width / dppx));
+                        let natural_height = Some(Au::from_f32_px(size.height / dppx));
                         builder.check_for_lcp_candidate(
                             state,
-                            layer.common.clip_rect,
                             layer.bounds,
+                            layer.common.clip_rect,
                             self.fragment.base.tag,
                             None,
+                            natural_width,
+                            natural_height,
                         );
                     }
                 },

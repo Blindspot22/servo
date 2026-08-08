@@ -36,7 +36,7 @@ aes-gcm = { version = "0.11", features = ["hazmat", "zeroize"] }
 aes-kw = { version = "0.3", features = ["zeroize"] }
 android_logger = "0.15"
 app_units = "0.7"
-arboard = "3"
+arboard = { version = "3", features = ["wayland-data-control"] }
 argon2 = { version = "=0.6.0-rc.8", features = ["alloc"] }
 arrayvec = "0.7"
 async-compression = { version = "0.4.12", default-features = false }
@@ -246,7 +246,7 @@ swapper = "0.1"
 syn = { version = "2", default-features = false, features = ["clone-impls", "derive", "parsing"] }
 synstructure = "0.13"
 sys-locale = "0.3"
-taffy = { version = "0.12.1", default-features = false, features = ["calc", "detailed_layout_info", "grid", "std"] }
+taffy = { version = "0.13.0", default-features = false, features = ["calc", "detailed_layout_info", "grid", "std"] }
 tempfile = "3"
 tendril = { version = "0.5", features = ["encoding_rs"] }
 tikv-jemalloc-sys = "0.6.1"
@@ -271,12 +271,12 @@ url = "2.5"
 urlpattern = "0.3"
 uuid = { version = "1.23.3", features = ["v4", "v5"] }
 vello = "0.9"
-vello_cpu = { version = "0.0.9", features = ["multithreading"] }
+vello_cpu = { version = "0.2.0", features = ["multithreading"] }
 warp = "0.4.2"
 web_atoms = "0.2.4"
 webdriver = { version = "0.53.0", default-features = false }
 webpki-roots = "1.0"
-webrender = { version = "0.70", features = ["capture"] }
+webrender = { version = "0.70", features = ["serde"] }
 webrender_api = "0.70"
 wgpu-core = "30"
 wgpu-types = "30"

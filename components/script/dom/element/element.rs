@@ -167,7 +167,6 @@ use crate::dom::promise::Promise;
 use crate::dom::range::Range;
 use crate::dom::raredata::ElementRareData;
 use crate::dom::sanitizer::Sanitizer;
-use crate::dom::scrolling_box::{ScrollAxisState, ScrollingBox};
 use crate::dom::servoparser::ServoParser;
 use crate::dom::shadowroot::{IsUserAgentWidget, ShadowRoot};
 use crate::dom::svg::svgelement::SVGElement;
@@ -177,6 +176,7 @@ use crate::dom::trustedtypes::trustedtypepolicyfactory::TrustedTypePolicyFactory
 use crate::dom::validation::Validatable;
 use crate::dom::validitystate::ValidationFlags;
 use crate::dom::window::Window;
+use crate::dom::window::scrolling_box::{ScrollAxisState, ScrollingBox};
 use crate::layout_dom::ServoDangerousStyleElement;
 use crate::realms::enter_auto_realm;
 use crate::script_thread::ScriptThread;
@@ -2203,7 +2203,13 @@ impl Element {
             return;
         }
 
-        let name = qname.local.clone();
+        let name = match qname.prefix {
+            None => qname.local.clone(),
+            Some(ref prefix) => {
+                let name = format!("{}:{}", &**prefix, &*qname.local);
+                LocalName::from(name)
+            },
+        };
         let value = self.parse_attribute(&qname.ns, &qname.local, value);
         self.push_new_attribute(
             cx,
@@ -2211,7 +2217,7 @@ impl Element {
             value,
             name,
             qname.ns,
-            None, // TODO: pass prefix from `qname`.
+            qname.prefix,
             AttributeMutationReason::ByParser,
         );
     }
@@ -4561,7 +4567,7 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
         // > The assignedSlot getter steps are to return the result of
         // > find a slot given this and with the open flag set.
         rooted!(&in(cx) let slottable = Slottable(Dom::from_ref(self.upcast::<Node>())));
-        slottable.find_a_slot(true)
+        slottable.find_a_slot(cx.no_gc(), true)
     }
 
     /// <https://drafts.csswg.org/css-shadow-parts/#dom-element-part>
@@ -5000,13 +5006,7 @@ impl Element {
             },
             _ => None,
         };
-        element.and_then(|elem| {
-            if elem.is_instance_activatable() {
-                Some(elem)
-            } else {
-                None
-            }
-        })
+        element.filter(|elem| elem.is_instance_activatable())
     }
 
     pub(crate) fn as_stylesheet_owner(&self) -> Option<&dyn StylesheetOwner> {

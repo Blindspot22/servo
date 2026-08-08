@@ -86,6 +86,7 @@ use crate::dom::animationtimeline::AnimationTimeline;
 use crate::dom::attr::Attr;
 use crate::dom::beforeunloadevent::BeforeUnloadEvent;
 use crate::dom::bindings::callback::ExceptionHandling;
+use crate::dom::bindings::codegen::Bindings::AnimationFrameProviderBinding::FrameRequestCallback;
 use crate::dom::bindings::codegen::Bindings::BeforeUnloadEventBinding::BeforeUnloadEvent_Binding::BeforeUnloadEventMethods;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
     DocumentMethods, DocumentReadyState, DocumentVisibilityState, NamedPropertyValue,
@@ -102,9 +103,7 @@ use crate::dom::bindings::codegen::Bindings::PermissionStatusBinding::Permission
 use crate::dom::bindings::codegen::Bindings::SanitizerBinding::{
     SetHTMLOptions, SetHTMLUnsafeOptions,
 };
-use crate::dom::bindings::codegen::Bindings::WindowBinding::{
-    FrameRequestCallback, ScrollBehavior, WindowMethods,
-};
+use crate::dom::bindings::codegen::Bindings::WindowBinding::{ScrollBehavior, WindowMethods};
 use crate::dom::bindings::codegen::Bindings::XPathEvaluatorBinding::XPathEvaluatorMethods;
 use crate::dom::bindings::codegen::Bindings::XPathNSResolverBinding::XPathNSResolver;
 use crate::dom::bindings::codegen::UnionTypes::{
@@ -137,6 +136,7 @@ use crate::dom::customevent::CustomEvent;
 use crate::dom::document::accessibility_data::AccessibilityData;
 use crate::dom::document::focus::{DocumentFocusHandler, FocusableArea};
 use crate::dom::document::tree_ordered_index_map::TreeOrderedIndexMap;
+use crate::dom::document::websocket::WebSocket;
 use crate::dom::document_embedder_controls::DocumentEmbedderControls;
 use crate::dom::document_event_handler::DocumentEventHandler;
 use crate::dom::documentfragment::DocumentFragment;
@@ -190,7 +190,6 @@ use crate::dom::promise::Promise;
 use crate::dom::range::Range;
 use crate::dom::resizeobserver::{ResizeObservationDepth, ResizeObserver};
 use crate::dom::sanitizer::Sanitizer;
-use crate::dom::scrolling_box::{ScrollAxisState, ScrollingBox};
 use crate::dom::selection::Selection;
 use crate::dom::servoparser::ServoParser;
 use crate::dom::shadowroot::ShadowRoot;
@@ -201,8 +200,8 @@ use crate::dom::touchlist::TouchList;
 use crate::dom::trustedtypes::trustedhtml::TrustedHTML;
 use crate::dom::types::{HTMLCanvasElement, VisibilityStateEntry};
 use crate::dom::uievent::UIEvent;
-use crate::dom::websocket::WebSocket;
 use crate::dom::window::Window;
+use crate::dom::window::scrolling_box::{ScrollAxisState, ScrollingBox};
 use crate::dom::windowproxy::WindowProxy;
 use crate::dom::xpathevaluator::XPathEvaluator;
 use crate::dom::xpathexpression::XPathExpression;
@@ -215,9 +214,9 @@ use crate::network_listener::{FetchResponseListener, NetworkListener};
 use crate::script_thread::{ScriptThread, SharedRwLocks};
 use crate::stylesheet_loader::StylesheetContextId;
 use crate::stylesheet_set::StylesheetSetRef;
-use crate::task::NonSendTaskBox;
-use crate::task_manager::TaskManager;
-use crate::task_source::TaskSourceName;
+use crate::tasks::task::NonSendTaskBox;
+use crate::tasks::task_manager::TaskManager;
+use crate::tasks::task_source::TaskSourceName;
 use crate::timers::{OneshotTimerCallback, OneshotTimers};
 use crate::xpath::parse_expression;
 
@@ -1821,7 +1820,7 @@ impl Document {
         if self.animation_frame_list.borrow().is_empty() {
             self.window().send_to_constellation(
                 ScriptToConstellationMessage::ChangeRunningAnimationsState(
-                    AnimationState::NoAnimationCallbacksPresent,
+                    AnimationState::AnimationCallbacksAbsent,
                 ),
             );
         }
@@ -2795,7 +2794,9 @@ impl Document {
 
         // Step 10. Remove document from the owner set of each WorkerGlobalScope
         // object whose set contains document.
-        // TODO
+        exited_window
+            .as_global_scope()
+            .disable_owned_worker_animation_frame_providers();
 
         // Step 11. For each workletGlobalScope in document's worklet global scopes,
         // terminate workletGlobalScope.
@@ -3091,6 +3092,12 @@ impl Document {
             return true;
         }
         if self.window().has_pending_media_query_evaluation() {
+            return true;
+        }
+        if self
+            .selection()
+            .is_some_and(|selection| selection.visible_selection_dirty())
+        {
             return true;
         }
 

@@ -61,11 +61,11 @@ use crate::dom::trustedtypes::trustedscript::TrustedScript;
 use crate::dom::trustedtypes::trustedscripturl::TrustedScriptURL;
 use crate::dom::window::Window;
 use crate::fetch::{RequestWithGlobalScope, create_a_potential_cors_request_with_claim};
-use crate::network_listener::{self, FetchResponseListener, ResourceTimingListener};
-use crate::script_module::{
-    ImportMap, ModuleTree, ScriptFetchOptions, fetch_an_external_module_script,
-    fetch_inline_module_script, parse_an_import_map_string, register_import_map,
+use crate::modules::import_map::{ImportMap, parse_an_import_map_string, register_import_map};
+use crate::modules::script_module::{
+    ModuleTree, ScriptFetchOptions, fetch_an_external_module_script, fetch_inline_module_script,
 };
+use crate::network_listener::{self, FetchResponseListener, ResourceTimingListener};
 use crate::script_runtime::IntroductionType;
 use crate::url::ensure_blob_referenced_by_url_is_kept_alive;
 
@@ -552,7 +552,7 @@ impl HTMLScriptElement {
         // Step 1. If script’s script text value is not equal to its child text content,
         // set script’s script text to the result of executing
         // Get Trusted Type compliant string, with the following arguments:
-        if self.script_text.borrow().clone() != self.text() {
+        if *self.script_text.borrow() != self.text() {
             *self.script_text.borrow_mut() = TrustedScript::get_trusted_type_compliant_string(
                 cx,
                 &self.owner_global(),

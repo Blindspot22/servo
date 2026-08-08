@@ -23,7 +23,7 @@ use embedder_traits::{
 use euclid::{Point2D, Vector2D};
 use js::context::JSContext;
 use keyboard_types::{Code, Key, KeyState, Modifiers, NamedKey};
-use layout_api::{ScrollContainerQueryFlags, node_id_from_scroll_id};
+use layout_api::{HitTestFlags, ScrollContainerQueryFlags, node_id_from_scroll_id};
 use rustc_hash::FxHashMap;
 use script_bindings::cell::DomRefCell;
 use script_bindings::codegen::GenericBindings::DocumentBinding::DocumentMethods;
@@ -68,12 +68,12 @@ use crate::dom::iterators::ShadowIncluding;
 use crate::dom::keyboardevent::KeyboardEvent;
 use crate::dom::node::{self, Node, NodeTraits};
 use crate::dom::pointerevent::{PointerEvent, PointerId};
-use crate::dom::scrolling_box::{ScrollAxisState, ScrollRequirement, ScrollingBoxAxis};
 use crate::dom::types::{
     ClipboardEvent, CompositionEvent, DataTransfer, Element, Event, EventTarget, GlobalScope,
     HTMLAnchorElement, HTMLElement, HTMLLabelElement, MouseEvent, Touch, TouchEvent, TouchList,
     WheelEvent, Window,
 };
+use crate::dom::window::scrolling_box::{ScrollAxisState, ScrollRequirement, ScrollingBoxAxis};
 use crate::drag_data_store::{DragDataStore, Kind, Mode};
 use crate::realms::enter_auto_realm;
 
@@ -452,10 +452,11 @@ impl DocumentEventHandler {
                 element.set_hover_state(false);
             }
 
+            let flags = HitTestFlags::empty();
             if let Some(hit_test_result) = self
                 .most_recent_mousemove_point
                 .get()
-                .and_then(|point| self.window.hit_test_from_point_in_viewport(point))
+                .and_then(|point| self.window.hit_test_from_point_in_viewport(flags, point))
             {
                 let mouse_out_event = MouseEvent::new_for_platform_motion_event(
                     cx,
@@ -580,11 +581,18 @@ impl DocumentEventHandler {
         let released_disconnected =
             self.release_disconnected_pointer_capture(cx, pointer_id, "mouse", true);
 
+        let flags = if input_event.primary_button_is_pressed() {
+            HitTestFlags::IncludeDomPosition
+        } else {
+            HitTestFlags::empty()
+        };
+
         // Always do full hit test so we can keep `current_hover_target` in sync
         // with the actual element under the pointer. Boundary events for hover
         // transitions are suppressed while pointer capture is active: per spec,
         // pointer events are retargeted to the capture element.
-        let Some(hit_test_result) = self.window.hit_test_from_input_event(input_event) else {
+        let Some(hit_test_result) = self.window.hit_test_from_input_event(flags, input_event)
+        else {
             return;
         };
 
@@ -797,9 +805,10 @@ impl DocumentEventHandler {
             return;
         };
 
+        let flags = HitTestFlags::empty();
         let Some(hit_test_result) = self
             .window
-            .hit_test_from_point_in_viewport(most_recent_mousemove_point)
+            .hit_test_from_point_in_viewport(flags, most_recent_mousemove_point)
         else {
             return;
         };
@@ -860,8 +869,14 @@ impl DocumentEventHandler {
         event: MouseButtonEvent,
         input_event: &ConstellationInputEvent,
     ) {
+        let flags = if input_event.primary_button_is_pressed() {
+            HitTestFlags::IncludeDomPosition
+        } else {
+            HitTestFlags::empty()
+        };
         // Ignore all incoming events without a hit test.
-        let Some(hit_test_result) = self.window.hit_test_from_input_event(input_event) else {
+        let Some(hit_test_result) = self.window.hit_test_from_input_event(flags, input_event)
+        else {
             return;
         };
 
@@ -1215,8 +1230,10 @@ impl DocumentEventHandler {
         event: EmbedderTouchEvent,
         input_event: &ConstellationInputEvent,
     ) -> InputEventResult {
+        let flags = HitTestFlags::empty();
         // Ignore all incoming events without a hit test.
-        let Some(hit_test_result) = self.window.hit_test_from_input_event(input_event) else {
+        let Some(hit_test_result) = self.window.hit_test_from_input_event(flags, input_event)
+        else {
             self.update_active_touch_points_when_early_return(event);
             return Default::default();
         };
@@ -1612,7 +1629,9 @@ impl DocumentEventHandler {
         input_event: &ConstellationInputEvent,
     ) -> InputEventResult {
         // Ignore all incoming events without a hit test.
-        let Some(hit_test_result) = self.window.hit_test_from_input_event(input_event) else {
+        let flags = HitTestFlags::empty();
+        let Some(hit_test_result) = self.window.hit_test_from_input_event(flags, input_event)
+        else {
             return Default::default();
         };
 

@@ -50,18 +50,18 @@ use crate::dom::element::{
     cors_settings_attribute_credential_mode, referrer_policy_for_element,
     reflect_cross_origin_attribute, reflect_referrer_policy_attribute, set_cross_origin_attribute,
 };
+use crate::dom::html::documentmetadata::processingoptions::{
+    LinkFetchContext, LinkFetchContextType, LinkProcessingOptions,
+};
 use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::medialist::MediaList;
 use crate::dom::node::virtualmethods::VirtualMethods;
 use crate::dom::node::{BindContext, Node, NodeTraits, UnbindContext};
 use crate::dom::performance::performanceresourcetiming::InitiatorType;
-use crate::dom::processingoptions::{
-    LinkFetchContext, LinkFetchContextType, LinkProcessingOptions,
-};
 use crate::dom::types::{EventTarget, GlobalScope};
 use crate::links::LinkRelations;
+use crate::modules::script_module::{ScriptFetchOptions, fetch_a_modulepreload_module};
 use crate::network_listener::{FetchResponseListener, ResourceTimingListener, submit_timing};
-use crate::script_module::{ScriptFetchOptions, fetch_a_modulepreload_module};
 use crate::stylesheet_loader::{ElementStylesheetLoader, StylesheetContextSource, StylesheetOwner};
 use crate::url::ensure_blob_referenced_by_url_is_kept_alive;
 

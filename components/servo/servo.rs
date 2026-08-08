@@ -841,7 +841,6 @@ impl ServoInner {
                         .notify_crashed(webview, reason, backtrace);
                 }
             },
-            ConstellationToEmbedderMsg::ReportProfile(_items) => {},
             ConstellationToEmbedderMsg::MediaSessionEvent(webview_id, media_session_event) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview
@@ -1001,6 +1000,10 @@ impl Servo {
         if opts::get().multiprocess {
             prefs::add_observer(Box::new(constellation_proxy.clone()));
         }
+
+        // Note: This marks the embedder thread as critical, we'll want to
+        // evaluate that in the future.
+        servo_base::threadboost::mark_thread_as_critical();
 
         Servo(Rc::new(ServoInner {
             delegate: RefCell::new(Rc::new(DefaultServoDelegate)),

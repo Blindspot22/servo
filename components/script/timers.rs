@@ -42,10 +42,10 @@ use crate::dom::testbinding::TestBindingCallback;
 use crate::dom::trustedtypes::trustedscript::TrustedScript;
 use crate::dom::types::{Window, WorkerGlobalScope};
 use crate::dom::xmlhttprequest::XHRTimeoutCallback;
-use crate::script_module::{ScriptFetchOptions, module_script_from_reference_private};
+use crate::modules::script_module::{ScriptFetchOptions, module_script_from_reference_private};
 use crate::script_runtime::IntroductionType;
 use crate::script_thread::ScriptThread;
-use crate::task_source::SendableTaskSource;
+use crate::tasks::task_source::SendableTaskSource;
 
 type TimerKey = i32;
 type RunStepsDeadline = Instant;

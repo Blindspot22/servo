@@ -109,7 +109,6 @@ use crate::dom::bindings::structuredclone;
 use crate::dom::bindings::trace::{CustomTraceable, HashMapTracedValues, RootedTraceableBox};
 use crate::dom::bindings::weakref::{DOMTracker, WeakRef};
 use crate::dom::blob::Blob;
-use crate::dom::broadcastchannel::BroadcastChannel;
 use crate::dom::dedicatedworkerglobalscope::{
     DedicatedWorkerControlMsg, DedicatedWorkerGlobalScope,
 };
@@ -119,6 +118,7 @@ use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventsource::EventSource;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::file::File;
+use crate::dom::globalscope::broadcastchannel::BroadcastChannel;
 use crate::dom::globalscope::script_execution::{
     ErrorReporting, evaluate_script, fill_compile_options,
 };
@@ -147,15 +147,16 @@ use crate::dom::workletglobalscope::WorkletGlobalScope;
 use crate::fetch::{DeferredFetchRecordId, FetchGroup, QueuedDeferredFetchRecord};
 use crate::messaging::{CommonScriptMsg, ScriptEventLoopReceiver, ScriptEventLoopSender};
 use crate::microtask::MicrotaskRunnable;
+use crate::modules::import_map::ImportMap;
+use crate::modules::script_module::{
+    ModuleRequest, ModuleStatus, ModuleTree, ResolvedModule, ScriptFetchOptions,
+};
 use crate::network_listener::{FetchResponseListener, NetworkListener};
 use crate::realms::enter_auto_realm;
-use crate::script_module::{
-    ImportMap, ModuleRequest, ModuleStatus, ModuleTree, ResolvedModule, ScriptFetchOptions,
-};
 use crate::script_runtime::ThreadSafeJSContext;
 use crate::script_thread::{ScriptThread, with_script_thread};
-use crate::task_manager::TaskManager;
-use crate::task_source::SendableTaskSource;
+use crate::tasks::task_manager::TaskManager;
+use crate::tasks::task_source::SendableTaskSource;
 use crate::timers::{
     IsInterval, OneshotTimerCallback, OneshotTimerHandle, OneshotTimers, TimerCallback,
     TimerEventId, TimerSource,
@@ -167,11 +168,12 @@ pub(crate) struct AutoCloseWorker {
     /// <https://html.spec.whatwg.org/multipage/#dom-workerglobalscope-closing>
     #[conditional_malloc_size_of]
     closing: Arc<AtomicBool>,
+    #[conditional_malloc_size_of]
+    animation_frame_provider_supported: Arc<AtomicBool>,
     /// A handle to join on the worker thread.
     #[ignore_malloc_size_of = "JoinHandle"]
     join_handle: Option<JoinHandle<()>>,
-    /// A sender of control messages,
-    /// currently only used to signal shutdown.
+    /// A sender of control messages.
     #[no_trace]
     control_sender: Sender<DedicatedWorkerControlMsg>,
     /// The context to request an interrupt on the worker thread.
@@ -2315,6 +2317,7 @@ impl GlobalScope {
     pub(crate) fn track_worker(
         &self,
         closing: Arc<AtomicBool>,
+        animation_frame_provider_supported: Arc<AtomicBool>,
         join_handle: JoinHandle<()>,
         control_sender: Sender<DedicatedWorkerControlMsg>,
         context: ThreadSafeJSContext,
@@ -2323,10 +2326,22 @@ impl GlobalScope {
             .borrow_mut()
             .push(AutoCloseWorker {
                 closing,
+                animation_frame_provider_supported,
                 join_handle: Some(join_handle),
                 control_sender,
                 context,
             });
+    }
+
+    pub(crate) fn disable_owned_worker_animation_frame_providers(&self) {
+        for worker in &*self.list_auto_close_worker.borrow() {
+            worker
+                .animation_frame_provider_supported
+                .store(false, Ordering::SeqCst);
+            let _ = worker
+                .control_sender
+                .send(DedicatedWorkerControlMsg::AnimationFrameProviderUnsupported);
+        }
     }
 
     pub(crate) fn track_event_source(&self, event_source: &EventSource) {

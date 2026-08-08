@@ -71,6 +71,9 @@ use crate::dom::documentfragment::DocumentFragment;
 use crate::dom::documenttype::DocumentType;
 use crate::dom::element::{CustomElementCreationMode, Element, ElementCreator};
 use crate::dom::globalscope::GlobalScope;
+use crate::dom::html::documentmetadata::processingoptions::{
+    LinkHeader, LinkProcessingPhase, extract_links_from_headers, process_link_headers,
+};
 use crate::dom::html::htmlformelement::{FormControlElementHelpers, HTMLFormElement};
 use crate::dom::html::htmlimageelement::HTMLImageElement;
 use crate::dom::html::htmlscriptelement::{HTMLScriptElement, ScriptResult};
@@ -81,9 +84,6 @@ use crate::dom::node::virtualmethods::vtable_for;
 use crate::dom::performance::performanceentry::PerformanceEntry;
 use crate::dom::performance::performancenavigationtiming::PerformanceNavigationTiming;
 use crate::dom::processinginstruction::ProcessingInstruction;
-use crate::dom::processingoptions::{
-    LinkHeader, LinkProcessingPhase, extract_links_from_headers, process_link_headers,
-};
 use crate::dom::reporting::reportingendpoint::ReportingEndpoint;
 use crate::dom::security::csp::CspReporting;
 use crate::dom::security::xframeoptions::check_a_navigation_response_adherence_to_x_frame_options;
@@ -1065,7 +1065,7 @@ impl ParserContext {
         let Some(media_type) = MimeClassifier::get_media_type(&mime_type) else {
             let page = format!(
                 "<html><body><p>Unknown content type ({}).</p></body></html>",
-                &mime_type,
+                mime_type,
             );
             self.load_inline_unknown_content(cx, parser, page);
             return;
@@ -1089,7 +1089,7 @@ impl ParserContext {
             MediaType::Font => {
                 let page = format!(
                     "<html><body><p>Unable to load font with content type ({}).</p></body></html>",
-                    &mime_type,
+                    mime_type,
                 );
                 self.load_inline_unknown_content(cx, parser, page);
                 return;

@@ -43,7 +43,7 @@ use crate::dom::window::Window;
 use crate::dom::workerglobalscope::prepare_workerscope_init;
 use crate::realms::enter_auto_realm;
 use crate::script_runtime::ThreadSafeJSContext;
-use crate::task::TaskOnce;
+use crate::tasks::task::TaskOnce;
 use crate::url::ensure_blob_referenced_by_url_is_kept_alive;
 
 pub(crate) type TrustedWorkerAddress = Trusted<Worker>;
@@ -245,6 +245,10 @@ impl WorkerMethods<crate::DomTypeHolder> for Worker {
             .and_then(|window| window.webgl_chan_value());
         let init =
             prepare_workerscope_init(global, Some(devtools_sender), Some(worker_id), webgl_chan);
+        let animation_frame_provider_supported = global
+            .downcast::<DedicatedWorkerGlobalScope>()
+            .map(|worker| worker.animation_frame_provider_supported_flag())
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(init.animation_frame_provider_supported)));
 
         let (control_sender, control_receiver) = unbounded();
         let (context_sender, context_receiver) = unbounded();
@@ -264,6 +268,7 @@ impl WorkerMethods<crate::DomTypeHolder> for Worker {
             worker_load_origin,
             worker_options,
             closing.clone(),
+            animation_frame_provider_supported.clone(),
             global.image_cache(),
             browsing_context,
             #[cfg(feature = "webgpu")]
@@ -280,7 +285,13 @@ impl WorkerMethods<crate::DomTypeHolder> for Worker {
             .expect("Couldn't receive a context for worker.");
 
         worker.set_context_for_interrupt(context.clone());
-        global.track_worker(closing, join_handle, control_sender, context);
+        global.track_worker(
+            closing,
+            animation_frame_provider_supported,
+            join_handle,
+            control_sender,
+            context,
+        );
 
         Ok(worker)
     }

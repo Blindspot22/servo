@@ -55,6 +55,7 @@ use servo_arc::Arc as ServoArc;
 use servo_base::Epoch;
 use servo_base::generic_channel::GenericSender;
 use servo_base::id::{BrowsingContextId, PipelineId, WebViewId};
+use servo_base::text::Utf32CodeUnits;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use style::Atom;
 use style::animation::DocumentAnimationSet;
@@ -223,7 +224,7 @@ pub struct PendingImage {
     pub is_internal_request: InternalRequest,
 }
 
-/// A data structure to tarck vector image that are fully loaded (i.e has a parsed SVG
+/// A data structure to track vector image that are fully loaded (i.e has a parsed SVG
 /// tree) but not yet rasterized to the size needed by layout. The rasterization is
 /// happening in the image cache.
 #[derive(Debug)]
@@ -248,6 +249,7 @@ pub struct MediaMetadata {
 pub struct HTMLMediaData {
     pub current_frame: Option<MediaFrame>,
     pub metadata: Option<MediaMetadata>,
+    pub poster_url: Option<ServoUrl>,
 }
 
 pub struct LayoutConfig {
@@ -264,6 +266,13 @@ pub struct LayoutConfig {
     pub user_stylesheets: Rc<Vec<DocumentStyleSheet>>,
     pub theme: Theme,
     pub embedder_chan: ScriptToEmbedderChan,
+}
+
+bitflags! {
+    pub struct HitTestFlags: u8 {
+        /// Whether to populate [`ElementsFromPointResult::dom_position_for_selection`]
+        const IncludeDomPosition = 0b0000_0001;
+    }
 }
 
 pub trait LayoutFactory: Send + Sync {
@@ -391,13 +400,7 @@ pub trait Layout {
         animation_timeline_value: f64,
     ) -> Option<ServoArc<Font>>;
     fn query_scrolling_area(&self, node: Option<TrustedNodeAddress>) -> Rect<i32, CSSPixel>;
-    /// Find the character offset of the point in the given node, if it has text content.
-    fn query_text_index(
-        &self,
-        node: TrustedNodeAddress,
-        point: Point2D<Au, CSSPixel>,
-    ) -> Option<usize>;
-    fn query_elements_from_point(&self, point: LayoutPoint) -> Vec<ElementsFromPointResult>;
+    fn hit_test(&self, flags: HitTestFlags, point: LayoutPoint) -> HitTestResult;
     fn query_effective_overflow(&self, node: TrustedNodeAddress) -> Option<AxesOverflow>;
     fn stylist_mut(&mut self) -> &mut Stylist;
 
@@ -905,9 +908,16 @@ impl ImageAnimationState {
     }
 }
 
+/// The result of a hit test query.
+#[derive(Debug, Default)]
+pub struct HitTestResult {
+    pub items: Vec<HitTestResultItem>,
+    pub dom_position_for_selection: Option<(OpaqueNode, Utf32CodeUnits)>,
+}
+
 /// Describe an item that matched a hit-test query.
 #[derive(Debug)]
-pub struct ElementsFromPointResult {
+pub struct HitTestResultItem {
     /// An [`OpaqueNode`] that contains a pointer to the node hit by
     /// this hit test result.
     pub node: OpaqueNode,

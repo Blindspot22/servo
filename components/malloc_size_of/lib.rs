@@ -1071,6 +1071,16 @@ impl MallocSizeOf for usvg::ClipPath {
     }
 }
 
+impl<'a> MallocSizeOf for usvg::Options<'a> {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.font_family.size_of(ops) +
+            self.languages.size_of(ops) +
+            self.style_sheet.size_of(ops) +
+            self.fontdb.conditional_shallow_size_of(ops) +
+            self.resources_dir.size_of(ops)
+    }
+}
+
 // Placeholder for unique case where internals of Sender cannot be measured.
 // malloc size of is 0 macro complains about type supplied!
 impl<T> MallocSizeOf for crossbeam_channel::Sender<T> {
@@ -1112,6 +1122,17 @@ impl<T> MallocSizeOf for ipc_channel::ipc::IpcReceiver<T> {
 impl MallocSizeOf for ipc_channel::ipc::IpcSharedMemory {
     fn size_of(&self, _ops: &mut MallocSizeOfOps) -> usize {
         self.len()
+    }
+}
+
+impl MallocSizeOf for vello_cpu::Pixmap {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        let data = self.data();
+        if data.is_empty() {
+            0
+        } else {
+            unsafe { ops.malloc_size_of(data.as_ptr()) }
+        }
     }
 }
 
